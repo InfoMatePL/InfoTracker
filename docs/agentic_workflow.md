@@ -74,6 +74,7 @@ flowchart LR
 - `docs/example_dataset.md`
 - `docs/algorithm.md`
 - `docs/cli_usage.md`
+- `docs/dbt_integration.md`
 
 ### Modus Operandi: Continuous Improvement with Cursor Agents
 To extend the agentic workflow for 24/7/365 improvement of InfoTracker, integrate Cursor's web-based agents (like Background Agents) with GitHub. This builds on the regression testing and CI loops above, enabling automated code suggestions, bug fixes, and PR reviews. See [Cursor Changelog](https://cursor.com/changelog) for details.

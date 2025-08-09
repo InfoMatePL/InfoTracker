@@ -129,4 +129,5 @@ infotracker diff --base REF --head REF --sql-dir DIR [--adapter mssql] [--severi
 - `docs/breaking_changes.md`
 - `docs/configuration.md`
 - `docs/architecture.md`
-- `docs/openlineage_mapping.md` 
+- `docs/openlineage_mapping.md`
+- `docs/dbt_integration.md` 

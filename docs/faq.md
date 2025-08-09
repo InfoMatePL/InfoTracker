@@ -18,3 +18,6 @@ Ensure deterministic ordering of outputs and diagnostics. Use the same adapter/c
 
 #### How do I output JSON instead of text?
 Add `--format json` and redirect to a file. 
+
+#### Can I use InfoTracker with dbt?
+Yes. Compile your dbt project (`dbt compile`) and point InfoTracker to `target/compiled/<project>/models`. See `docs/dbt_integration.md` for details. 

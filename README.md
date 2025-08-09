@@ -31,6 +31,7 @@ infotracker diff --base main --head feature/x --sql-dir examples/warehouse/sql
 - `docs/configuration.md` — configuration reference
 - `docs/openlineage_mapping.md` — how outputs map to OpenLineage
 - `docs/faq.md` — common questions
+- `docs/dbt_integration.md` — how to use with dbt projects
 
 #### Requirements
 - Python 3.10+

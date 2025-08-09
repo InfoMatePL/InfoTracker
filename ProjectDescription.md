@@ -51,6 +51,9 @@ If you're new to SQL, try this free tutorial: [Khan Academy SQL](https://www.kha
    - Breaking changes: [docs/breaking_changes.md](docs/breaking_changes.md)
    - Compare base vs head branches: diff schemas/expressions, classify severity, compute downstream impacts, and emit machine + human-readable reports.
 
+10) Optional: Integrate with dbt
+   - dbt integration: [docs/dbt_integration.md](docs/dbt_integration.md)
+
 ### Milestones (suggested timebox)
 - Day 1–2: read docs, install CLI, run extract on examples
 - Day 3–5: implement simple lineage (no joins), pass gold files

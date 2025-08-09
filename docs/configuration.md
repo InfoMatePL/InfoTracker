@@ -25,4 +25,14 @@ catalog: "catalog.yml"
 
 #### Notes
 - Unknown objects resolve best-effort; provide a `catalog.yml` to improve type accuracy
-- Deterministic outputs help CI diffs; set `severity_threshold` per your policy 
+- Deterministic outputs help CI diffs; set `severity_threshold` per your policy
+
+#### dbt projects
+- Run `dbt compile` first and point `sql_dir` to `target/compiled/<project>/models`
+- Example:
+  ```yaml
+  sql_dir: target/compiled/my_dbt_project/models
+  out_dir: build/lineage
+  include: ["*.sql"]
+  exclude: ["**/tests/**", "**/analysis/**", "**/snapshots/**"]
+  ``` 
