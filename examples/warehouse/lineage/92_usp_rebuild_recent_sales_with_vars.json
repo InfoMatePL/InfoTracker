@@ -1,0 +1,52 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-03T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000092" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/92_usp_rebuild_recent_sales_with_vars.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.fct_sales_recent_var",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderID"} ],
+              "transformationType": "FILTER",
+              "transformationDescription": "o.OrderDate >= DATEADD(DAY,-14, MAX(Orders.OrderDate))"
+            },
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "CustomerID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "Carried from filtered recent orders"
+            },
+            "OrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "CAST",
+              "transformationDescription": "CAST(OrderDate AS DATE) with variable-bounded filter"
+            },
+            "ProductID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "transformationType": "JOIN",
+              "transformationDescription": "Join on OrderID to recent orders"
+            },
+            "Revenue": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "ARITHMETIC",
+              "transformationDescription": "Quantity * UnitPrice"
+            }
+          }
+        }
+      }
+    }
+  ]
+} 

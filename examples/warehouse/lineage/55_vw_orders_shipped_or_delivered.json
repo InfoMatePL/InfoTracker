@@ -1,0 +1,25 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-02T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000055" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/55_vw_orders_shipped_or_delivered.sql" },
+  "inputs": [ { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" } ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.vw_orders_shipped_or_delivered",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderID"}],"transformationType":"FILTER","transformationDescription":"WHERE OrderStatus IN (...)"},
+            "CustomerID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"CustomerID"}],"transformationType":"IDENTITY","transformationDescription":"SELECT *"},
+            "OrderDate": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderDate"}],"transformationType":"IDENTITY","transformationDescription":"SELECT *"},
+            "OrderStatus": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderStatus"}],"transformationType":"FILTER","transformationDescription":"WHERE OrderStatus IN (...)"}
+          }
+        }
+      }
+    }
+  ]
+} 

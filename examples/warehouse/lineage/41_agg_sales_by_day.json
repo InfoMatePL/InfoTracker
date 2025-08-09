@@ -1,0 +1,39 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000041" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/41_agg_sales_by_day.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_order_items" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_orders" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.agg_sales_by_day",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_orders", "field": "OrderDate"} ],
+              "transformationType": "CAST",
+              "transformationDescription": "CAST(OrderDate AS DATE)"
+            },
+            "TotalQuantity": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_order_items", "field": "Quantity"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "SUM(Quantity)"
+            },
+            "TotalRevenue": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_order_items", "field": "ExtendedPrice"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "SUM(ExtendedPrice)"
+            }
+          }
+        }
+      }
+    }
+  ]
+} 

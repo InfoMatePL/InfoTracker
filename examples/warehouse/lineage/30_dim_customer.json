@@ -1,0 +1,43 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000030" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/30_dim_customer.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_customers" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.dim_customer",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_customers", "field": "CustomerID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerID from stg_customers.CustomerID"
+            },
+            "CustomerName": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_customers", "field": "CustomerName"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerName from stg_customers.CustomerName"
+            },
+            "EmailDomain": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_customers", "field": "EmailDomain"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "EmailDomain from stg_customers.EmailDomain"
+            },
+            "SignupDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.stg_customers", "field": "SignupDate"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "SignupDate from stg_customers.SignupDate"
+            }
+          }
+        }
+      }
+    }
+  ]
+} 

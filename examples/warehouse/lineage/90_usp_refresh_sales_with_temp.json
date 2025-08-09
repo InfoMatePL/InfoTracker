@@ -1,0 +1,57 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000090" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/90_usp_refresh_sales_with_temp.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.fct_sales_snapshot",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "SnapshotDate": {
+              "inputFields": [],
+              "transformationType": "CONSTANT",
+              "transformationDescription": "GETDATE() cast to DATE at runtime"
+            },
+            "SalesID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "OrderItemID"} ],
+              "transformationType": "RENAME",
+              "transformationDescription": "OrderItemID AS SalesID via temp pipeline"
+            },
+            "OrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "FILTER",
+              "transformationDescription": "Orders within last 7 days"
+            },
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "CustomerID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "From recent orders temp table"
+            },
+            "ProductID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "From temp sales join"
+            },
+            "Revenue": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "ARITHMETIC",
+              "transformationDescription": "Quantity * UnitPrice computed into temp then inserted"
+            }
+          }
+        }
+      }
+    }
+  ]
+} 

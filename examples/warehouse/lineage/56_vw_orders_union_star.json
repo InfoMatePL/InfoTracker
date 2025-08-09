@@ -1,0 +1,40 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-02T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000056" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/56_vw_orders_union_star.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.vw_orders_union_star",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {"inputFields": [
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderID"},
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderID"}
+            ],"transformationType":"UNION","transformationDescription":"UNION ALL of shipped and delivered"},
+            "CustomerID": {"inputFields": [
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"CustomerID"},
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"CustomerID"}
+            ],"transformationType":"UNION","transformationDescription":"UNION ALL"},
+            "OrderDate": {"inputFields": [
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderDate"},
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderDate"}
+            ],"transformationType":"UNION","transformationDescription":"UNION ALL"},
+            "OrderStatus": {"inputFields": [
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderStatus"},
+              {"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.Orders","field":"OrderStatus"}
+            ],"transformationType":"UNION","transformationDescription":"UNION ALL"}
+          }
+        }
+      }
+    }
+  ]
+} 

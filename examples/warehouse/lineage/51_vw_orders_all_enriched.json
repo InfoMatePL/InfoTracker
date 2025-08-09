@@ -1,0 +1,26 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-02T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000051" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/51_vw_orders_all_enriched.sql" },
+  "inputs": [ { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.vw_orders_all" } ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.vw_orders_all_enriched",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderID"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "CustomerID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"CustomerID"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "OrderDate": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderDate"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "OrderStatus": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderStatus"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "IsRecent": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderDate"}],"transformationType":"COMPARISON","transformationDescription":"OrderDate >= GETDATE()-7"}
+          }
+        }
+      }
+    }
+  ]
+} 

@@ -1,0 +1,26 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000004" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/04_order_items.sql" },
+  "inputs": [],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.OrderItems",
+      "facets": {
+        "schema": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
+          "fields": [
+            { "name": "OrderItemID", "type": "int" },
+            { "name": "OrderID", "type": "int" },
+            { "name": "ProductID", "type": "int" },
+            { "name": "Quantity", "type": "int" },
+            { "name": "UnitPrice", "type": "decimal(10,2)" }
+          ]
+        }
+      }
+    }
+  ]
+} 

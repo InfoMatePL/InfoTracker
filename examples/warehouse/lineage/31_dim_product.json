@@ -1,0 +1,43 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000031" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/31_dim_product.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Products" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.dim_product",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "ProductID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Products", "field": "ProductID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "ProductID from Products.ProductID"
+            },
+            "ProductName": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Products", "field": "ProductName"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "ProductName from Products.ProductName"
+            },
+            "Category": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Products", "field": "Category"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "Category from Products.Category"
+            },
+            "Price": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Products", "field": "Price"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "Price from Products.Price"
+            }
+          }
+        }
+      }
+    }
+  ]
+} 

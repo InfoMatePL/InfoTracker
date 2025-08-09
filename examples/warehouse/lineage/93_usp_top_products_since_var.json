@@ -1,0 +1,42 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-03T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000093" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/93_usp_top_products_since_var.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.top_products_last30_var",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "ProductID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "transformationType": "GROUP_KEY",
+              "transformationDescription": "GROUP BY ProductID with filter o.OrderDate >= MAX(OrderDate)-30d"
+            },
+            "TotalQty": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "SUM(Quantity) WHERE Orders.OrderDate >= @since"
+            },
+            "TotalRevenue": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "SUM(Quantity * UnitPrice) WHERE Orders.OrderDate >= @since"
+            }
+          }
+        }
+      }
+    }
+  ]
+} 

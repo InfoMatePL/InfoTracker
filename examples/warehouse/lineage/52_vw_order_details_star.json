@@ -1,0 +1,31 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-02T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000052" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/52_vw_order_details_star.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.vw_orders_all" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.vw_order_details_star",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderID"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "CustomerID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"CustomerID"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "OrderDate": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderDate"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "OrderStatus": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.vw_orders_all","field":"OrderStatus"}],"transformationType":"IDENTITY","transformationDescription":"o.*"},
+            "ProductID": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.OrderItems","field":"ProductID"}],"transformationType":"IDENTITY","transformationDescription":"selected from OrderItems"},
+            "Quantity": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.OrderItems","field":"Quantity"}],"transformationType":"IDENTITY","transformationDescription":"selected from OrderItems"},
+            "UnitPrice": {"inputFields": [{"namespace":"mssql://localhost/InfoTrackerDW","name":"dbo.OrderItems","field":"UnitPrice"}],"transformationType":"IDENTITY","transformationDescription":"selected from OrderItems"}
+          }
+        }
+      }
+    }
+  ]
+} 
