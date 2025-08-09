@@ -4,10 +4,15 @@
 Your mission: protect downstream villagers (dashboards, jobs) from schema dragons and semantic shapeshifters. Spot trouble early; sleep better later.
 
 - What breaks: names, types, nullability, meaning, order
-- Why care: avoid 3 a.m. alerts and cursed KPIs
+- Why care: avoid late-night alerts and wrong metrics
 - How to win: run diffs in PRs; fix or document before merge
 
-If the tool shouts “BREAKING,” that’s your bat-signal. Cape optional.
+If the tool shouts “BREAKING,” that’s a clear warning to review.
+
+#### Audience & prerequisites
+- Audience: data producers/owners, reviewers, platform engineers
+
+- Prerequisites: basic SQL; understanding of schemas/types/nullability; PR/CI familiarity
 
 #### What is a breaking change?
 A breaking change is any modification to a dataset’s external contract—its schema, semantics, or behavior—that can cause downstream code, jobs, or dashboards to fail or, worse, to silently produce incorrect results. This contract includes:
@@ -49,6 +54,24 @@ Sample outputs include JSON change list and human-readable summary.
 - POTENTIALLY_BREAKING: requires review; may affect consumers (e.g., new column via `*`)
 - NON_BREAKING: safe additions or widenings not exposed via `*`
 
+#### How severity is determined
+```
+For each object:
+  1) Compare schema (names, types, nullability, order)
+  2) Compare expressions/lineage for each output column
+  3) Classify:
+     - remove/rename, type narrowing, nullability tighten, order misalign → BREAKING
+     - widen, add (not via *) → NON_BREAKING
+     - star-change, semantic/join/filter change → POTENTIALLY_BREAKING
+  4) Run impact to summarize affected downstream columns
+```
+
+#### Configuration knobs
+- `--severity-threshold` to control exit codes
+- `--ignore-additions`, `.infotrackerignore` patterns
+- Baseline file to accept current state; future diffs compare to baseline
+- CI recommend warn-only by default; enforce later if desired
+
 ### Compatibility matrix (illustrative)
 - INT -> BIGINT: non-breaking
 - DECIMAL(10,2) -> DECIMAL(12,2): non-breaking
@@ -82,36 +105,10 @@ If you know basic SQL (SELECT, JOIN, GROUP BY), you have enough to start. These 
 - **Lineage**: how each output column is computed from input columns
 - **Contract**: the promise a dataset makes to its consumers (names, types, meaning)
 
-### Quick start: detect breaking changes locally
-1. Make a branch and change some SQL under `examples/warehouse/sql` (or your SQL dir).
-2. Run a diff against `main`:
-   ```bash
-   infotracker diff --base main --head $(git rev-parse --abbrev-ref HEAD) --sql-dir examples/warehouse/sql
-   ```
-3. Read the result:
-   - Exit code `0`: no changes
-   - Exit code `1`: changes but none breaking
-   - Exit code `2`: breaking detected (warn by default; see actions below)
+### Easy Examples First
+Start with simple cases before advanced ones.
 
-Example human-readable output:
-```text
-Object: dbo.fct_sales
-- BREAKING: Column removed: TotalRevenue
-- NON_BREAKING: Column added: TotalRevenue_v2 (expression identical)
-```
-Example JSON excerpt:
-```json
-{
-  "object": "dbo.fct_sales",
-  "changes": [
-    { "type": "COLUMN_REMOVED", "name": "TotalRevenue", "severity": "BREAKING" },
-    { "type": "COLUMN_ADDED", "name": "TotalRevenue_v2", "severity": "NON_BREAKING" }
-  ]
-}
-```
-
-### Hands-on examples (before → after → classification)
-1) Rename a column
+1) Rename a column (like changing a variable name in code)
 - Before:
   ```sql
   SELECT o.OrderID AS OrderID FROM dbo.Orders o;
@@ -147,7 +144,17 @@ Example JSON excerpt:
 - Before: `SELECT OrderID FROM dbo.Orders` → After: `SELECT OrderID, CreatedAt FROM dbo.Orders`
 - Classification: NON_BREAKING (unless consumers use `SELECT *` and rely on exact positions)
 
-Tip: You can visualize column-level dependencies in `docs/lineage_concepts.md` to see why a change is breaking.
+6) New Example: Changing VARCHAR length in a student database
+- Before: `StudentName VARCHAR(50)`
+- After: `StudentName VARCHAR(30)`
+- Classification: BREAKING (names longer than 30 might get cut, like a box too small for your books).
+
+7) New Example: Adding a filter to a query
+- Before: `SELECT * FROM grades`
+- After: `SELECT * FROM grades WHERE score > 50`
+- Classification: POTENTIALLY_BREAKING (fewer rows, like only showing passing students—changes what data you see).
+
+### Advanced Cases
 
 ### Direct vs indirect lineage can break things
 - Direct lineage change: you change the column itself (rename, remove, type change). Easy to see.
@@ -241,17 +248,36 @@ The job always passes but shows clear warnings if breaking changes are found.
   3) Run a small regression (sample queries, key metrics) to confirm results match your expectation
 - If results look good, roll out to the main schema during a safe window.
 
+### PR comment template (copy/paste)
+```text
+Summary:
+- Change type: [rename|type change|filter change|join change|aggregation change]
+- Objects: dbo.X, dbo.Y
+- Expected impact: [row count/type/nullability/meaning]
+
+Validation:
+- Deployed to: [staging schema/db]
+- Regression: [queries|metrics] show expected results
+- Rollback plan: [revert commit|switch schema back]
+
+Notes:
+- Consumers notified? [Yes/No]
+- Follow-up tasks: [...]
+```
+
+### Notify consumers
+- Post a short summary in the team channel (change, impact, rollout plan)
+- Tag owners of downstream jobs/dashboards if needed
+
 ### How to read the report (beginner-friendly)
 - Start with the object name (e.g., `dbo.fct_sales`).
 - Scan severities: fix BREAKING first, then review POTENTIALLY_BREAKING.
 - For each change, note the column name, type/nullability changes, and any expression diffs.
 - Use lineage hints to locate the exact input columns or transforms causing the change.
 
-### Common pitfalls and how to avoid them
-- Relying on `SELECT *`: prefer explicit column lists to avoid accidental contract changes.
-- Silent type narrowing: be careful when changing DECIMAL precision/scale or casting to smaller types.
-- UNION/SELECT INTO ordinals: keep column orders consistent and aligned.
-- Implicit casts: make type conversions explicit so intent is clear to reviewers and tools.
+### Common Mistakes
+- Using `SELECT *` too much: It can hide changes. Fix: List columns explicitly.
+- Forgetting to check types: Changing INT to VARCHAR can break math operations.
 
 ### Reviewer checklist
 - Are all breaking changes justified and communicated to consumers?

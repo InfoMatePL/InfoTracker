@@ -1,13 +1,20 @@
 ### High-level algorithm
 
 #### Map the labyrinth (bring string, not MINUS)
-To escape the SQL maze, you’ll build maps: object graphs, schemas, and column lineage webs. One step at a time, no Minotaur required.
+To escape the SQL maze, you’ll build maps: object graphs, schemas, and column lineage webs. One step at a time, no special math needed.
 
 - Scout terrain: parse files → objects → dependencies
 - Place torches: resolve schemas, expand stars where safe
 - Trace footprints: build column graph for impact and diff
 
 If you see a star `*`, don’t panic—just expand it after you know what’s upstream.
+
+Plain: compute inputs first, then dependents (this is topological sort).
+
+#### Audience & prerequisites
+- Audience: data engineers, analytics engineers, platform engineers
+
+- Prerequisites: basic SQL; comfortable with CLI and git; Python 3.10+; AST familiarity helpful but optional (AST is Abstract Syntax Tree: a breakdown of code structure).
 
 1. Discover SQL assets and parse to AST (normalize identifiers)
 2. Build object-level dependency graph (views, CTEs, procs/temp tables)
@@ -53,7 +60,50 @@ for obj in order:
 - On unresolved identifiers: record error with location; skip column lineage for affected outputs
 - On unsupported syntax: emit warning; continue best-effort resolution
 - Deterministic ordering of outputs and diagnostics for stable diffs
+- Don’t crash the whole run for one bad file; continue and report
 
 ### Performance notes
 - Cache parsed ASTs and resolved schemas by file hash
 - Short-circuit lineage for unchanged objects between branches 
+
+### Impact search (recursive)
+- Upstream: walk edges from selected column to its input columns until sources are reached
+- Downstream: walk edges from selected column to outputs until targets are reached
+- Stop conditions: max-depth (if given), visited-set to avoid cycles 
+
+### Flowchart
+```mermaid
+flowchart TD
+  A[Discover SQL files] --> B[Parse to AST]
+  B --> C[Build object graph]
+  C --> D[Topological order]
+  D --> E[Resolve input schemas]
+  E --> F[Expand * after inputs known]
+  F --> G[Extract column lineage per output]
+  G --> H[Build column graph]
+  H --> I[Emit OpenLineage + reports]
+```
+
+### Star expansion worked example
+```sql
+CREATE VIEW dbo.vw_orders_all_enriched AS
+SELECT o.*, c.Region
+FROM dbo.Orders o
+JOIN dbo.Customers c ON o.CustomerID = c.CustomerID;
+```
+- Resolve `Orders` and `Customers` schemas first
+- Expand `o.*` by ordinal from `Orders`; append `Region`
+- Track nullability impact from the JOIN type
+
+### Determinism requirements
+- Deterministic output column ordering and schema serialization
+- Deterministic diagnostics (stable file/line ordering)
+- Stable JSON field ordering to make diffs meaningful 
+
+### Simple Example Walkthrough
+Take this SQL: `SELECT id AS student_id FROM students;`
+
+1. Parse to AST: Break into parts like 'SELECT', 'id', 'AS student_id'.
+2. Build object graph: Note dependency on 'students'.
+3. Resolve schemas: Output has 'student_id' from 'students.id'.
+4. Extract lineage: student_id comes from students.id. 

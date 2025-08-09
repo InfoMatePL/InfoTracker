@@ -6,16 +6,19 @@ You are the hero. Your quest: teach a tool to read SQL scrolls and tell true sto
 - Your gear: a CLI, example SQLs, and clear docs
 - Your allies: adapters, lineage graphs, and CI checks
 - Your enemies: sneaky `SELECT *`, UNION goblins, and 3 a.m. alerts
-- Win condition: green checks, clean diffs, and no broken charts
+- Goal: green checks, clear diffs, and no broken charts
 
 If you get stuck, it’s normal. Take a sip of tea, re-read the step, try a smaller example.
 
+### For Beginners
+If you're new to SQL, try this free tutorial: [Khan Academy SQL](https://www.khanacademy.org/computing/computer-programming/sql). It's in simple English and has exercises.
+
 ### Action plan (read and build in this order)
-1) Understand the goal and scope
+1) Understand the goal and scope (1 hour)
    - Overview: [docs/overview.md](docs/overview.md)
    - What you’re building, supported features, and what’s out of scope. Keep this open as your north star.
 
-2) Learn column-level lineage basics
+2) Learn column-level lineage basics (1-2 hours)
    - Concepts: [docs/lineage_concepts.md](docs/lineage_concepts.md)
    - Visual examples showing how each output column maps back to inputs (joins, transforms, aggregations). This informs how your extractor must reason.
 
@@ -48,12 +51,20 @@ If you get stuck, it’s normal. Take a sip of tea, re-read the step, try a smal
    - Breaking changes: [docs/breaking_changes.md](docs/breaking_changes.md)
    - Compare base vs head branches: diff schemas/expressions, classify severity, compute downstream impacts, and emit machine + human-readable reports.
 
+### Milestones (suggested timebox)
+- Day 1–2: read docs, install CLI, run extract on examples
+- Day 3–5: implement simple lineage (no joins), pass gold files
+- Day 6–8: add joins and aggregations, handle star expansion
+- Day 9–10: wire warn-only diff in CI, polish docs
+
+### Acceptance checklist
+- Lineage matches gold JSONs in `examples/warehouse/lineage`
+- Impact queries return correct columns for sample selectors
+- Diff runs in CI (warn-only) and shows helpful messages
+- Docs updated where needed; examples run without errors
+
 ### Quick-start CLI (target behavior)
-```
-infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
-infotracker impact -s dbo.fct_sales.Revenue+
-infotracker diff --base main --head feature/x --sql-dir examples/warehouse/sql
-```
+Simple Example: To test one file, run `infotracker extract --sql-dir examples/warehouse/sql/01_customers.sql --out-dir build/lineage`
 
 ### Tips (pro-level, easy to follow)
 - Start small: one view, then a join, then an aggregate

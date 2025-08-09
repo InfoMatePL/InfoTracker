@@ -1,7 +1,7 @@
 ### Edge cases: SELECT * and star expansion
 
 #### Boss fights (optional, but the loot is sweet)
-Every adventure has bosses. Here, stars explode into many columns, UNIONs misalign like mischievous goblins, and temp tables vanish at dawn. Fear not.
+Every adventure has bosses. Here, stars explode into many columns, UNIONs can misalign columns (wrong order), and temp tables vanish at dawn. Fear not.
 
 - Strategy: resolve first, expand later
 - Keep count: ordinals matter more than riddles
@@ -10,6 +10,33 @@ Every adventure has bosses. Here, stars explode into many columns, UNIONs misali
 Roll for advantage by qualifying ambiguous columns.
 
 Key idea: Build object-level lineage and resolve upstream schemas before expanding `*`.
+
+#### Audience & prerequisites
+- Audience: engineers handling dialect quirks and tricky constructs
+- Prerequisites: SQL joins, set operations, and understanding of nullability/ordinals
+
+### Tiny examples
+- SELECT * in a view (prefer explicit):
+  ```sql
+  -- Not great
+  CREATE VIEW dbo.v1 AS SELECT * FROM dbo.Orders;
+  -- Better
+  CREATE VIEW dbo.v1 AS SELECT OrderID, CustomerID, OrderDate FROM dbo.Orders;
+  ```
+- UNION ordinal mismatch:
+  ```sql
+  SELECT OrderID, CustomerID FROM dbo.Orders WHERE OrderStatus='shipped'
+  UNION ALL
+  SELECT CustomerID, OrderID FROM dbo.Orders WHERE OrderStatus='delivered'; -- wrong order
+  ```
+- SELECT INTO infers schema:
+  ```sql
+  SELECT OrderID, CustomerID INTO dbo.orders_copy FROM dbo.Orders;
+  ```
+
+### Do / Don’t
+- Do: list columns explicitly in views; align UNION columns by position
+- Don’t: rely on `SELECT *` in shared views; don’t reorder UNION columns silently
 
 Included examples:
 - `50_vw_orders_all.sql` — `SELECT *` from base table
@@ -24,6 +51,16 @@ Guidance:
 - Resolve input schemas first; then expand `*`
 - Track column order (UNION, SELECT INTO)
 - Diff resolved star sets across branches to detect breaking changes 
+
+### Star Expansion Example
+Before: `SELECT * FROM students` (unknown columns)
+After Resolution: Expands to `SELECT id, name, age FROM students`
+
+| Before | After |
+|--------|-------|
+| * | id, name, age |
+
+See docs/algorithm.md for more on resolution.
 
 ### Additional edge cases and handling
 - Ambiguous column names without aliases
@@ -46,3 +83,20 @@ Guidance:
   - Handling: note implicit casts; flag potential narrowing in diff
 - Transactional temp tables reused across statements
   - Handling: track temp table schema across statements within procedure scope 
+
+### More examples
+- Window frame (indirect lineage drivers `k`, `dt`):
+```sql
+SELECT SUM(x) OVER (PARTITION BY k ORDER BY dt ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS rolling_sum
+FROM t;
+```
+- TOP/ORDER BY (ordering column is indirect lineage):
+```sql
+SELECT TOP 1 OrderID FROM dbo.Orders ORDER BY OrderDate DESC;
+```
+`OrderDate` influences which row is selected; treat as indirect lineage for `OrderID`.
+
+### See also
+- `docs/algorithm.md`
+- `docs/lineage_concepts.md`
+- `docs/breaking_changes.md` 

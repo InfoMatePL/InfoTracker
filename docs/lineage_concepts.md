@@ -9,6 +9,16 @@ Put on your SQL spectacles and watch how outputs inherit their magic from inputs
 
 If a node name has parentheses, quote it—Mermaid likes polite labels.
 
+Plain: outputs depend on inputs; arrows show that link.
+
+#### Audience & prerequisites
+- Audience: readers new to column-level lineage and impact analysis
+- Prerequisites: basic SQL; familiarity with SELECT/JOIN/GROUP BY
+
+### Diagram legend
+- Node = `db.schema.object.column`
+- Arrow (`A --> B`) = A is used to compute B
+
 Column lineage explains how output columns are derived from input columns across tables, views, joins, and transforms.
 
 #### Simple transform
@@ -206,6 +216,8 @@ graph TD
 - `columnLineage` facet: per-field `inputFields`, `transformationType`, and `transformationDescription`
 - Include concise expressions in descriptions; avoid full SQL dumps
 
+See also `docs/openlineage_mapping.md` for mapping details.
+
 ### Naming and qualification rules
 - MS SQL is case-insensitive; normalize internally but preserve display casing
 - Prefer 3-part names `db.schema.object` in processing; allow `schema.object` and infer db if configured
@@ -214,7 +226,7 @@ graph TD
 ### Direct vs indirect lineage (simple view)
 - Direct lineage: the output column uses an input column directly.
   - Example: `SELECT o.OrderID AS id` → `id` comes straight from `Orders.OrderID`.
-- Indirect lineage: the output value is affected by a column that is not shown in the output.
+- Indirect lineage: the output value is affected by a column that is not shown in the output. Like how a filter in a coffee machine affects the taste without being in the cup.
   - This happens with JOIN keys, WHERE filters, GROUP BY keys, and WINDOW partitions.
 
 Small examples:
@@ -234,4 +246,61 @@ Small examples:
   ```
   `OrderStatus` is not in the output, but it changes which rows exist. It is indirect lineage for `OrderID`.
 
-Tip: when you change JOIN type (LEFT vs INNER) or filters, you change indirect lineage. That can change row counts, nullability, and downstream results. 
+Note on JOINs: INNER JOIN may drop rows; LEFT JOIN keeps left rows and can add NULLs to right columns. This can change row counts and nullability. 
+
+Beginner Note: Start with the simple transform example before jumping to windows.
+
+### End-to-end lineage (recursive)
+We track lineage across many steps. From source to target, the link is continuous.
+
+SQL chain (one column through 4 objects):
+```sql
+-- 1) Base table
+CREATE TABLE dbo.Orders (
+  OrderID INT,
+  CustomerID INT,
+  OrderDate DATE
+);
+
+-- 2) First view (pass-through)
+CREATE VIEW dbo.stg_orders AS
+SELECT o.OrderID
+FROM dbo.Orders AS o;
+
+-- 3) Second view (still pass-through)
+CREATE VIEW dbo.vw_orders_clean AS
+SELECT s.OrderID
+FROM dbo.stg_orders AS s;
+
+-- 4) Final view (target)
+CREATE VIEW dbo.vw_orders_final AS
+SELECT c.OrderID
+FROM dbo.vw_orders_clean AS c;
+```
+Lineage chain (Orders → stg_orders → vw_orders_clean → vw_orders_final):
+```mermaid
+graph TD
+  A[Orders.OrderID] --> B[stg_orders.OrderID]
+  B --> C[vw_orders_clean.OrderID]
+  C --> D[vw_orders_final.OrderID]
+```
+Plain: we follow the column across each step, so end-to-end lineage is clear.
+
+Tip: use the impact command to see the full path (see `docs/cli_usage.md`).
+
+#### Impact path example
+```mermaid
+graph TD
+  A[Orders.OrderID] --> B[stg_orders.OrderID]
+  B --> C[fct_sales.OrderID]
+  C --> D[agg_sales_by_day.TotalOrders]
+```
+
+#### Build Your Own Exercise
+Try this: Write a simple SQL like `SELECT id, name FROM students WHERE age > 18`. Draw arrows showing lineage for 'id' (direct from students.id, indirect from students.age because of the filter).
+
+### See also
+- `docs/overview.md`
+- `docs/breaking_changes.md`
+- `docs/cli_usage.md`
+- `docs/openlineage_mapping.md` 
