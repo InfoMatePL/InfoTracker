@@ -19,8 +19,7 @@ class TestExpectedOutputs:
     def test_customers_table_exact_match(self, sql_content, expected_lineage):
         """Test that customers table output exactly matches expected JSON."""
         sql = sql_content["01_customers"]
-        result_json = self.adapter.extract_lineage(sql, "01_customers")
-        result = json.loads(result_json)
+        result = self.adapter.extract_lineage(sql, "01_customers")
         expected = expected_lineage["01_customers"]
         
         # Normalize for comparison (handles formatting differences)
@@ -56,8 +55,7 @@ class TestExpectedOutputs:
     def test_stg_orders_view_exact_match(self, sql_content, expected_lineage):
         """Test that stg_orders view output exactly matches expected JSON."""
         sql = sql_content["10_stg_orders"]
-        result_json = self.adapter.extract_lineage(sql, "10_stg_orders")
-        result = json.loads(result_json)
+        result = self.adapter.extract_lineage(sql, "10_stg_orders")
         expected = expected_lineage["10_stg_orders"]
         
         # Normalize for comparison
@@ -127,8 +125,7 @@ class TestExpectedOutputs:
             pytest.skip(f"Files for {file_stem} not available")
         
         sql = sql_content[file_stem]
-        result_json = self.adapter.extract_lineage(sql, file_stem)
-        result = json.loads(result_json)
+        result = self.adapter.extract_lineage(sql, file_stem)
         expected = expected_lineage[file_stem]
         
         # Basic structure validation
@@ -167,8 +164,7 @@ class TestExpectedOutputs:
             pytest.skip(f"Files for {file_stem} not available")
         
         sql = sql_content[file_stem]
-        result_json = self.adapter.extract_lineage(sql, file_stem)
-        result = json.loads(result_json)
+        result = self.adapter.extract_lineage(sql, file_stem)
         expected = expected_lineage[file_stem]
         
         # Basic structure validation
@@ -218,8 +214,7 @@ class TestExpectedOutputs:
         for file_stem in sql_content:
             if file_stem in expected_lineage:
                 sql = sql_content[file_stem]
-                result_json = self.adapter.extract_lineage(sql, file_stem)
-                result = json.loads(result_json)
+                result = self.adapter.extract_lineage(sql, file_stem)
                 
                 # Basic validation for each file
                 assert "eventType" in result

@@ -26,21 +26,25 @@ class MssqlAdapter:
         self.parser = SqlParser(dialect=self.dialect)
         self.lineage_generator = OpenLineageGenerator()
 
-    def extract_lineage(self, sql: str, object_hint: str | None = None) -> str:
-        """Extract lineage from SQL and return OpenLineage JSON."""
+    def extract_lineage(self, sql: str, object_hint: str | None = None) -> dict:
+        """Extract lineage from SQL and return OpenLineage JSON as dictionary."""
         try:
             # Parse the SQL and extract object information
             obj_info = self.parser.parse_sql_file(sql, object_hint)
             
-            # Generate OpenLineage JSON
+            # Generate OpenLineage JSON string
             job_name = f"warehouse/sql/{object_hint}.sql" if object_hint else None
-            return self.lineage_generator.generate(obj_info, job_name=job_name, object_hint=object_hint)
+            json_str = self.lineage_generator.generate(obj_info, job_name=job_name, object_hint=object_hint)
+            
+            # Parse back to dictionary for easier programmatic access
+            import json
+            return json.loads(json_str)
             
         except Exception as exc:
             logger.error(f"Failed to extract lineage from SQL: {exc}")
             
             # Return error payload in OpenLineage format
-            error_payload = {
+            return {
                 "eventType": "COMPLETE",
                 "eventTime": "2025-01-01T00:00:00Z",
                 "run": {"runId": "00000000-0000-0000-0000-000000000000"},
@@ -53,13 +57,16 @@ class MssqlAdapter:
                     "namespace": "mssql://localhost/InfoTrackerDW",
                     "name": object_hint or "unknown",
                     "facets": {
-                        "schema": {"fields": []},
-                        "columnLineage": {"fields": []},
+                        "schema": {
+                            "_producer": "https://github.com/OpenLineage/OpenLineage",
+                            "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
+                            "fields": [
+                                {"name": "error", "type": "string", "description": f"Error: {exc}"}
+                            ]
+                        }
                     }
-                }],
-                "warnings": [str(exc)]
+                }]
             }
-            return json.dumps(error_payload, indent=2)
 
 
 _ADAPTERS: Dict[str, Adapter] = {

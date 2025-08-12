@@ -36,3 +36,7 @@ docs/_build/
 (?i)*phase*.py
 (?i)*test*.md
 (?i)*phase*.md
+InfoTracker/PHASE2_COMPLETE.md
+InfoTracker/PHASE3_PLAN.md
+InfoTracker/test_phase2.py
+InfoTracker/test_comprehensive.py
