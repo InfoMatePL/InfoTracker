@@ -1,0 +1,32 @@
+# Środowiska wirtualne
+.venv/
+infotracker-env/
+
+# Pliki i katalogi build
+build/
+dist/
+*.egg-info/
+
+# Cache Pythona
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pliki systemowe
+.DS_Store
+Thumbs.db
+
+# Pliki konfiguracyjne IDE
+.vscode/
+.idea/
+
+# Logi
+*.log
+
+# Zrzuty i pliki tymczasowe
+*.tmp
+*.temp
+
+# Pliki wygenerowane automatycznie
+docs/_build/
