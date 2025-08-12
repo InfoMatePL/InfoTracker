@@ -34,3 +34,5 @@ docs/_build/
 # Ignoruj wszystkie pliki Pythona z 'test' lub 'phase' w nazwie
 *test*.py
 *phase*.py
+*test*.md
+*phase*.md
