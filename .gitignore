@@ -30,3 +30,7 @@ Thumbs.db
 
 # Pliki wygenerowane automatycznie
 docs/_build/
+
+# Ignoruj wszystkie pliki Pythona z 'test' lub 'phase' w nazwie
+*test*.py
+*phase*.py
