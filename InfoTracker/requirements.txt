@@ -5,3 +5,7 @@ PyYAML==6.0.1
 networkx==3.3
 pydantic==2.8.2
 packaging==24.0
+
+# Development dependencies
+pytest>=7.4.0
+pytest-cov>=4.1.0
