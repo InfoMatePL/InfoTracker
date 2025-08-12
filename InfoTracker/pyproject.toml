@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling>=1.26.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "infotracker"
+version = "0.1.0"
+description = "Column-level SQL lineage, impact analysis, and breaking-change detection (MS SQL first)"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "InfoTracker Authors" }]
+keywords = ["data-lineage", "openlineage", "sql", "mssql", "lineage", "impact-analysis"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+  "Environment :: Console",
+]
+dependencies = [
+  "typer>=0.12.3",
+  "rich>=13.7.1",
+  "sqlglot>=23.0.0",
+  "PyYAML>=6.0.1",
+  "networkx>=3.3",
+  "pydantic>=2.8.2",
+  "packaging>=24.0"
+]
+
+
+[project.urls]
+homepage = "https://example.com/infotracker"
+documentation = "https://example.com/infotracker/docs"
+
+[project.scripts]
+infotracker = "infotracker.cli:entrypoint"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/infotracker"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+strict = false
