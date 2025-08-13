@@ -34,5 +34,19 @@ def load_config(path: Optional[Path]) -> RuntimeConfig:
         for k, v in data.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
+    
+    # Load .infotrackerignore if exists
+    ignore_file = Path(".infotrackerignore")
+    if ignore_file.exists():
+        try:
+            ignore_patterns = []
+            for line in ignore_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    ignore_patterns.append(line)
+            cfg.ignore.extend(ignore_patterns)
+        except Exception as e:
+            print(f"Warning: failed to load .infotrackerignore: {e}")
+    
     return cfg
 

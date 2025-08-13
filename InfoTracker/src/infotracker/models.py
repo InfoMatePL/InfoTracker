@@ -22,6 +22,7 @@ class TransformationType(Enum):
     UNION = "UNION"
     STRING_PARSE = "STRING_PARSE"
     WINDOW_FUNCTION = "WINDOW_FUNCTION"
+    WINDOW = "WINDOW"
 
 
 @dataclass
@@ -148,3 +149,154 @@ class ObjectGraph:
                 visit(obj_name)
         
         return result
+
+
+@dataclass
+class ColumnNode:
+    """Node in the column graph representing a fully qualified column."""
+    namespace: str
+    table_name: str
+    column_name: str
+    
+    def __str__(self) -> str:
+        return f"{self.namespace}.{self.table_name}.{self.column_name}"
+    
+    def __hash__(self) -> str:
+        return hash((self.namespace.lower(), self.table_name.lower(), self.column_name.lower()))
+    
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, ColumnNode):
+            return False
+        return (self.namespace.lower() == other.namespace.lower() and 
+                self.table_name.lower() == other.table_name.lower() and
+                self.column_name.lower() == other.column_name.lower())
+
+
+@dataclass
+class ColumnEdge:
+    """Edge in the column graph representing lineage relationship."""
+    from_column: ColumnNode
+    to_column: ColumnNode
+    transformation_type: TransformationType
+    transformation_description: str
+
+
+class ColumnGraph:
+    """Bidirectional graph of column-level lineage relationships."""
+    
+    def __init__(self):
+        self._nodes: Dict[str, ColumnNode] = {}
+        self._upstream_edges: Dict[str, List[ColumnEdge]] = {}  # node -> edges coming into it
+        self._downstream_edges: Dict[str, List[ColumnEdge]] = {}  # node -> edges going out of it
+    
+    def add_node(self, column_node: ColumnNode) -> None:
+        """Add a column node to the graph."""
+        key = str(column_node).lower()
+        self._nodes[key] = column_node
+        if key not in self._upstream_edges:
+            self._upstream_edges[key] = []
+        if key not in self._downstream_edges:
+            self._downstream_edges[key] = []
+    
+    def add_edge(self, edge: ColumnEdge) -> None:
+        """Add a lineage edge to the graph."""
+        from_key = str(edge.from_column).lower()
+        to_key = str(edge.to_column).lower()
+        
+        # Ensure nodes exist
+        self.add_node(edge.from_column)
+        self.add_node(edge.to_column)
+        
+        # Add edge to both directions
+        self._downstream_edges[from_key].append(edge)
+        self._upstream_edges[to_key].append(edge)
+    
+    def get_upstream(self, column: ColumnNode, max_depth: Optional[int] = None) -> List[ColumnEdge]:
+        """Get all upstream dependencies for a column."""
+        return self._traverse_upstream(column, max_depth or 10, set())
+    
+    def get_downstream(self, column: ColumnNode, max_depth: Optional[int] = None) -> List[ColumnEdge]:
+        """Get all downstream dependencies for a column."""
+        return self._traverse_downstream(column, max_depth or 10, set())
+    
+    def _traverse_upstream(self, column: ColumnNode, max_depth: int, visited: Set[str]) -> List[ColumnEdge]:
+        """Recursively traverse upstream dependencies."""
+        if max_depth <= 0:
+            return []
+        
+        column_key = str(column).lower()
+        if column_key in visited:
+            return []  # Avoid cycles
+        
+        visited.add(column_key)
+        edges = []
+        
+        # Get direct upstream edges
+        for edge in self._upstream_edges.get(column_key, []):
+            edges.append(edge)
+            # Recursively get upstream of the source column
+            upstream_edges = self._traverse_upstream(edge.from_column, max_depth - 1, visited.copy())
+            edges.extend(upstream_edges)
+        
+        return edges
+    
+    def _traverse_downstream(self, column: ColumnNode, max_depth: int, visited: Set[str]) -> List[ColumnEdge]:
+        """Recursively traverse downstream dependencies."""
+        if max_depth <= 0:
+            return []
+        
+        column_key = str(column).lower()
+        if column_key in visited:
+            return []  # Avoid cycles
+        
+        visited.add(column_key)
+        edges = []
+        
+        # Get direct downstream edges
+        for edge in self._downstream_edges.get(column_key, []):
+            edges.append(edge)
+            # Recursively get downstream of the target column
+            downstream_edges = self._traverse_downstream(edge.to_column, max_depth - 1, visited.copy())
+            edges.extend(downstream_edges)
+        
+        return edges
+    
+    def build_from_object_lineage(self, objects: List[ObjectInfo]) -> None:
+        """Build column graph from object lineage information."""
+        for obj in objects:
+            output_namespace = obj.schema.namespace
+            output_table = obj.schema.name
+            
+            for lineage in obj.lineage:
+                # Create output column node
+                output_column = ColumnNode(
+                    namespace=output_namespace,
+                    table_name=output_table,
+                    column_name=lineage.output_column
+                )
+                
+                # Create edges for each input field
+                for input_field in lineage.input_fields:
+                    input_column = ColumnNode(
+                        namespace=input_field.namespace,
+                        table_name=input_field.table_name,
+                        column_name=input_field.column_name
+                    )
+                    
+                    edge = ColumnEdge(
+                        from_column=input_column,
+                        to_column=output_column,
+                        transformation_type=lineage.transformation_type,
+                        transformation_description=lineage.transformation_description
+                    )
+                    
+                    self.add_edge(edge)
+    
+    def find_column(self, selector: str) -> Optional[ColumnNode]:
+        """Find a column by selector string (namespace.table.column)."""
+        selector_key = selector.lower()
+        return self._nodes.get(selector_key)
+    
+    def get_all_nodes(self) -> List[ColumnNode]:
+        """Get all column nodes in the graph."""
+        return list(self._nodes.values())

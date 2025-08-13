@@ -1,22 +1,16 @@
 from __future__ import annotations
-
 import json
 import logging
-from typing import Protocol, Dict
-
+from typing import Protocol, Dict, Any, Optional
 from .parser import SqlParser
 from .lineage import OpenLineageGenerator
 
-
 logger = logging.getLogger(__name__)
-
 
 class Adapter(Protocol):
     name: str
     dialect: str
-
-    def extract_lineage(self, sql: str, object_hint: str | None = None) -> str: ...
-
+    def extract_lineage(self, sql: str, object_hint: Optional[str] = None) -> str: ...
 
 class MssqlAdapter:
     name = "mssql"
@@ -26,32 +20,23 @@ class MssqlAdapter:
         self.parser = SqlParser(dialect=self.dialect)
         self.lineage_generator = OpenLineageGenerator()
 
-    def extract_lineage(self, sql: str, object_hint: str | None = None) -> dict:
-        """Extract lineage from SQL and return OpenLineage JSON as dictionary."""
+    def extract_lineage(self, sql: str, object_hint: Optional[str] = None) -> str:
+        """Extract lineage from SQL and return OpenLineage JSON as string."""
         try:
-            # Parse the SQL and extract object information
             obj_info = self.parser.parse_sql_file(sql, object_hint)
-            
-            # Generate OpenLineage JSON string
             job_name = f"warehouse/sql/{object_hint}.sql" if object_hint else None
-            json_str = self.lineage_generator.generate(obj_info, job_name=job_name, object_hint=object_hint)
-            
-            # Parse back to dictionary for easier programmatic access
-            import json
-            return json.loads(json_str)
-            
+            json_str = self.lineage_generator.generate(
+                obj_info, job_name=job_name, object_hint=object_hint
+            )
+            return json_str
         except Exception as exc:
             logger.error(f"Failed to extract lineage from SQL: {exc}")
-            
-            # Return error payload in OpenLineage format
-            return {
+            error_payload = {
                 "eventType": "COMPLETE",
                 "eventTime": "2025-01-01T00:00:00Z",
                 "run": {"runId": "00000000-0000-0000-0000-000000000000"},
-                "job": {
-                    "namespace": "infotracker/examples",
-                    "name": f"warehouse/sql/{object_hint or 'unknown'}.sql"
-                },
+                "job": {"namespace": "infotracker/examples",
+                        "name": f"warehouse/sql/{(object_hint or 'unknown')}.sql"},
                 "inputs": [],
                 "outputs": [{
                     "namespace": "mssql://localhost/InfoTrackerDW",
@@ -62,13 +47,13 @@ class MssqlAdapter:
                             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
                             "fields": [
                                 {"name": "error", "type": "string", "description": f"Error: {exc}"}
-                            ]
+                            ],
                         }
-                    }
-                }]
+                    },
+                }],
             }
-
-
+            return json.dumps(error_payload, indent=2, ensure_ascii=False)
+        
 _ADAPTERS: Dict[str, Adapter] = {
     "mssql": MssqlAdapter(),
 }
@@ -78,4 +63,3 @@ def get_adapter(name: str) -> Adapter:
     if name not in _ADAPTERS:
         raise KeyError(f"Unknown adapter '{name}'. Available: {', '.join(_ADAPTERS)}")
     return _ADAPTERS[name]
-

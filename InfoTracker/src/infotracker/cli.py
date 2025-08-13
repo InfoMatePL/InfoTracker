@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import json
 import sys
 from pathlib import Path
@@ -30,7 +31,7 @@ def main(
     ctx: typer.Context,
     config: Optional[Path] = typer.Option(None, exists=True, dir_okay=False, help="Path to infotracker.yml"),
     log_level: str = typer.Option("info", help="log level: debug|info|warn|error"),
-    format: str = typer.Option("text", help="output format: text|json"),
+    format: str = typer.Option("text", "--format", help="Output format: text|json", show_choices=True),
     version: bool = typer.Option(False, "--version", callback=version_callback, is_eager=True, help="Show version and exit"),
 ):
     ctx.ensure_object(dict)
@@ -39,6 +40,8 @@ def main(
     cfg.log_level = log_level
     cfg.output_format = format
     ctx.obj["cfg"] = cfg
+    level = getattr(logging, cfg.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=level)
 
 
 @app.command()
@@ -49,8 +52,8 @@ def extract(
     adapter: Optional[str] = typer.Option(None),
     catalog: Optional[Path] = typer.Option(None, exists=True),
     fail_on_warn: bool = typer.Option(False),
-    include: Optional[str] = typer.Option(None, help="Glob include pattern"),
-    exclude: Optional[str] = typer.Option(None, help="Glob exclude pattern"),
+    include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
+    exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     engine = Engine(cfg)
@@ -59,12 +62,17 @@ def extract(
         out_dir=out_dir or Path(cfg.out_dir),
         adapter=adapter or cfg.default_adapter,
         catalog=catalog,
-        include=include or (cfg.include[0] if cfg.include else None),
-        exclude=exclude or (cfg.exclude[0] if cfg.exclude else None),
+        include=include or cfg.include,
+        exclude=exclude or cfg.exclude,
         fail_on_warn=fail_on_warn,
     )
     result = engine.run_extract(req)
     _emit(result, cfg.output_format)
+    
+    # Handle fail_on_warn
+    if fail_on_warn and result.get("warnings", 0) > 0:
+        console.print(f"[red]ERROR: {result['warnings']} warnings detected with --fail-on-warn enabled[/red]")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -106,25 +114,31 @@ def diff(
 
 
 def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
+    from rich.table import Table
+    from rich.console import Console
+    import json
+
+    console = Console()
+
     if fmt == "json":
-        text = json.dumps(payload, indent=2, ensure_ascii=False)
-        if out_path:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(text)
-        else:
-            sys.stdout.write(text + "\n")
+        console.print_json(json.dumps(payload, ensure_ascii=False))
         return
 
-    # text format (minimal placeholder)
-    if "rows" in payload and isinstance(payload["rows"], list):
-        table = Table(show_header=True)
-        for k in payload.get("columns", []):
-            table.add_column(k)
-        for r in payload["rows"]:
-            table.add_row(*[str(r.get(c, "")) for c in payload.get("columns", [])])
-        console.print(table)
-    else:
-        console.print(payload)
+    # fmt == "text"
+    table = Table(show_header=True, header_style="bold")
+    cols = payload.get("columns", [])
+    for k in cols:
+        table.add_column(str(k))
+
+    for r in payload.get("rows", []):
+        if isinstance(r, dict):
+            table.add_row(*[str(r.get(c, "")) for c in cols])
+        else:
+            # lista / krotka — dopasuj po pozycji
+            table.add_row(*[str(x) for x in (list(r) + [""] * max(0, len(cols) - len(r)))][:len(cols)])
+
+    console.print(table)
+
 
 
 def entrypoint() -> None:

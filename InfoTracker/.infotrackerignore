@@ -1,0 +1,4 @@
+# Test ignore patterns
+dbo.temp_*
+*usp_*
+# Ignore all procedures

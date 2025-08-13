@@ -35,6 +35,8 @@ class SqlParser:
             
             if isinstance(statement, exp.Create):
                 return self._parse_create_statement(statement, object_hint)
+            elif isinstance(statement, exp.Select) and self._is_select_into(statement):
+                return self._parse_select_into(statement, object_hint)
             else:
                 raise ValueError(f"Unsupported statement type: {type(statement)}")
                 
@@ -51,6 +53,47 @@ class SqlParser:
                 lineage=[],
                 dependencies=set()
             )
+    
+    def _is_select_into(self, statement: exp.Select) -> bool:
+        """Check if this is a SELECT INTO statement."""
+        return statement.args.get('into') is not None
+    
+    def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] = None) -> ObjectInfo:
+        """Parse SELECT INTO statement."""
+        # Get target table name from INTO clause
+        into_expr = statement.args.get('into')
+        if not into_expr:
+            raise ValueError("SELECT INTO requires INTO clause")
+        
+        table_name = self._get_table_name(into_expr, object_hint)
+        namespace = "mssql://localhost/InfoTrackerDW"
+        
+        # Normalize temp table names
+        if table_name.startswith('#'):
+            namespace = "tempdb"
+        
+        # Extract dependencies (tables referenced in FROM/JOIN)
+        dependencies = self._extract_dependencies(statement)
+        
+        # Extract column lineage
+        lineage, output_columns = self._extract_column_lineage(statement, table_name)
+        
+        schema = TableSchema(
+            namespace=namespace,
+            name=table_name,
+            columns=output_columns
+        )
+        
+        # Register schema for future reference
+        self.schema_registry.register(schema)
+        
+        return ObjectInfo(
+            name=table_name,
+            object_type="temp_table" if table_name.startswith('#') else "table",
+            schema=schema,
+            lineage=lineage,
+            dependencies=dependencies
+        )
     
     def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE TABLE or CREATE VIEW statement."""
@@ -400,6 +443,74 @@ class SqlParser:
             
             description = f"{func_name}({str(expr.this) if hasattr(expr, 'this') else '*'})"
             
+        elif isinstance(expr, exp.Window):
+            # Window functions 
+            transformation_type = TransformationType.WINDOW
+            
+            # Extract columns from the window function arguments
+            # Window function structure: function() OVER (PARTITION BY ... ORDER BY ...)
+            inner_function = expr.this  # The function being windowed (ROW_NUMBER, SUM, etc.)
+            
+            # Extract columns from function arguments
+            if hasattr(inner_function, 'find_all'):
+                for column_ref in inner_function.find_all(exp.Column):
+                    table_alias = str(column_ref.table) if column_ref.table else None
+                    column_name = str(column_ref.this)
+                    table_name = self._resolve_table_from_alias(table_alias, context)
+                    
+                    input_fields.append(ColumnReference(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        table_name=table_name,
+                        column_name=column_name
+                    ))
+            
+            # Extract columns from PARTITION BY clause
+            if hasattr(expr, 'partition_by') and expr.partition_by:
+                for partition_col in expr.partition_by:
+                    for column_ref in partition_col.find_all(exp.Column):
+                        table_alias = str(column_ref.table) if column_ref.table else None
+                        column_name = str(column_ref.this)
+                        table_name = self._resolve_table_from_alias(table_alias, context)
+                        
+                        input_fields.append(ColumnReference(
+                            namespace="mssql://localhost/InfoTrackerDW",
+                            table_name=table_name,
+                            column_name=column_name
+                        ))
+            
+            # Extract columns from ORDER BY clause
+            if hasattr(expr, 'order') and expr.order:
+                for order_col in expr.order.expressions:
+                    for column_ref in order_col.find_all(exp.Column):
+                        table_alias = str(column_ref.table) if column_ref.table else None
+                        column_name = str(column_ref.this)
+                        table_name = self._resolve_table_from_alias(table_alias, context)
+                        
+                        input_fields.append(ColumnReference(
+                            namespace="mssql://localhost/InfoTrackerDW",
+                            table_name=table_name,
+                            column_name=column_name
+                        ))
+            
+            # Create description
+            func_name = str(inner_function) if inner_function else "UNKNOWN"
+            partition_cols = []
+            order_cols = []
+            
+            if hasattr(expr, 'partition_by') and expr.partition_by:
+                partition_cols = [str(col) for col in expr.partition_by]
+            if hasattr(expr, 'order') and expr.order:
+                order_cols = [str(col) for col in expr.order.expressions]
+            
+            description = f"{func_name} OVER ("
+            if partition_cols:
+                description += f"PARTITION BY {', '.join(partition_cols)}"
+            if order_cols:
+                if partition_cols:
+                    description += " "
+                description += f"ORDER BY {', '.join(order_cols)}"
+            description += ")"
+            
         elif isinstance(expr, (exp.Mul, exp.Add, exp.Sub, exp.Div)):
             # Arithmetic operations
             transformation_type = TransformationType.ARITHMETIC
@@ -559,8 +670,42 @@ class SqlParser:
         lineage = []
         output_columns = []
         
-        # Get source tables
+        # Get source tables and their aliases
         source_tables = []
+        table_aliases = {}
+        
+        # Check for explicit aliased star (o.*, c.*)
+        for select_expr in select_stmt.expressions:
+            if isinstance(select_expr, exp.Star) and select_expr.table:
+                # This is an aliased star like o.* or c.*
+                alias = str(select_expr.table)
+                table_name = self._resolve_table_from_alias(alias, select_stmt)
+                if table_name != "unknown":
+                    columns = self._infer_table_columns(table_name)
+                    ordinal = len(output_columns)
+                    
+                    for column_name in columns:
+                        output_columns.append(ColumnSchema(
+                            name=column_name,
+                            data_type="unknown",
+                            nullable=True,
+                            ordinal=ordinal
+                        ))
+                        ordinal += 1
+                        
+                        lineage.append(ColumnLineage(
+                            output_column=column_name,
+                            input_fields=[ColumnReference(
+                                namespace="mssql://localhost/InfoTrackerDW",
+                                table_name=table_name,
+                                column_name=column_name
+                            )],
+                            transformation_type=TransformationType.IDENTITY,
+                            transformation_description=f"SELECT {alias}.{column_name}"
+                        ))
+                return lineage, output_columns
+        
+        # Handle unqualified * - expand all tables
         for table in select_stmt.find_all(exp.Table):
             table_name = self._get_table_name(table)
             if table_name != "unknown":
@@ -569,20 +714,19 @@ class SqlParser:
         if not source_tables:
             return lineage, output_columns
         
-        # For star expansion, we need to infer the schema
-        # This is a simplified approach - in practice you'd query the database metadata
-        if len(source_tables) == 1:
-            # Single table - use known schemas or make educated guesses
-            table_name = source_tables[0]
+        # For unqualified *, expand columns from all tables
+        ordinal = 0
+        for table_name in source_tables:
             columns = self._infer_table_columns(table_name)
             
-            for i, column_name in enumerate(columns):
+            for column_name in columns:
                 output_columns.append(ColumnSchema(
                     name=column_name,
                     data_type="unknown",
                     nullable=True,
-                    ordinal=i
+                    ordinal=ordinal
                 ))
+                ordinal += 1
                 
                 lineage.append(ColumnLineage(
                     output_column=column_name,
@@ -592,7 +736,7 @@ class SqlParser:
                         column_name=column_name
                     )],
                     transformation_type=TransformationType.IDENTITY,
-                    transformation_description="SELECT *"
+                    transformation_description=f"SELECT * (from {table_name})"
                 ))
         
         return lineage, output_columns
