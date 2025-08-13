@@ -78,15 +78,14 @@ def extract(
 @app.command()
 def impact(
     ctx: typer.Context,
-    selector: str = typer.Option(..., "-s", "--selector", help="[+]db.schema.object.column[+]"),
-    direction: str = typer.Option("downstream", case_sensitive=False),
+    selector: str = typer.Option(..., "-s", "--selector", help="[+]db.schema.object.column[+] - use + to indicate direction"),
     max_depth: Optional[int] = typer.Option(None),
     out: Optional[Path] = typer.Option(None),
     graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     engine = Engine(cfg)
-    req = ImpactRequest(selector=selector, direction=direction, max_depth=max_depth or 2, graph_dir=graph_dir)
+    req = ImpactRequest(selector=selector, max_depth=max_depth or 2, graph_dir=graph_dir)
     result = engine.run_impact(req)
     _emit(result, cfg.output_format, out)
 

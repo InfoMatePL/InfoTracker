@@ -40,7 +40,6 @@ class ExtractRequest:
 @dataclass
 class ImpactRequest:
     selector: str
-    direction: str = "both"        # "upstream" | "downstream" | "both"
     max_depth: int = 2
     graph_dir: Optional[Path] = None
 
@@ -258,6 +257,27 @@ class Engine:
 
         sel = req.selector.strip()
 
+        # Parse direction from + symbols in selector
+        direction_downstream = False
+        direction_upstream = False
+        
+        if sel.startswith('+') and sel.endswith('+'):
+            # +column+ → both directions
+            direction_downstream = True
+            direction_upstream = True
+            sel = sel[1:-1]  # remove both + symbols
+        elif sel.startswith('+'):
+            # +column → downstream only
+            direction_downstream = True
+            sel = sel[1:]  # remove + from start
+        elif sel.endswith('+'):
+            # column+ → upstream only
+            direction_upstream = True
+            sel = sel[:-1]  # remove + from end
+        else:
+            # column → default (downstream)
+            direction_downstream = True
+
         # Normalizacja selektora - obsługuj różne formaty:
         # 1. table.column -> dbo.table.column
         # 2. schema.table.column -> namespace/schema.table.column (jeśli nie ma protokołu)  
@@ -297,10 +317,10 @@ class Engine:
                 e.transformation_description or "",
             ]
 
-        if req.direction in ("both", "upstream"):
+        if direction_upstream:
             for e in self._column_graph.get_upstream(target, req.max_depth):
                 rows.append(edge_row("upstream", e))
-        if req.direction in ("both", "downstream"):
+        if direction_downstream:
             for e in self._column_graph.get_downstream(target, req.max_depth):
                 rows.append(edge_row("downstream", e))
 
