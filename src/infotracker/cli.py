@@ -82,10 +82,11 @@ def impact(
     direction: str = typer.Option("downstream", case_sensitive=False),
     max_depth: Optional[int] = typer.Option(None),
     out: Optional[Path] = typer.Option(None),
+    graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     engine = Engine(cfg)
-    req = ImpactRequest(selector=selector, direction=direction, max_depth=max_depth)
+    req = ImpactRequest(selector=selector, direction=direction, max_depth=max_depth or 2, graph_dir=graph_dir)
     result = engine.run_impact(req)
     _emit(result, cfg.output_format, out)
 

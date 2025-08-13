@@ -15,7 +15,10 @@ from .models import (
     ObjectInfo,
     ColumnSchema,
     TableSchema,
-    ColumnGraph,  # zakładam, że masz tę klasę w models (jak w poprzednich wersjach)
+    ColumnGraph,
+    ColumnNode,
+    ColumnEdge,
+    TransformationType,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,7 @@ class ImpactRequest:
     selector: str
     direction: str = "both"        # "upstream" | "downstream" | "both"
     max_depth: int = 2
+    graph_dir: Optional[Path] = None
 
 
 @dataclass
@@ -180,13 +184,35 @@ class Engine:
                 logger.warning("failed to process %s: %s", sql_path, e)
 
         # 5) Budowa grafu kolumn z wszystkich sparsowanych obiektów
+        # 5) Budowa grafu kolumn z wszystkich sparsowanych obiektów
         if parsed_objects:
             try:
                 graph = ColumnGraph()
-                graph.build_from_object_lineage(parsed_objects)  # ← kluczowa zmiana
+                graph.build_from_object_lineage(parsed_objects)  # ← użyj tej metody z models.py
                 self._column_graph = graph
+
+                # (opcjonalnie) zapisz graf na dysk, żeby impact mógł go wczytać w osobnym procesie
+                graph_path = Path(req.out_dir) / "column_graph.json"
+                edges_dump = []
+                seen = set()
+                for edges_list in graph._downstream_edges.values():  # prosty eksport krawędzi
+                    for e in edges_list:
+                        key = (str(e.from_column), str(e.to_column),
+                            getattr(e.transformation_type, "value", str(e.transformation_type)),
+                            e.transformation_description or "")
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        edges_dump.append({
+                            "from": str(e.from_column),
+                            "to": str(e.to_column),
+                            "transformation": key[2],
+                            "description": key[3],
+                        })
+                graph_path.write_text(json.dumps({"edges": edges_dump}, indent=2, ensure_ascii=False), encoding="utf-8")
             except Exception as e:
                 logger.warning("failed to build column graph: %s", e)
+
 
         return {
             "columns": ["input_sql", "openlineage_json"],
@@ -205,23 +231,53 @@ class Engine:
         - pełny klucz 'namespace.table.column' dokładnie jak w grafie.
         """
         if not self._column_graph:
-            return {
-                "columns": ["message"],
-                "rows": [["Column graph is not built. Run 'extract' first."]],
-            }
+            # spróbuj wczytać z dysku (ten sam out_dir, co w extract)
+            try:
+                graph_dir = req.graph_dir if req.graph_dir else Path(getattr(self.config, "out_dir", "build/lineage"))
+                graph_path = graph_dir / "column_graph.json"
+                if graph_path.exists():
+                    data = json.loads(graph_path.read_text(encoding="utf-8"))
+                    graph = ColumnGraph()
+                    for edge in data.get("edges", []):
+                        from_ns, from_tbl, from_col = edge["from"].split(".", 2)
+                        to_ns, to_tbl, to_col = edge["to"].split(".", 2)
+                        graph.add_edge(ColumnEdge(
+                            from_column=ColumnNode(from_ns, from_tbl, from_col),
+                            to_column=ColumnNode(to_ns, to_tbl, to_col),
+                            transformation_type=TransformationType(edge.get("transformation", "IDENTITY")),
+                            transformation_description=edge.get("description", ""),
+                        ))
+                    self._column_graph = graph
+            except Exception as e:
+                logger.warning("failed to load column graph from disk: %s", e)
+
+        if not self._column_graph:
+            return {"columns": ["message"],
+                    "rows": [["Column graph is not built. Run 'extract' first."]]}
+
 
         sel = req.selector.strip()
 
-        # prosta normalizacja: jeśli w selektorze są 2 segmenty (table.column), dołóż 'dbo'
-        # jeśli są 3 segmenty (namespace.table.column) – użyj jak jest
-        parts = [p for p in sel.split(".") if p]
-        if len(parts) == 2:
-            sel = f"dbo.{parts[0]}.{parts[1]}"  # dostosuj jeśli masz inny default namespace
-        elif len(parts) != 3:
-            return {
-                "columns": ["message"],
-                "rows": [[f"Unsupported selector format: '{req.selector}'. Use 'dbo.table.column'."]],
-            }
+        # Normalizacja selektora - obsługuj różne formaty:
+        # 1. table.column -> dbo.table.column
+        # 2. schema.table.column -> namespace/schema.table.column (jeśli nie ma protokołu)  
+        # 3. pełny URI -> użyj jak jest
+        if "://" in sel:
+            # pełny URI, użyj jak jest
+            pass
+        else:
+            parts = [p for p in sel.split(".") if p]
+            if len(parts) == 2:
+                # table.column -> dbo.table.column
+                sel = f"dbo.{parts[0]}.{parts[1]}"
+            elif len(parts) == 3:
+                # schema.table.column -> namespace.schema.table.column  
+                sel = f"mssql://localhost/InfoTrackerDW.{sel}"
+            else:
+                return {
+                    "columns": ["message"],
+                    "rows": [[f"Unsupported selector format: '{req.selector}'. Use 'table.column', 'schema.table.column', or full URI."]],
+                }
 
         target = self._column_graph.find_column(sel)
         if not target:
