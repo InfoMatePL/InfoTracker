@@ -1,0 +1,137 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000094" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/94_fn_customer_orders_tvf.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.fn_customer_orders_inline",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrderID from Orders table with parameterized filtering"
+            },
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "CustomerID"} ],
+              "transformationType": "FILTER",
+              "transformationDescription": "CustomerID from Orders table, filtered by @CustomerID parameter"
+            },
+            "OrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "FILTER",
+              "transformationDescription": "OrderDate from Orders table, filtered by @StartDate and @EndDate parameters"
+            },
+            "OrderStatus": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderStatus"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrderStatus from Orders table"
+            },
+            "ProductID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "ProductID from OrderItems table via INNER JOIN"
+            },
+            "Quantity": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "Quantity from OrderItems table"
+            },
+            "UnitPrice": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "UnitPrice from OrderItems table"
+            },
+            "ExtendedPrice": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "ARITHMETIC",
+              "transformationDescription": "Quantity * UnitPrice computed in inline table-valued function"
+            },
+            "IsFulfilled": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderStatus"} ],
+              "transformationType": "CASE",
+              "transformationDescription": "CASE WHEN OrderStatus IN ('shipped','delivered') THEN 1 ELSE 0 END"
+            }
+          }
+        }
+      }
+    },
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.fn_customer_orders_mstvf",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrderID from Orders table with parameterized filtering"
+            },
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "CustomerID"} ],
+              "transformationType": "FILTER",
+              "transformationDescription": "CustomerID from Orders table, filtered by @CustomerID parameter"
+            },
+            "OrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "FILTER",
+              "transformationDescription": "OrderDate from Orders table, filtered by @StartDate and @EndDate parameters"
+            },
+            "OrderStatus": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderStatus"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrderStatus from Orders table"
+            },
+            "ProductID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "ProductID from OrderItems table via INNER JOIN"
+            },
+            "Quantity": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "Quantity from OrderItems table"
+            },
+            "UnitPrice": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "UnitPrice from OrderItems table"
+            },
+            "ExtendedPrice": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "ARITHMETIC",
+              "transformationDescription": "Quantity * UnitPrice computed in multi-statement table-valued function"
+            },
+            "IsFulfilled": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderStatus"} ],
+              "transformationType": "CASE",
+              "transformationDescription": "CASE WHEN OrderStatus IN ('shipped','delivered') THEN 1 ELSE 0 END"
+            },
+            "DaysSinceOrder": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "DATE_FUNCTION",
+              "transformationDescription": "DATEDIFF(DAY, OrderDate, GETDATE()) computed in multi-statement function"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -67,6 +67,9 @@ sql/
   91_usp_snapshot_recent_orders_star.sql
   92_usp_rebuild_recent_sales_with_vars.sql
   93_usp_top_products_since_var.sql
+  94_fn_customer_orders_tvf.sql
+  95_usp_customer_metrics_dataset.sql
+  96_demo_usage_tvf_and_proc.sql
 lineage/
   one JSON per SQL file with OpenLineage column lineage
 ```
@@ -111,6 +114,9 @@ graph TD
 - `41_agg_sales_by_day.sql`: Aggregates with GROUP BY and SUM
 - `50_*` to `56_*`: star expansion variants, UNION, filters
 - `90_*` to `93_*`: procedures with temp tables, SELECT INTO, and variables
+- `94_fn_customer_orders_tvf.sql`: parametrized tabular function with two syntax variants (RETURN AS and RETURN TABLE)
+- `95_usp_customer_metrics_dataset.sql`: procedure that returns a dataset for further processing
+- `96_demo_usage_tvf_and_proc.sql`: demonstration of using both objects together in workflows
 
 ### Using the corpus
 - Treat JSON files in `lineage/` as gold outputs — your extractor must match them exactly
