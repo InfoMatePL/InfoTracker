@@ -1,4 +1,4 @@
-CREATE OR ALTER PROCEDURE dbo.usp_refresh_sales_with_temp
+CREATE OR ALTER PROCEDURE INFOMART.dbo.usp_refresh_sales_with_temp
 AS
 BEGIN
     SET NOCOUNT ON;
@@ -8,7 +8,7 @@ BEGIN
     IF OBJECT_ID('tempdb..#recent_orders') IS NOT NULL DROP TABLE #recent_orders;
     SELECT o.OrderID, o.CustomerID, o.OrderDate
     INTO #recent_orders
-    FROM dbo.Orders AS o
+    FROM STG.dbo.Orders AS o
     WHERE o.OrderDate >= DATEADD(DAY, -7, GETDATE());
 
     IF OBJECT_ID('tempdb..#sales') IS NOT NULL DROP TABLE #sales;
@@ -20,10 +20,10 @@ BEGIN
         CAST(oi.Quantity * oi.UnitPrice AS DECIMAL(18,2)) AS Revenue
     INTO #sales
     FROM #recent_orders AS r
-    JOIN dbo.OrderItems AS oi
+    JOIN STG.dbo.OrderItems AS oi
       ON oi.OrderID = r.OrderID;
 
-    IF OBJECT_ID('dbo.fct_sales_snapshot', 'U') IS NULL
+    IF OBJECT_ID('INFOMART.dbo.fct_sales_snapshot', 'U') IS NULL
     BEGIN
         SELECT
             @snapshotDate AS SnapshotDate,
@@ -32,13 +32,13 @@ BEGIN
             s.CustomerID,
             s.ProductID,
             s.Revenue
-        INTO dbo.fct_sales_snapshot
+        INTO INFOMART.dbo.fct_sales_snapshot
         FROM #sales AS s;
     END
     ELSE
     BEGIN
-        DELETE FROM dbo.fct_sales_snapshot WHERE SnapshotDate = @snapshotDate;
-        INSERT INTO dbo.fct_sales_snapshot (
+        DELETE FROM INFOMART.dbo.fct_sales_snapshot WHERE SnapshotDate = @snapshotDate;
+        INSERT INTO INFOMART.dbo.fct_sales_snapshot (
             SnapshotDate, SalesID, OrderDate, CustomerID, ProductID, Revenue
         )
         SELECT

@@ -192,8 +192,11 @@ class SqlParser:
     def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None) -> str:
         """Extract table name from expression."""
         if isinstance(table_expr, exp.Table):
-            # Handle qualified names like dbo.table_name
-            if table_expr.db:
+            # Handle three-part names: database.schema.table
+            if table_expr.catalog and table_expr.db:
+                return f"{table_expr.catalog}.{table_expr.db}.{table_expr.name}"
+            # Handle two-part names like dbo.table_name (legacy format)
+            elif table_expr.db:
                 return f"{table_expr.db}.{table_expr.name}"
             return str(table_expr.name)
         elif isinstance(table_expr, exp.Identifier):
@@ -676,7 +679,7 @@ class SqlParser:
         
         # Check for explicit aliased star (o.*, c.*)
         for select_expr in select_stmt.expressions:
-            if isinstance(select_expr, exp.Star) and select_expr.table:
+            if isinstance(select_expr, exp.Star) and hasattr(select_expr, 'table') and select_expr.table:
                 # This is an aliased star like o.* or c.*
                 alias = str(select_expr.table)
                 table_name = self._resolve_table_from_alias(alias, select_stmt)
@@ -790,8 +793,21 @@ class SqlParser:
         return lineage, output_columns
     
     def _infer_table_columns(self, table_name: str) -> List[str]:
-        """Infer table columns based on known schemas or naming patterns."""
-        # This is a simplified approach - you'd typically query the database
+        """Infer table columns from schema registry or fallback to patterns."""
+        # First try to get from schema registry
+        # Try different namespace combinations
+        namespaces_to_try = [
+            "mssql://localhost/InfoTrackerDW",
+            "dbo", 
+            "",
+        ]
+        
+        for namespace in namespaces_to_try:
+            schema = self.schema_registry.get(namespace, table_name)
+            if schema:
+                return [col.name for col in schema.columns]
+        
+        # Fallback to patterns if not in registry
         table_simple = table_name.split('.')[-1].lower()
         
         if 'orders' in table_simple:

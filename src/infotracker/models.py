@@ -297,6 +297,52 @@ class ColumnGraph:
         selector_key = selector.lower()
         return self._nodes.get(selector_key)
     
-    def get_all_nodes(self) -> List[ColumnNode]:
-        """Get all column nodes in the graph."""
-        return list(self._nodes.values())
+    
+    def find_columns_wildcard(self, selector: str) -> List[ColumnNode]:
+            """
+            Find columns matching a wildcard pattern.
+
+            Supports:
+            - Table wildcard:   <ns>.<schema>.<table>.*     → all columns of that table
+            - Column wildcard:  <optional_ns>..<pattern>    → match by COLUMN NAME only:
+                * if pattern contains any of [*?[]] → fnmatch on the column name
+                * otherwise → default to case-insensitive "contains"
+            - Fallback:         fnmatch on the full identifier "ns.schema.table.column"
+            """
+            import fnmatch as _fn
+
+            sel = (selector or "").strip().lower()
+
+            # 1) Table wildcard: "...schema.table.*"
+            if sel.endswith(".*"):
+                table_sel = sel[:-1]  # remove trailing '*', keep final dot
+                # simple prefix match on full key
+                return [node for key, node in self._nodes.items() if key.startswith(table_sel)]
+
+            # 2) Column wildcard: "<optional_ns>..<pattern>"
+            if ".." in sel:
+                ns_part, col_pat = sel.split("..", 1)
+                ns_part = ns_part.strip(".")
+                col_pat = col_pat.strip()
+
+                # if no explicit wildcard meta, treat as "contains"
+                has_meta = any(ch in col_pat for ch in "*?[]")
+
+                def col_name_matches(name: str) -> bool:
+                    name = (name or "").lower()
+                    if has_meta:
+                        return _fn.fnmatch(name, col_pat)
+                    return col_pat in name  # default: contains (case-insensitive)
+
+                if ns_part:
+                    ns_prefix = ns_part + "."
+                    return [
+                        node
+                        for key, node in self._nodes.items()
+                        if key.startswith(ns_prefix) and col_name_matches(getattr(node, "column_name", ""))
+                    ]
+                else:
+                    return [node for node in self._nodes.values() if col_name_matches(getattr(node, "column_name", ""))]
+
+            # 3) Fallback: fnmatch on the full identifier
+            return [node for key, node in self._nodes.items() if _fn.fnmatch(key, sel)]

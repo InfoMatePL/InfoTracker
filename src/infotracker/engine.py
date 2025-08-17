@@ -5,7 +5,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from fnmatch import fnmatch
 
 import yaml
@@ -136,39 +136,70 @@ class Engine:
             if match_any(p, includes) and not match_any(p, excludes)
         ]
 
-        # 3) Parsowanie i generacja OL
+        # 3) Parse all files first to build dependency graph
         out_dir = Path(req.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         outputs: List[List[str]] = []
         parsed_objects: List[ObjectInfo] = []
+        sql_file_map: Dict[str, Path] = {}  # object_name -> file_path
 
         ignore_patterns: List[str] = list(getattr(self.config, "ignore", []) or [])
 
+        # Phase 1: Parse all SQL files and collect objects
         for sql_path in sql_files:
             try:
                 sql_text = sql_path.read_text(encoding="utf-8")
-
-                # Parse do ObjectInfo (na potrzeby ignorów i grafu)
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
-                parsed_objects.append(obj_info)
-
-                # ignore po nazwie obiektu (string), nie po ObjectInfo
+                
+                # Store mapping for later processing
                 obj_name = getattr(getattr(obj_info, "schema", None), "name", None) or getattr(obj_info, "name", None)
-                if obj_name and ignore_patterns and any(fnmatch(obj_name, pat) for pat in ignore_patterns):
-                    continue
+                if obj_name:
+                    sql_file_map[obj_name] = sql_path
+                    
+                    # Skip ignored objects
+                    if ignore_patterns and any(fnmatch(obj_name, pat) for pat in ignore_patterns):
+                        continue
+                        
+                    parsed_objects.append(obj_info)
+                    
+            except Exception as e:
+                warnings += 1
+                logger.warning("failed to parse %s: %s", sql_path, e)
 
-                # Adapter → payload (str lub dict) → normalizacja do dict
+        # Phase 2: Build dependency graph and resolve schemas in topological order
+        dependency_graph = self._build_dependency_graph(parsed_objects)
+        processing_order = self._topological_sort(dependency_graph)
+        
+        # Phase 3: Process objects in dependency order, building up schema registry
+        for obj_name in processing_order:
+            if obj_name not in sql_file_map:
+                continue
+                
+            sql_path = sql_file_map[obj_name]
+            try:
+                sql_text = sql_path.read_text(encoding="utf-8")
+                
+                # Parse with updated schema registry (now has dependencies resolved)
+                obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                
+                # Register this object's schema for future dependencies
+                if obj_info.schema:
+                    parser.schema_registry.register(obj_info.schema)
+                    # Also register in adapter's parser for lineage generation
+                    adapter.parser.schema_registry.register(obj_info.schema)
+
+                # Generate OpenLineage with resolved schema context
                 ol_raw = adapter.extract_lineage(sql_text, object_hint=sql_path.stem)
                 ol_payload: Dict[str, Any] = json.loads(ol_raw) if isinstance(ol_raw, str) else ol_raw
 
-                # Zapis do pliku (deterministyczny)
+                # Save to file
                 target = out_dir / f"{sql_path.stem}.json"
                 target.write_text(json.dumps(ol_payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
                 outputs.append([str(sql_path), str(target)])
 
-                # Heurystyka warnings – patrzymy w outputs[0].facets
+                # Check for warnings
                 out0 = (ol_payload.get("outputs") or [])
                 out0 = out0[0] if out0 else {}
                 facets = out0.get("facets", {})
@@ -219,6 +250,47 @@ class Engine:
             "warnings": warnings,
         }
 
+    def _build_dependency_graph(self, objects: List[ObjectInfo]) -> Dict[str, Set[str]]:
+        """Build dependency graph: object_name -> set of dependencies."""
+        dependencies = {}
+        
+        for obj in objects:
+            obj_name = obj.schema.name if obj.schema else obj.name
+            dependencies[obj_name] = set()
+            
+            # Find dependencies from lineage input fields
+            for lineage in obj.lineage:
+                for input_field in lineage.input_fields:
+                    dep_name = input_field.table_name
+                    if dep_name != obj_name:  # Don't depend on self
+                        dependencies[obj_name].add(dep_name)
+        
+        return dependencies
+    
+    def _topological_sort(self, dependencies: Dict[str, Set[str]]) -> List[str]:
+        """Sort objects in dependency order (dependencies first)."""
+        result = []
+        remaining = dependencies.copy()
+        
+        while remaining:
+            # Find nodes with no dependencies (or dependencies already processed)
+            ready = []
+            for node, deps in remaining.items():
+                if not deps or all(dep in result for dep in deps):
+                    ready.append(node)
+            
+            if not ready:
+                # Circular dependency or missing dependency - process remaining arbitrarily
+                ready = [next(iter(remaining.keys()))]
+                logger.warning("Circular or missing dependencies detected, processing: %s", ready[0])
+            
+            # Process ready nodes
+            for node in ready:
+                result.append(node)
+                del remaining[node]
+        
+        return result
+
     # ------------------ IMPACT (prosty wariant; zostaw swój jeśli masz bogatszy) ------------------
 
     def run_impact(self, req: ImpactRequest) -> Dict[str, Any]:
@@ -267,44 +339,84 @@ class Engine:
             direction_upstream = True
             sel = sel[1:-1]  # remove both + symbols
         elif sel.startswith('+'):
-            # +column → downstream only
-            direction_downstream = True
+            # +column → upstream only
+            direction_upstream = True
             sel = sel[1:]  # remove + from start
         elif sel.endswith('+'):
-            # column+ → upstream only
-            direction_upstream = True
+            # column+ → downstream only
+            direction_downstream = True
             sel = sel[:-1]  # remove + from end
         else:
             # column → default (downstream)
             direction_downstream = True
 
         # Normalizacja selektora - obsługuj różne formaty:
-        # 1. table.column -> dbo.table.column
-        # 2. schema.table.column -> namespace/schema.table.column (jeśli nie ma protokołu)  
-        # 3. pełny URI -> użyj jak jest
+        # 1. table.column -> dbo.table.column (legacy)
+        # 2. schema.table.column -> schema.table.column (legacy)
+        # 3. database.schema.table.column -> namespace/database.schema.table.column  
+        # 4. database.schema.table.* -> namespace/database.schema.table.* (table wildcard)
+        # 5. ..column -> ..column (column wildcard)
+        # 6. pełny URI -> użyj jak jest
         if "://" in sel:
             # pełny URI, użyj jak jest
             pass
+        elif sel.startswith('.') and not sel.startswith('..'):
+            # Alias: .column -> ..column (column wildcard in default namespace)
+            sel = f"mssql://localhost/InfoTrackerDW..{sel[1:]}"
+        elif sel.startswith('..'):
+            # Column wildcard pattern - leave as is, will be handled specially
+            sel = f"mssql://localhost/InfoTrackerDW{sel}"
+        elif sel.endswith('.*'):
+            # Table wildcard pattern
+            base_sel = sel[:-2]  # Remove .*
+            parts = [p for p in base_sel.split(".") if p]
+            if len(parts) == 2:
+                # schema.table.* -> namespace/schema.table.*
+                sel = f"mssql://localhost/InfoTrackerDW.{base_sel}.*"
+            elif len(parts) == 3:
+                # database.schema.table.* -> namespace/database.schema.table.*
+                sel = f"mssql://localhost/InfoTrackerDW.{base_sel}.*"
+            else:
+                return {
+                    "columns": ["message"],
+                    "rows": [[f"Unsupported wildcard selector format: '{req.selector}'. Use 'schema.table.*' or 'database.schema.table.*'."]],
+                }
         else:
             parts = [p for p in sel.split(".") if p]
             if len(parts) == 2:
-                # table.column -> dbo.table.column
+                # table.column -> dbo.table.column (legacy)
                 sel = f"dbo.{parts[0]}.{parts[1]}"
             elif len(parts) == 3:
-                # schema.table.column -> namespace.schema.table.column  
+                # schema.table.column -> schema.table.column (legacy)
+                sel = f"mssql://localhost/InfoTrackerDW.{sel}"
+            elif len(parts) == 4:
+                # database.schema.table.column -> namespace/database.schema.table.column  
                 sel = f"mssql://localhost/InfoTrackerDW.{sel}"
             else:
                 return {
                     "columns": ["message"],
-                    "rows": [[f"Unsupported selector format: '{req.selector}'. Use 'table.column', 'schema.table.column', or full URI."]],
+                    "rows": [[f"Unsupported selector format: '{req.selector}'. Use 'table.column', 'schema.table.column', 'database.schema.table.column', 'database.schema.table.*' (table wildcard), '..columnname' (column wildcard), '.columnname' (alias), or full URI."]],
                 }
 
         target = self._column_graph.find_column(sel)
-        if not target:
-            return {
-                "columns": ["message"],
-                "rows": [[f"Column '{sel}' not found in graph."]],
-            }
+        targets = []
+        
+        # Check if this is a wildcard selector
+        if '*' in sel or '..' in sel or sel.endswith('.*'):
+            targets = self._column_graph.find_columns_wildcard(sel)
+            if not targets:
+                return {
+                    "columns": ["message"],
+                    "rows": [[f"No columns found matching pattern '{sel}'."]],
+                }
+        else:
+            # Single column selector
+            if not target:
+                return {
+                    "columns": ["message"],
+                    "rows": [[f"Column '{sel}' not found in graph."]],
+                }
+            targets = [target]
 
         rows: List[List[str]] = []
 
@@ -317,16 +429,34 @@ class Engine:
                 e.transformation_description or "",
             ]
 
-        if direction_upstream:
-            for e in self._column_graph.get_upstream(target, req.max_depth):
-                rows.append(edge_row("upstream", e))
-        if direction_downstream:
-            for e in self._column_graph.get_downstream(target, req.max_depth):
-                rows.append(edge_row("downstream", e))
+        # Process all target columns
+        for target in targets:
+            if direction_upstream:
+                for e in self._column_graph.get_upstream(target, req.max_depth):
+                    rows.append(edge_row("upstream", e))
+            if direction_downstream:
+                for e in self._column_graph.get_downstream(target, req.max_depth):
+                    rows.append(edge_row("downstream", e))
+
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_rows = []
+        for row in rows:
+            row_tuple = tuple(row)
+            if row_tuple not in seen:
+                seen.add(row_tuple)
+                unique_rows.append(row)
+
+        if not unique_rows:
+            # Show info about the matched columns
+            if len(targets) == 1:
+                unique_rows = [[str(targets[0]), str(targets[0]), "info", "", "No relationships found"]]
+            else:
+                unique_rows = [[f"Matched {len(targets)} columns", "", "info", "", f"Pattern: {req.selector}"]]
 
         return {
             "columns": ["from", "to", "direction", "transformation", "description"],
-            "rows": rows or [[str(target), str(target), "info", "", "No relationships found"]],
+            "rows": unique_rows,
         }
 
 
