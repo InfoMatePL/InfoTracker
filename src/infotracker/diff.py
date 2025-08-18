@@ -3,7 +3,7 @@ Breaking change detection for InfoTracker.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Set, Any
 
@@ -44,11 +44,56 @@ class Change:
     impact_count: int = 0  # Number of downstream columns affected
 
 
+@dataclass
+class DiffReport:
+    """Report containing detected changes and metadata."""
+    changes: List[Change] = field(default_factory=list)
+    
+    @property
+    def has_breaking(self) -> bool:
+        """Check if there are any breaking changes."""
+        return any(c.severity == Severity.BREAKING for c in self.changes)
+    
+    @property
+    def rows(self) -> List[List[str]]:
+        """Get rows for table display."""
+        return [
+            [c.object_name, c.change_type.value, c.severity.value, c.description]
+            for c in self.changes
+        ]
+    
+    @property
+    def columns(self) -> List[str]:
+        """Get column headers for table display."""
+        return ["object", "change_type", "severity", "description"]
+
+
+@dataclass
+class DiffResult:
+    """Result of diff operation."""
+    report: DiffReport
+    exit_code: int
+    
+    @property
+    def rows(self) -> List[List[str]]:
+        return self.report.rows
+    
+    @property
+    def columns(self) -> List[str]:
+        return self.report.columns
+
+
 class BreakingChangeDetector:
     """Detects breaking changes between two sets of object information."""
     
     def __init__(self):
         self.changes: List[Change] = []
+    
+    def compare(self, base_objects: List[ObjectInfo], head_objects: List[ObjectInfo]) -> DiffReport:
+        """Compare base and head objects and return a diff report."""
+        self.changes = []
+        self.detect_changes(base_objects, head_objects)
+        return DiffReport(changes=self.changes.copy())
     
     def detect_changes(self, base_objects: List[ObjectInfo], head_objects: List[ObjectInfo]) -> List[Change]:
         """Detect changes between base and head object lists."""

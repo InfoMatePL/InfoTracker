@@ -8,6 +8,11 @@ import yaml
 
 
 @dataclass
+class OpenLineageCfg:
+    namespace: str = "mssql"
+
+
+@dataclass
 class RuntimeConfig:
     default_adapter: str = "mssql"
     default_database: Optional[str] = None
@@ -20,6 +25,7 @@ class RuntimeConfig:
     catalog: Optional[str] = None
     log_level: str = "info"
     output_format: str = "text"
+    openlineage: OpenLineageCfg = field(default_factory=OpenLineageCfg)
 
 
 def load_config(path: Optional[Path]) -> RuntimeConfig:

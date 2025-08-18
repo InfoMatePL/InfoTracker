@@ -93,23 +93,20 @@ def impact(
 @app.command()
 def diff(
     ctx: typer.Context,
-    base: str = typer.Option(..., help="git ref name for base"),
-    head: str = typer.Option(..., help="git ref name for head"),
-    sql_dir: Optional[Path] = typer.Option(None, exists=True, file_okay=False),
-    adapter: Optional[str] = typer.Option(None),
-    severity_threshold: str = typer.Option("BREAKING"),
+    base: Optional[Path] = typer.Option(None, "--base", help="Directory containing base OpenLineage artifacts"),
+    head: Optional[Path] = typer.Option(None, "--head", help="Directory containing head OpenLineage artifacts"),
+    format: str = typer.Option("text", "--format", help="Output format: text|json"),
 ):
+    """Compare two sets of OpenLineage artifacts for breaking changes."""
     cfg: RuntimeConfig = ctx.obj["cfg"]
     engine = Engine(cfg)
-    req = DiffRequest(
-        base=base,
-        head=head,
-        sql_dir=sql_dir or Path(cfg.sql_dir),
-        adapter=adapter or cfg.default_adapter,
-        severity_threshold=severity_threshold,
-    )
-    result = engine.run_diff(req)
-    _emit(result, cfg.output_format)
+    
+    if not base or not head:
+        console.print("[red]ERROR: Both --base and --head directories are required[/red]")
+        raise typer.Exit(1)
+    
+    result = engine.run_diff(base, head, format)
+    _emit(result, format)
     raise typer.Exit(code=result.get("exit_code", 0))
 
 
@@ -121,23 +118,42 @@ def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
     console = Console()
 
     if fmt == "json":
-        console.print_json(json.dumps(payload, ensure_ascii=False))
-        return
+        content = json.dumps(payload, ensure_ascii=False, indent=2)
+    else:
+        # fmt == "text" - we'll capture the table as a string
+        table = Table(show_header=True, header_style="bold")
+        cols = payload.get("columns", [])
+        for k in cols:
+            table.add_column(str(k))
 
-    # fmt == "text"
-    table = Table(show_header=True, header_style="bold")
-    cols = payload.get("columns", [])
-    for k in cols:
-        table.add_column(str(k))
+        for r in payload.get("rows", []):
+            if isinstance(r, dict):
+                table.add_row(*[str(r.get(c, "")) for c in cols])
+            else:
+                # lista / krotka — dopasuj po pozycji
+                table.add_row(*[str(x) for x in (list(r) + [""] * max(0, len(cols) - len(r)))][:len(cols)])
 
-    for r in payload.get("rows", []):
-        if isinstance(r, dict):
-            table.add_row(*[str(r.get(c, "")) for c in cols])
+        if out_path:
+            # Capture table as string for file output
+            from io import StringIO
+            string_io = StringIO()
+            temp_console = Console(file=string_io, width=120)
+            temp_console.print(table)
+            content = string_io.getvalue()
         else:
-            # lista / krotka — dopasuj po pozycji
-            table.add_row(*[str(x) for x in (list(r) + [""] * max(0, len(cols) - len(r)))][:len(cols)])
+            # Print to stdout
+            console.print(table)
+            return
 
-    console.print(table)
+    # Write to file if out_path is specified
+    if out_path:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(content, encoding='utf-8')
+        console.print(f"[green]Output written to {out_path}[/green]")
+    else:
+        # Print to stdout for JSON format
+        if fmt == "json":
+            console.print_json(content)
 
 
 

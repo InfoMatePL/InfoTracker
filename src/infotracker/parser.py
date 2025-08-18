@@ -24,6 +24,11 @@ class SqlParser:
     def __init__(self, dialect: str = "tsql"):
         self.dialect = dialect
         self.schema_registry = SchemaRegistry()
+        self.default_database: Optional[str] = None  # Will be set from config
+    
+    def set_default_database(self, default_database: Optional[str]):
+        """Set the default database for qualification."""
+        self.default_database = default_database
     
     def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
         """Find the last SELECT statement in SQL content using SQLGlot AST."""
@@ -164,31 +169,36 @@ class SqlParser:
             
             # For EXEC temp tables, we create placeholder columns since we can't determine 
             # the actual structure without executing the procedure
+            # Create at least 2 output columns as per the requirement
             output_columns = [
                 ColumnSchema(
-                    name="Unknown",
+                    name="output_col_1",
                     data_type="unknown",
-                    position=1,
-                    is_nullable=True
+                    ordinal=0,
+                    nullable=True
+                ),
+                ColumnSchema(
+                    name="output_col_2",
+                    data_type="unknown",
+                    ordinal=1,
+                    nullable=True
                 )
             ]
             
             # Create placeholder lineage pointing to the procedure
             lineage = []
             if procedure_name:
-                lineage.append(ColumnLineage(
-                    target_column=ColumnNode(
-                        namespace=namespace,
-                        table=table_name,
-                        column="Unknown"
-                    ),
-                    source_columns=[ColumnNode(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table=procedure_name,
-                        column="*"  # Wildcard since we don't know the procedure output
-                    )],
-                    transformation_type="exec_procedure"
-                ))
+                for i, col in enumerate(output_columns):
+                    lineage.append(ColumnLineage(
+                        output_column=col.name,
+                        input_fields=[ColumnReference(
+                            namespace="mssql://localhost/InfoTrackerDW",
+                            table_name=procedure_name,
+                            column_name="*"  # Wildcard since we don't know the procedure output
+                        )],
+                        transformation_type=TransformationType.EXEC,
+                        transformation_description=f"INSERT INTO {table_name} EXEC {procedure_name}"
+                    ))
             
             schema = TableSchema(
                 namespace=namespace,
@@ -374,33 +384,51 @@ class SqlParser:
         )
     
     def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None) -> str:
-        """Extract table name from expression."""
+        """Extract table name from expression and qualify with default database if needed."""
+        from .openlineage_utils import qualify_identifier
+        
         if isinstance(table_expr, exp.Table):
             # Handle three-part names: database.schema.table
             if table_expr.catalog and table_expr.db:
                 return f"{table_expr.catalog}.{table_expr.db}.{table_expr.name}"
             # Handle two-part names like dbo.table_name (legacy format)
             elif table_expr.db:
-                return f"{table_expr.db}.{table_expr.name}"
-            return str(table_expr.name)
+                table_name = f"{table_expr.db}.{table_expr.name}"
+                return qualify_identifier(table_name, self.default_database)
+            else:
+                table_name = str(table_expr.name)
+                return qualify_identifier(table_name, self.default_database)
         elif isinstance(table_expr, exp.Identifier):
-            return str(table_expr.this)
+            table_name = str(table_expr.this)
+            return qualify_identifier(table_name, self.default_database)
         return hint or "unknown"
     
     def _extract_column_type(self, column_def: exp.ColumnDef) -> str:
         """Extract column type from column definition."""
         if column_def.kind:
             data_type = str(column_def.kind)
-            # Convert to match expected format (lowercase for simple types)
-            if data_type.upper().startswith('VARCHAR'):
-                data_type = data_type.replace('VARCHAR', 'nvarchar')
-            elif data_type.upper() == 'INT':
-                data_type = 'int'
-            elif data_type.upper() == 'DATE':
-                data_type = 'date'
-            elif 'DECIMAL' in data_type.upper():
+            
+            # Type normalization mappings - adjust these as needed for your environment
+            # Note: This aggressive normalization can be modified by updating the mappings below
+            TYPE_MAPPINGS = {
+                'VARCHAR': 'nvarchar',  # SQL Server: VARCHAR -> NVARCHAR
+                'INT': 'int',
+                'DATE': 'date',
+            }
+            
+            data_type_upper = data_type.upper()
+            for old_type, new_type in TYPE_MAPPINGS.items():
+                if data_type_upper.startswith(old_type):
+                    data_type = data_type.replace(old_type, new_type)
+                    break
+                elif data_type_upper == old_type:
+                    data_type = new_type
+                    break
+            
+            if 'DECIMAL' in data_type_upper:
                 # Normalize decimal formatting: "DECIMAL(10, 2)" -> "decimal(10,2)"
                 data_type = data_type.replace(' ', '').lower()
+            
             return data_type.lower()
         return "unknown"
     
@@ -857,42 +885,96 @@ class SqlParser:
         lineage = []
         output_columns = []
         
-        # Get source tables and their aliases
-        source_tables = []
-        table_aliases = {}
+        # Process all SELECT expressions, including both stars and explicit columns
+        ordinal = 0
         
-        # Check for explicit aliased star (o.*, c.*)
         for select_expr in select_stmt.expressions:
-            if isinstance(select_expr, exp.Star) and hasattr(select_expr, 'table') and select_expr.table:
-                # This is an aliased star like o.* or c.*
-                alias = str(select_expr.table)
-                table_name = self._resolve_table_from_alias(alias, select_stmt)
-                if table_name != "unknown":
-                    columns = self._infer_table_columns(table_name)
-                    ordinal = len(output_columns)
-                    
-                    for column_name in columns:
-                        output_columns.append(ColumnSchema(
-                            name=column_name,
-                            data_type="unknown",
-                            nullable=True,
-                            ordinal=ordinal
-                        ))
-                        ordinal += 1
+            if isinstance(select_expr, exp.Star):
+                if hasattr(select_expr, 'table') and select_expr.table:
+                    # This is an aliased star like o.* or c.*
+                    alias = str(select_expr.table)
+                    table_name = self._resolve_table_from_alias(alias, select_stmt)
+                    if table_name != "unknown":
+                        columns = self._infer_table_columns(table_name)
                         
-                        lineage.append(ColumnLineage(
-                            output_column=column_name,
-                            input_fields=[ColumnReference(
-                                namespace="mssql://localhost/InfoTrackerDW",
-                                table_name=table_name,
-                                column_name=column_name
-                            )],
-                            transformation_type=TransformationType.IDENTITY,
-                            transformation_description=f"SELECT {alias}.{column_name}"
-                        ))
-                return lineage, output_columns
+                        for column_name in columns:
+                            output_columns.append(ColumnSchema(
+                                name=column_name,
+                                data_type="unknown",
+                                nullable=True,
+                                ordinal=ordinal
+                            ))
+                            ordinal += 1
+                            
+                            lineage.append(ColumnLineage(
+                                output_column=column_name,
+                                input_fields=[ColumnReference(
+                                    namespace="mssql://localhost/InfoTrackerDW",
+                                    table_name=table_name,
+                                    column_name=column_name
+                                )],
+                                transformation_type=TransformationType.IDENTITY,
+                                transformation_description=f"SELECT {alias}.{column_name}"
+                            ))
+                else:
+                    # Handle unqualified * - expand all tables
+                    source_tables = []
+                    for table in select_stmt.find_all(exp.Table):
+                        table_name = self._get_table_name(table)
+                        if table_name != "unknown":
+                            source_tables.append(table_name)
+                    
+                    for table_name in source_tables:
+                        columns = self._infer_table_columns(table_name)
+                        
+                        for column_name in columns:
+                            output_columns.append(ColumnSchema(
+                                name=column_name,
+                                data_type="unknown",
+                                nullable=True,
+                                ordinal=ordinal
+                            ))
+                            ordinal += 1
+                            
+                            lineage.append(ColumnLineage(
+                                output_column=column_name,
+                                input_fields=[ColumnReference(
+                                    namespace="mssql://localhost/InfoTrackerDW",
+                                    table_name=table_name,
+                                    column_name=column_name
+                                )],
+                                transformation_type=TransformationType.IDENTITY,
+                                transformation_description=f"SELECT * (from {table_name})"
+                            ))
+            else:
+                # Handle explicit column expressions (like "1 as extra_col")
+                col_name = self._extract_column_alias(select_expr) or f"col_{ordinal}"
+                output_columns.append(ColumnSchema(
+                    name=col_name,
+                    data_type="unknown",
+                    nullable=True,
+                    ordinal=ordinal
+                ))
+                ordinal += 1
+                
+                # Try to extract lineage for this column
+                input_refs = self._extract_column_references(select_expr, select_stmt)
+                if not input_refs:
+                    # If no specific references found, treat as expression
+                    input_refs = [ColumnReference(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        table_name="LITERAL",
+                        column_name=str(select_expr)
+                    )]
+                
+                lineage.append(ColumnLineage(
+                    output_column=col_name,
+                    input_fields=input_refs,
+                    transformation_type=TransformationType.EXPRESSION,
+                    transformation_description=f"SELECT {str(select_expr)}"
+                ))
         
-        # Handle unqualified * - expand all tables
+        return lineage, output_columns
         for table in select_stmt.find_all(exp.Table):
             table_name = self._get_table_name(table)
             if table_name != "unknown":
@@ -1174,30 +1256,6 @@ class SqlParser:
                         ))
         
         return output_columns
-    
-    def _find_last_select_string(self, sql_content: str) -> Optional[str]:
-        """Find the last standalone SELECT statement in SQL content."""
-        # Remove comments and normalize whitespace
-        cleaned_sql = re.sub(r'--.*?$', '', sql_content, flags=re.MULTILINE)
-        cleaned_sql = re.sub(r'/\*.*?\*/', '', cleaned_sql, flags=re.DOTALL)
-        
-        # Find all SELECT statements that are not part of INSERT/UPDATE/SET
-        select_pattern = r'(?<!INSERT\s)(?<!UPDATE\s)(?<!SET\s)(?<!FROM\s)(?<==\s)SELECT\s+.*?(?=(?:FROM|;|$))'
-        matches = list(re.finditer(select_pattern, cleaned_sql, re.IGNORECASE | re.DOTALL))
-        
-        if matches:
-            last_match = matches[-1]
-            # Try to capture the complete SELECT statement including FROM clause
-            remaining_sql = cleaned_sql[last_match.start():]
-            complete_select = self._extract_complete_select(remaining_sql)
-            return complete_select
-        
-        return None
-    
-    def _extract_complete_select(self, sql_fragment: str) -> str:
-        """Extract a complete SELECT statement including FROM, WHERE, etc."""
-        # Simple approach: find until next major keyword or end
-        keywords = ['GROUP BY', 'ORDER BY', 'HAVING', ';', 'END', 'GO']
         
         end_pos = len(sql_fragment)
         for keyword in keywords:
@@ -1387,3 +1445,55 @@ class SqlParser:
                 pass
         
         return None
+    
+    def _extract_column_alias(self, select_expr: exp.Expression) -> Optional[str]:
+        """Extract column alias from a SELECT expression."""
+        if hasattr(select_expr, 'alias') and select_expr.alias:
+            return str(select_expr.alias)
+        elif isinstance(select_expr, exp.Alias):
+            return str(select_expr.alias)
+        elif isinstance(select_expr, exp.Column):
+            return str(select_expr.this)
+        else:
+            # Try to extract from the expression itself
+            expr_str = str(select_expr)
+            if ' AS ' in expr_str.upper():
+                parts = expr_str.split()
+                as_idx = -1
+                for i, part in enumerate(parts):
+                    if part.upper() == 'AS':
+                        as_idx = i
+                        break
+                if as_idx >= 0 and as_idx + 1 < len(parts):
+                    return parts[as_idx + 1].strip("'\"")
+        return None
+    
+    def _extract_column_references(self, select_expr: exp.Expression, select_stmt: exp.Select) -> List[ColumnReference]:
+        """Extract column references from a SELECT expression."""
+        refs = []
+        
+        # Find all column references in the expression
+        for column_expr in select_expr.find_all(exp.Column):
+            table_name = "unknown"
+            column_name = str(column_expr.this)
+            
+            # Try to resolve table name from table reference or alias
+            if hasattr(column_expr, 'table') and column_expr.table:
+                table_alias = str(column_expr.table)
+                table_name = self._resolve_table_from_alias(table_alias, select_stmt)
+            else:
+                # If no table specified, try to infer from FROM clause
+                tables = []
+                for table in select_stmt.find_all(exp.Table):
+                    tables.append(self._get_table_name(table))
+                if len(tables) == 1:
+                    table_name = tables[0]
+            
+            if table_name != "unknown":
+                refs.append(ColumnReference(
+                    namespace="mssql://localhost/InfoTrackerDW",
+                    table_name=table_name,
+                    column_name=column_name
+                ))
+        
+        return refs

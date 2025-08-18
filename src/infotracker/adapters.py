@@ -16,9 +16,15 @@ class MssqlAdapter:
     name = "mssql"
     dialect = "tsql"
 
-    def __init__(self):
+    def __init__(self, config=None):
         self.parser = SqlParser(dialect=self.dialect)
-        self.lineage_generator = OpenLineageGenerator()
+        # Use namespace from config if available
+        namespace = "mssql://localhost/InfoTrackerDW"  # default
+        if config and hasattr(config, 'openlineage'):
+            namespace = f"{config.openlineage.namespace}://localhost/InfoTrackerDW"
+        if config and hasattr(config, 'default_database'):
+            self.parser.set_default_database(config.default_database)
+        self.lineage_generator = OpenLineageGenerator(namespace=namespace)
 
     def extract_lineage(self, sql: str, object_hint: Optional[str] = None) -> str:
         """Extract lineage from SQL and return OpenLineage JSON as string."""
@@ -54,12 +60,13 @@ class MssqlAdapter:
             }
             return json.dumps(error_payload, indent=2, ensure_ascii=False)
         
-_ADAPTERS: Dict[str, Adapter] = {
-    "mssql": MssqlAdapter(),
-}
+_ADAPTERS: Dict[str, Adapter] = {}
 
 
-def get_adapter(name: str) -> Adapter:
+def get_adapter(name: str, config=None) -> Adapter:
     if name not in _ADAPTERS:
-        raise KeyError(f"Unknown adapter '{name}'. Available: {', '.join(_ADAPTERS)}")
+        if name == "mssql":
+            _ADAPTERS[name] = MssqlAdapter(config)
+        else:
+            raise KeyError(f"Unknown adapter '{name}'. Available: mssql")
     return _ADAPTERS[name]
