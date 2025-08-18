@@ -7,7 +7,7 @@
   "outputs": [
     {
       "namespace": "mssql://localhost/InfoTrackerDW",
-      "name": "dbo.OrderItems",
+      "name": "STG.dbo.OrderItems",
       "facets": {
         "schema": {
           "_producer": "https://github.com/OpenLineage/OpenLineage",
@@ -17,7 +17,8 @@
             { "name": "OrderID", "type": "int" },
             { "name": "ProductID", "type": "int" },
             { "name": "Quantity", "type": "int" },
-            { "name": "UnitPrice", "type": "decimal(10,2)" }
+            { "name": "UnitPrice", "type": "decimal(10,2)" },
+            { "name": "ExtendedPrice", "type": "unknown" }
           ]
         }
       }

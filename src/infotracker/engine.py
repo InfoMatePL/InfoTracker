@@ -95,7 +95,7 @@ class Engine:
                         cols: List[ColumnSchema] = [
                             ColumnSchema(
                                 name=c["name"],
-                                type=c.get("type"),
+                                data_type=c.get("type"),
                                 nullable=bool(c.get("nullable", True)),
                                 ordinal=int(c.get("ordinal", 0)),
                             )
@@ -310,8 +310,8 @@ class Engine:
                     data = json.loads(graph_path.read_text(encoding="utf-8"))
                     graph = ColumnGraph()
                     for edge in data.get("edges", []):
-                        from_ns, from_tbl, from_col = edge["from"].split(".", 2)
-                        to_ns, to_tbl, to_col = edge["to"].split(".", 2)
+                        from_ns, from_tbl, from_col = edge["from"].rsplit(".", 2)
+                        to_ns, to_tbl, to_col = edge["to"].rsplit(".", 2)
                         graph.add_edge(ColumnEdge(
                             from_column=ColumnNode(from_ns, from_tbl, from_col),
                             to_column=ColumnNode(to_ns, to_tbl, to_col),
@@ -384,10 +384,10 @@ class Engine:
         else:
             parts = [p for p in sel.split(".") if p]
             if len(parts) == 2:
-                # table.column -> dbo.table.column (legacy)
-                sel = f"dbo.{parts[0]}.{parts[1]}"
+                # table.column -> namespace/dbo.table.column
+                sel = f"mssql://localhost/InfoTrackerDW.dbo.{parts[0]}.{parts[1]}"
             elif len(parts) == 3:
-                # schema.table.column -> schema.table.column (legacy)
+                # schema.table.column -> namespace/schema.table.column
                 sel = f"mssql://localhost/InfoTrackerDW.{sel}"
             elif len(parts) == 4:
                 # database.schema.table.column -> namespace/database.schema.table.column  

@@ -166,7 +166,7 @@ class ColumnNode:
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
     
-    def __hash__(self) -> str:
+    def __hash__(self) -> int:
         return hash((self.namespace.lower(), self.table_name.lower(), self.column_name.lower()))
     
     def __eq__(self, other) -> bool:

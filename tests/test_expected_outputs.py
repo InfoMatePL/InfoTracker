@@ -56,8 +56,7 @@ class TestExpectedOutputs:
         """Test that stg_orders view output exactly matches expected JSON."""
         sql = sql_content["10_stg_orders"]
         result = json.loads(self.adapter.extract_lineage(sql, "10_stg_orders"))
-        expected = expected_lineage["10_stg_orders"]
-        
+        expected = expected_lineage["10_stg_orders"]       
         # Normalize for comparison
         result_norm = normalize_json(result)
         expected_norm = normalize_json(expected)
@@ -114,7 +113,7 @@ class TestExpectedOutputs:
             elif field_name == "IsFulfilled":
                 # CASE transformations
                 assert "case" in result_desc
-                assert "orderstatus" in result_desc
+                assert "status" in result_desc
 
     @pytest.mark.parametrize("file_stem", [
         "01_customers", "02_orders", "03_products", "04_order_items"

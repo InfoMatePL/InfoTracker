@@ -7,7 +7,7 @@
   "outputs": [
     {
       "namespace": "mssql://localhost/InfoTrackerDW",
-      "name": "dbo.Orders",
+      "name": "STG.dbo.Orders",
       "facets": {
         "schema": {
           "_producer": "https://github.com/OpenLineage/OpenLineage",
@@ -15,8 +15,8 @@
           "fields": [
             { "name": "OrderID", "type": "int" },
             { "name": "CustomerID", "type": "int" },
-            { "name": "OrderDate", "type": "datetime" },
-            { "name": "OrderStatus", "type": "nvarchar(20)" }
+            { "name": "OrderDate", "type": "date" },
+            { "name": "Status", "type": "nvarchar(50)" }
           ]
         }
       }

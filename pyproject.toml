@@ -7,7 +7,7 @@ name = "InfoTracker"
 version = "0.1.0"
 description = "Column-level SQL lineage, impact analysis, and breaking-change detection (MS SQL first)"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "InfoTracker Authors" }]
 keywords = ["data-lineage", "openlineage", "sql", "mssql", "lineage", "impact-analysis"]
@@ -20,7 +20,7 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
   "Environment :: Console",
 ]
-dependencies = ["typer[all]","click>=8.1.3,<9.0.0",
+dependencies = ["typer","click", "rich", "shellingham",
   "sqlglot>=23.0.0",
   "PyYAML>=6.0.1",
   "networkx>=3.3",

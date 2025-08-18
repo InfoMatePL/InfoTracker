@@ -4,49 +4,48 @@
   "run": { "runId": "00000000-0000-0000-0000-000000000011" },
   "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/11_stg_order_items.sql" },
   "inputs": [
-    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" }
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems" }
   ],
   "outputs": [
     {
       "namespace": "mssql://localhost/InfoTrackerDW",
-      "name": "dbo.stg_order_items",
+      "name": "STG.dbo.stg_order_items",
       "facets": {
         "columnLineage": {
           "_producer": "https://github.com/OpenLineage/OpenLineage",
           "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
           "fields": {
             "OrderItemID": {
-              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "OrderItemID"} ],
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems", "field": "OrderItemID"} ],
               "transformationType": "IDENTITY",
               "transformationDescription": "OrderItemID from OrderItems.OrderItemID"
             },
             "OrderID": {
-              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "OrderID"} ],
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems", "field": "OrderID"} ],
               "transformationType": "IDENTITY",
               "transformationDescription": "OrderID from OrderItems.OrderID"
             },
             "ProductID": {
-              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems", "field": "ProductID"} ],
               "transformationType": "IDENTITY",
               "transformationDescription": "ProductID from OrderItems.ProductID"
             },
             "Quantity": {
-              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"} ],
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems", "field": "Quantity"} ],
               "transformationType": "IDENTITY",
               "transformationDescription": "Quantity from OrderItems.Quantity"
             },
             "UnitPrice": {
-              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"} ],
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems", "field": "UnitPrice"} ],
               "transformationType": "IDENTITY",
               "transformationDescription": "UnitPrice from OrderItems.UnitPrice"
             },
             "ExtendedPrice": {
               "inputFields": [
-                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
-                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "STG.dbo.OrderItems", "field": "ExtendedPrice"}
               ],
-              "transformationType": "ARITHMETIC",
-              "transformationDescription": "Quantity * UnitPrice"
+              "transformationType": "IDENTITY",
+              "transformationDescription": "ExtendedPrice from OrderItems.ExtendedPrice"
             }
           }
         }

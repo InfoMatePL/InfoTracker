@@ -3,6 +3,7 @@ SQL parsing and lineage extraction using SQLGlot.
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import List, Optional, Set, Dict, Any
 
@@ -14,6 +15,8 @@ from .models import (
     TransformationType, ObjectInfo, SchemaRegistry
 )
 
+logger = logging.getLogger(__name__)
+
 
 class SqlParser:
     """Parser for SQL statements using SQLGlot."""
@@ -21,6 +24,21 @@ class SqlParser:
     def __init__(self, dialect: str = "tsql"):
         self.dialect = dialect
         self.schema_registry = SchemaRegistry()
+    
+    def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
+        """Find the last SELECT statement in SQL content using SQLGlot AST."""
+        import sqlglot
+        from sqlglot import exp
+        try:
+            parsed = sqlglot.parse(sql_content, read=dialect)
+            selects = []
+            for stmt in parsed:
+                selects.extend(list(stmt.find_all(exp.Select)))
+            if not selects:
+                return None
+            return str(selects[-1])
+        except Exception:
+            return None
     
     def parse_sql_file(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse a SQL file and extract object information."""
@@ -48,6 +66,7 @@ class SqlParser:
                 raise ValueError(f"Unsupported statement type: {type(statement)}")
                 
         except Exception as e:
+            logger.warning("parse failed: %s", e)
             # Return an object with error information
             return ObjectInfo(
                 name=object_hint or "unknown",

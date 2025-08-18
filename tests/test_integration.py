@@ -28,7 +28,7 @@ class TestCLIIntegration:
         out_dir.mkdir()
         
         # Create a simple test SQL file
-        test_sql = """CREATE TABLE dbo.TestTable (
+        test_sql = """CREATE TABLE STG.dbo.TestTable (
             ID INT PRIMARY KEY,
             Name NVARCHAR(100) NOT NULL
         );"""
@@ -114,7 +114,7 @@ class TestCLIIntegration:
         """Test impact command (placeholder functionality)."""
         result = self.runner.invoke(app, [
             "impact",
-            "--selector", "dbo.Customers.CustomerID"
+            "--selector", "STG.dbo.Customers.CustomerID"
         ])
         
         # Should run without error (even if functionality is placeholder)
