@@ -189,10 +189,18 @@ class ColumnEdge:
 class ColumnGraph:
     """Bidirectional graph of column-level lineage relationships."""
     
-    def __init__(self):
+    def __init__(self, max_upstream_depth: int = 10, max_downstream_depth: int = 10):
+        """Initialize the column graph with configurable depth limits.
+        
+        Args:
+            max_upstream_depth: Maximum depth for upstream traversal (default: 10)
+            max_downstream_depth: Maximum depth for downstream traversal (default: 10)
+        """
         self._nodes: Dict[str, ColumnNode] = {}
         self._upstream_edges: Dict[str, List[ColumnEdge]] = {}  # node -> edges coming into it
         self._downstream_edges: Dict[str, List[ColumnEdge]] = {}  # node -> edges going out of it
+        self.max_upstream_depth = max_upstream_depth
+        self.max_downstream_depth = max_downstream_depth
     
     def add_node(self, column_node: ColumnNode) -> None:
         """Add a column node to the graph."""
@@ -217,16 +225,28 @@ class ColumnGraph:
         self._upstream_edges[to_key].append(edge)
     
     def get_upstream(self, column: ColumnNode, max_depth: Optional[int] = None) -> List[ColumnEdge]:
-        """Get all upstream dependencies for a column."""
-        return self._traverse_upstream(column, max_depth or 10, set())
+        """Get all upstream dependencies for a column.
+        
+        Args:
+            column: The column to find upstream dependencies for
+            max_depth: Override the default max_upstream_depth for this query
+        """
+        effective_depth = max_depth if max_depth is not None else self.max_upstream_depth
+        return self._traverse_upstream(column, effective_depth, set())
     
     def get_downstream(self, column: ColumnNode, max_depth: Optional[int] = None) -> List[ColumnEdge]:
-        """Get all downstream dependencies for a column."""
-        return self._traverse_downstream(column, max_depth or 10, set())
+        """Get all downstream dependencies for a column.
+        
+        Args:
+            column: The column to find downstream dependencies for
+            max_depth: Override the default max_downstream_depth for this query
+        """
+        effective_depth = max_depth if max_depth is not None else self.max_downstream_depth
+        return self._traverse_downstream(column, effective_depth, set())
     
-    def _traverse_upstream(self, column: ColumnNode, max_depth: int, visited: Set[str]) -> List[ColumnEdge]:
+    def _traverse_upstream(self, column: ColumnNode, max_depth: int, visited: Set[str], current_depth: int = 0) -> List[ColumnEdge]:
         """Recursively traverse upstream dependencies."""
-        if max_depth <= 0:
+        if max_depth <= 0 or current_depth >= max_depth:
             return []
         
         column_key = str(column).lower()
@@ -240,14 +260,14 @@ class ColumnGraph:
         for edge in self._upstream_edges.get(column_key, []):
             edges.append(edge)
             # Recursively get upstream of the source column
-            upstream_edges = self._traverse_upstream(edge.from_column, max_depth - 1, visited.copy())
+            upstream_edges = self._traverse_upstream(edge.from_column, max_depth, visited.copy(), current_depth + 1)
             edges.extend(upstream_edges)
         
         return edges
     
-    def _traverse_downstream(self, column: ColumnNode, max_depth: int, visited: Set[str]) -> List[ColumnEdge]:
+    def _traverse_downstream(self, column: ColumnNode, max_depth: int, visited: Set[str], current_depth: int = 0) -> List[ColumnEdge]:
         """Recursively traverse downstream dependencies."""
-        if max_depth <= 0:
+        if max_depth <= 0 or current_depth >= max_depth:
             return []
         
         column_key = str(column).lower()
@@ -261,10 +281,29 @@ class ColumnGraph:
         for edge in self._downstream_edges.get(column_key, []):
             edges.append(edge)
             # Recursively get downstream of the target column
-            downstream_edges = self._traverse_downstream(edge.to_column, max_depth - 1, visited.copy())
+            downstream_edges = self._traverse_downstream(edge.to_column, max_depth, visited.copy(), current_depth + 1)
             edges.extend(downstream_edges)
         
         return edges
+    
+    def get_traversal_stats(self, column: ColumnNode) -> Dict[str, Any]:
+        """Get traversal statistics for a column including depth information.
+        
+        Returns:
+            Dictionary with upstream/downstream counts and depth information
+        """
+        upstream_edges = self.get_upstream(column)
+        downstream_edges = self.get_downstream(column)
+        
+        return {
+            "column": str(column),
+            "upstream_count": len(upstream_edges),
+            "downstream_count": len(downstream_edges),
+            "max_upstream_depth": self.max_upstream_depth,
+            "max_downstream_depth": self.max_downstream_depth,
+            "upstream_tables": len(set(str(edge.from_column).rsplit('.', 1)[0] for edge in upstream_edges)),
+            "downstream_tables": len(set(str(edge.to_column).rsplit('.', 1)[0] for edge in downstream_edges))
+        }
     
     def build_from_object_lineage(self, objects: List[ObjectInfo]) -> None:
         """Build column graph from object lineage information."""

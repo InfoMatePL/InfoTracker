@@ -45,11 +45,12 @@ class ImpactRequest:
 
 
 @dataclass
+@dataclass
 class DiffRequest:
+    base: str  # git ref for base
+    head: str  # git ref for head
     sql_dir: Path
     adapter: str
-    base: Path
-    head: Optional[Path] = None
     severity_threshold: str = "BREAKING"   # NON_BREAKING | POTENTIALLY_BREAKING | BREAKING
 
 
@@ -464,7 +465,281 @@ class Engine:
 
     def run_diff(self, req: DiffRequest) -> Dict[str, Any]:
         """
-        Placeholder: jeśli masz pełną implementację porównywania, zostaw ją.
-        Tu tylko zwracamy kod 0, żeby nie blokować CLI.
+        Compare base and head SQL directories to detect breaking changes.
+        
+        Returns a structured diff report with severity classifications.
         """
-        return {"columns": ["message"], "rows": [["Diff not implemented in this stub"]], "exit_code": 0}
+        try:
+            # Extract lineage from base and head
+            base_lineage = self._extract_lineage_from_dir(req.sql_dir, req.base)
+            head_lineage = self._extract_lineage_from_dir(req.sql_dir, req.head)
+            
+            # Compare and detect changes
+            changes = self._detect_schema_changes(base_lineage, head_lineage)
+            
+            # Classify severity and filter by threshold
+            classified_changes = self._classify_changes(changes)
+            filtered_changes = self._filter_by_severity(classified_changes, req.severity_threshold)
+            
+            # Generate report
+            report = self._generate_diff_report(filtered_changes)
+            
+            # Determine exit code based on severity
+            exit_code = self._determine_exit_code(filtered_changes, req.severity_threshold)
+            
+            return {
+                "changes": filtered_changes,
+                "summary": report,
+                "exit_code": exit_code,
+                "columns": ["object", "change_type", "severity", "description"],
+                "rows": [[
+                    change["object_name"],
+                    change["change_type"], 
+                    change["severity"],
+                    change["description"]
+                ] for change in filtered_changes]
+            }
+            
+        except Exception as e:
+            return {
+                "error": str(e),
+                "columns": ["message"], 
+                "rows": [["Error running diff: " + str(e)]], 
+                "exit_code": 1
+            }
+    
+    def _extract_lineage_from_dir(self, sql_dir: Path, ref: str) -> Dict[str, Any]:
+        """Extract lineage information from a SQL directory at a specific git ref."""
+        # For now, assume we're working with the current directory
+        # In a full implementation, this would checkout the ref and run extraction
+        req = ExtractRequest(
+            sql_dir=sql_dir,
+            adapter=self.config.default_adapter,
+            include=getattr(self.config, 'include', None),
+            exclude=getattr(self.config, 'exclude', None),
+            ignore=getattr(self.config, 'ignore', None)
+        )
+        return self.run_extract(req)
+    
+    def _detect_schema_changes(self, base: Dict[str, Any], head: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Detect schema changes between base and head lineage."""
+        changes = []
+        
+        base_objects = {obj["name"]: obj for obj in base.get("objects", [])}
+        head_objects = {obj["name"]: obj for obj in head.get("objects", [])}
+        
+        all_objects = set(base_objects.keys()) | set(head_objects.keys())
+        
+        for obj_name in all_objects:
+            base_obj = base_objects.get(obj_name)
+            head_obj = head_objects.get(obj_name)
+            
+            if base_obj is None:
+                # New object added
+                changes.append({
+                    "object_name": obj_name,
+                    "change_type": "object_added",
+                    "base_schema": None,
+                    "head_schema": head_obj.get("schema"),
+                    "description": f"New object '{obj_name}' added"
+                })
+            elif head_obj is None:
+                # Object removed
+                changes.append({
+                    "object_name": obj_name,
+                    "change_type": "object_removed", 
+                    "base_schema": base_obj.get("schema"),
+                    "head_schema": None,
+                    "description": f"Object '{obj_name}' removed"
+                })
+            else:
+                # Object exists in both - check for schema changes
+                obj_changes = self._compare_object_schemas(obj_name, base_obj, head_obj)
+                changes.extend(obj_changes)
+        
+        return changes
+    
+    def _compare_object_schemas(self, obj_name: str, base_obj: Dict[str, Any], head_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Compare schemas of two versions of the same object."""
+        changes = []
+        
+        base_schema = base_obj.get("schema", {})
+        head_schema = head_obj.get("schema", {})
+        
+        base_columns = {col["name"]: col for col in base_schema.get("columns", [])}
+        head_columns = {col["name"]: col for col in head_schema.get("columns", [])}
+        
+        all_columns = set(base_columns.keys()) | set(head_columns.keys())
+        
+        for col_name in all_columns:
+            base_col = base_columns.get(col_name)
+            head_col = head_columns.get(col_name)
+            
+            if base_col is None:
+                # Column added
+                changes.append({
+                    "object_name": obj_name,
+                    "change_type": "column_added",
+                    "column_name": col_name,
+                    "base_column": None,
+                    "head_column": head_col,
+                    "description": f"Column '{col_name}' added to '{obj_name}'"
+                })
+            elif head_col is None:
+                # Column removed
+                changes.append({
+                    "object_name": obj_name,
+                    "change_type": "column_removed",
+                    "column_name": col_name,
+                    "base_column": base_col,
+                    "head_column": None,
+                    "description": f"Column '{col_name}' removed from '{obj_name}'"
+                })
+            else:
+                # Column exists in both - check for changes
+                col_changes = self._compare_columns(obj_name, col_name, base_col, head_col)
+                changes.extend(col_changes)
+        
+        return changes
+    
+    def _compare_columns(self, obj_name: str, col_name: str, base_col: Dict[str, Any], head_col: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Compare two versions of the same column."""
+        changes = []
+        
+        # Check data type changes
+        base_type = base_col.get("data_type", "")
+        head_type = head_col.get("data_type", "")
+        if base_type != head_type:
+            changes.append({
+                "object_name": obj_name,
+                "change_type": "column_type_changed",
+                "column_name": col_name,
+                "base_column": base_col,
+                "head_column": head_col,
+                "description": f"Column '{col_name}' in '{obj_name}' type changed from '{base_type}' to '{head_type}'"
+            })
+        
+        # Check nullability changes
+        base_nullable = base_col.get("nullable", True)
+        head_nullable = head_col.get("nullable", True)
+        if base_nullable != head_nullable:
+            nullable_desc = "nullable" if head_nullable else "not nullable"
+            changes.append({
+                "object_name": obj_name,
+                "change_type": "column_nullability_changed",
+                "column_name": col_name,
+                "base_column": base_col,
+                "head_column": head_col,
+                "description": f"Column '{col_name}' in '{obj_name}' nullability changed to {nullable_desc}"
+            })
+        
+        # Check position changes
+        base_pos = base_col.get("position", 0)
+        head_pos = head_col.get("position", 0)
+        if base_pos != head_pos:
+            changes.append({
+                "object_name": obj_name,
+                "change_type": "column_position_changed",
+                "column_name": col_name,
+                "base_column": base_col,
+                "head_column": head_col,
+                "description": f"Column '{col_name}' in '{obj_name}' position changed from {base_pos} to {head_pos}"
+            })
+        
+        return changes
+    
+    def _classify_changes(self, changes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Classify changes by severity level."""
+        for change in changes:
+            change["severity"] = self._determine_change_severity(change)
+        return changes
+    
+    def _determine_change_severity(self, change: Dict[str, Any]) -> str:
+        """Determine the severity of a specific change."""
+        change_type = change["change_type"]
+        
+        # Breaking changes
+        if change_type in ["object_removed", "column_removed"]:
+            return "BREAKING"
+        
+        if change_type == "column_type_changed":
+            # Check if this is a narrowing type change
+            if self._is_type_narrowing(change.get("base_column", {}).get("data_type", ""), 
+                                     change.get("head_column", {}).get("data_type", "")):
+                return "BREAKING"
+            else:
+                return "NON_BREAKING"
+        
+        if change_type == "column_nullability_changed":
+            # Making a column NOT NULL is breaking
+            base_nullable = change.get("base_column", {}).get("nullable", True)
+            head_nullable = change.get("head_column", {}).get("nullable", True)
+            if base_nullable and not head_nullable:
+                return "BREAKING"
+            else:
+                return "NON_BREAKING"
+        
+        if change_type == "column_position_changed":
+            return "POTENTIALLY_BREAKING"
+        
+        # Non-breaking changes
+        if change_type in ["object_added", "column_added"]:
+            return "NON_BREAKING"
+        
+        return "POTENTIALLY_BREAKING"
+    
+    def _is_type_narrowing(self, base_type: str, head_type: str) -> bool:
+        """Check if a type change represents narrowing (potentially breaking)."""
+        # Simplified type narrowing detection
+        type_widths = {
+            "TINYINT": 1, "SMALLINT": 2, "INT": 4, "BIGINT": 8,
+            "FLOAT": 4, "DOUBLE": 8, "REAL": 4,
+            "VARCHAR(50)": 50, "VARCHAR(100)": 100, "VARCHAR(255)": 255,
+            "DECIMAL(10,2)": 10, "DECIMAL(18,2)": 18
+        }
+        
+        base_width = type_widths.get(base_type.upper(), 0)
+        head_width = type_widths.get(head_type.upper(), 0)
+        
+        # If we can't determine widths, assume potentially breaking
+        if base_width == 0 or head_width == 0:
+            return base_type.upper() != head_type.upper()
+        
+        return head_width < base_width
+    
+    def _filter_by_severity(self, changes: List[Dict[str, Any]], threshold: str) -> List[Dict[str, Any]]:
+        """Filter changes by severity threshold."""
+        severity_levels = {"NON_BREAKING": 0, "POTENTIALLY_BREAKING": 1, "BREAKING": 2}
+        threshold_level = severity_levels.get(threshold, 2)
+        
+        return [change for change in changes 
+                if severity_levels.get(change["severity"], 2) >= threshold_level]
+    
+    def _generate_diff_report(self, changes: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Generate a summary report of changes."""
+        breaking_count = len([c for c in changes if c["severity"] == "BREAKING"])
+        potentially_breaking_count = len([c for c in changes if c["severity"] == "POTENTIALLY_BREAKING"])
+        non_breaking_count = len([c for c in changes if c["severity"] == "NON_BREAKING"])
+        
+        return {
+            "total_changes": len(changes),
+            "breaking_changes": breaking_count,
+            "potentially_breaking_changes": potentially_breaking_count,
+            "non_breaking_changes": non_breaking_count,
+            "objects_affected": len(set(c["object_name"] for c in changes))
+        }
+    
+    def _determine_exit_code(self, changes: List[Dict[str, Any]], threshold: str) -> int:
+        """Determine appropriate exit code based on changes and threshold."""
+        if not changes:
+            return 0
+        
+        has_breaking = any(c["severity"] == "BREAKING" for c in changes)
+        has_potentially_breaking = any(c["severity"] == "POTENTIALLY_BREAKING" for c in changes)
+        
+        if threshold == "BREAKING" and has_breaking:
+            return 1
+        elif threshold == "POTENTIALLY_BREAKING" and (has_breaking or has_potentially_breaking):
+            return 1
+        else:
+            return 0

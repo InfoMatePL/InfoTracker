@@ -12,7 +12,7 @@ from sqlglot import expressions as exp
 
 from .models import (
     ColumnReference, ColumnSchema, TableSchema, ColumnLineage, 
-    TransformationType, ObjectInfo, SchemaRegistry
+    TransformationType, ObjectInfo, SchemaRegistry, ColumnNode
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,8 @@ class SqlParser:
                 return self._parse_create_statement(statement, object_hint)
             elif isinstance(statement, exp.Select) and self._is_select_into(statement):
                 return self._parse_select_into(statement, object_hint)
+            elif isinstance(statement, exp.Insert) and self._is_insert_exec(statement):
+                return self._parse_insert_exec(statement, object_hint)
             else:
                 raise ValueError(f"Unsupported statement type: {type(statement)}")
                 
@@ -83,6 +85,17 @@ class SqlParser:
     def _is_select_into(self, statement: exp.Select) -> bool:
         """Check if this is a SELECT INTO statement."""
         return statement.args.get('into') is not None
+    
+    def _is_insert_exec(self, statement: exp.Insert) -> bool:
+        """Check if this is an INSERT INTO ... EXEC statement."""
+        # Check if the expression is a command (EXEC)
+        expression = statement.expression
+        return (
+            hasattr(expression, 'expressions') and 
+            expression.expressions and 
+            isinstance(expression.expressions[0], exp.Command) and
+            str(expression.expressions[0]).upper().startswith('EXEC')
+        )
     
     def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse SELECT INTO statement."""
@@ -120,6 +133,82 @@ class SqlParser:
             lineage=lineage,
             dependencies=dependencies
         )
+    
+    def _parse_insert_exec(self, statement: exp.Insert, object_hint: Optional[str] = None) -> ObjectInfo:
+        """Parse INSERT INTO ... EXEC statement."""
+        # Get target table name from INSERT INTO clause
+        table_name = self._get_table_name(statement.this, object_hint)
+        namespace = "mssql://localhost/InfoTrackerDW"
+        
+        # Normalize temp table names
+        if table_name.startswith('#'):
+            namespace = "tempdb"
+        
+        # Extract the EXEC command
+        expression = statement.expression
+        if hasattr(expression, 'expressions') and expression.expressions:
+            exec_command = expression.expressions[0]
+            
+            # Extract procedure name and dependencies
+            dependencies = set()
+            procedure_name = None
+            
+            # Parse the EXEC command text
+            exec_text = str(exec_command)
+            if exec_text.upper().startswith('EXEC'):
+                # Extract procedure name (first identifier after EXEC)
+                parts = exec_text.split()
+                if len(parts) > 1:
+                    procedure_name = parts[1].strip('()').split('(')[0]
+                    dependencies.add(procedure_name)
+            
+            # For EXEC temp tables, we create placeholder columns since we can't determine 
+            # the actual structure without executing the procedure
+            output_columns = [
+                ColumnSchema(
+                    name="Unknown",
+                    data_type="unknown",
+                    position=1,
+                    is_nullable=True
+                )
+            ]
+            
+            # Create placeholder lineage pointing to the procedure
+            lineage = []
+            if procedure_name:
+                lineage.append(ColumnLineage(
+                    target_column=ColumnNode(
+                        namespace=namespace,
+                        table=table_name,
+                        column="Unknown"
+                    ),
+                    source_columns=[ColumnNode(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        table=procedure_name,
+                        column="*"  # Wildcard since we don't know the procedure output
+                    )],
+                    transformation_type="exec_procedure"
+                ))
+            
+            schema = TableSchema(
+                namespace=namespace,
+                name=table_name,
+                columns=output_columns
+            )
+            
+            # Register schema for future reference
+            self.schema_registry.register(schema)
+            
+            return ObjectInfo(
+                name=table_name,
+                object_type="temp_table" if table_name.startswith('#') else "table",
+                schema=schema,
+                lineage=lineage,
+                dependencies=dependencies
+            )
+        
+        # Fallback if we can't parse the EXEC command
+        raise ValueError("Could not parse INSERT INTO ... EXEC statement")
     
     def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE TABLE, CREATE VIEW, CREATE FUNCTION, or CREATE PROCEDURE statement."""
