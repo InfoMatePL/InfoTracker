@@ -1,0 +1,96 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000095" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/95_usp_customer_metrics_dataset.sql" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Customers" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.usp_customer_metrics_dataset",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Customers", "field": "CustomerID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerID from Customers table, used in GROUP BY and parameterized filtering"
+            },
+            "CustomerName": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Customers", "field": "CustomerName"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerName from Customers table, used in GROUP BY"
+            },
+            "CustomerType": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Customers", "field": "CustomerType"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerType from Customers table, used in GROUP BY"
+            },
+            "RegistrationDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Customers", "field": "RegistrationDate"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "RegistrationDate from Customers table, used in GROUP BY"
+            },
+            "TotalOrders": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderID"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "COUNT(DISTINCT o.OrderID) aggregated by customer groups"
+            },
+            "UniqueProductsPurchased": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "ProductID"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "COUNT(DISTINCT oi.ProductID) aggregated by customer groups"
+            },
+            "TotalItemsPurchased": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "SUM(oi.Quantity) aggregated by customer groups"
+            },
+            "TotalRevenue": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "ARITHMETIC_AGGREGATION",
+              "transformationDescription": "SUM(Quantity * UnitPrice) computed and aggregated by customer groups"
+            },
+            "AverageOrderValue": {
+              "inputFields": [
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "Quantity"},
+                {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.OrderItems", "field": "UnitPrice"}
+              ],
+              "transformationType": "ARITHMETIC_AGGREGATION",
+              "transformationDescription": "AVG(Quantity * UnitPrice) computed and aggregated by customer groups"
+            },
+            "LastOrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "AGGREGATION",
+              "transformationDescription": "MAX(o.OrderDate) aggregated by customer groups"
+            },
+            "DaysSinceLastOrder": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "DATE_FUNCTION_AGGREGATION",
+              "transformationDescription": "DATEDIFF(DAY, MAX(OrderDate), GETDATE()) computed on aggregated OrderDate"
+            },
+            "CustomerActivityStatus": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "CASE_AGGREGATION",
+              "transformationDescription": "CASE statement based on MAX(OrderDate) thresholds, aggregated by customer groups"
+            },
+            "OrdersPerDay": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Orders", "field": "OrderDate"} ],
+              "transformationType": "COMPLEX_AGGREGATION",
+              "transformationDescription": "Complex calculation: COUNT(OrderID) / DATEDIFF(DAY, MIN(OrderDate), MAX(OrderDate)) aggregated by customer groups"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

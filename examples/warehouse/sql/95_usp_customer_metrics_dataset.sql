@@ -39,20 +39,33 @@ BEGIN
         CASE 
             WHEN MAX(o.OrderDate) >= DATEADD(MONTH, -1, GETDATE()) THEN 'Active'
             WHEN MAX(o.OrderDate) >= DATEADD(MONTH, -3, GETDATE()) THEN 'Recent'
+            WHEN MAX(o.OrderDate) >= DATEADD(MONTH, -6, GETDATE()) THEN 'Occasional'
             ELSE 'Inactive'
         END AS CustomerActivityStatus,
-        CASE
-            WHEN SUM(CAST(oi.Quantity * oi.UnitPrice AS DECIMAL(18,2))) >= 10000 THEN 'High Value'
-            WHEN SUM(CAST(oi.Quantity * oi.UnitPrice AS DECIMAL(18,2))) >= 5000 THEN 'Medium Value'
-            ELSE 'Standard'
-        END AS CustomerTier
+        -- Complex calculation: weighted average of order frequency
+        CASE 
+            WHEN COUNT(DISTINCT o.OrderID) > 1 THEN
+                CAST(COUNT(DISTINCT o.OrderID) AS FLOAT) / 
+                NULLIF(DATEDIFF(DAY, MIN(o.OrderDate), MAX(o.OrderDate)), 0)
+            ELSE 0 
+        END AS OrdersPerDay
     FROM dbo.Customers AS c
     LEFT JOIN dbo.Orders AS o ON c.CustomerID = o.CustomerID
     LEFT JOIN dbo.OrderItems AS oi ON o.OrderID = oi.OrderID
     WHERE (@CustomerID IS NULL OR c.CustomerID = @CustomerID)
       AND (@IncludeInactive = 1 OR c.IsActive = 1)
       AND (o.OrderDate IS NULL OR o.OrderDate BETWEEN @StartDate AND @EndDate)
+<<<<<<< HEAD
     GROUP BY c.CustomerID, c.CustomerName, c.CustomerType, c.RegistrationDate
     HAVING COUNT(DISTINCT o.OrderID) > 0
     ORDER BY TotalRevenue DESC;
+=======
+    GROUP BY 
+        c.CustomerID, 
+        c.CustomerName, 
+        c.CustomerType, 
+        c.RegistrationDate
+    HAVING COUNT(DISTINCT o.OrderID) > 0  -- Only customers with orders
+    ORDER BY TotalRevenue DESC, TotalOrders DESC;
+>>>>>>> main
 END;

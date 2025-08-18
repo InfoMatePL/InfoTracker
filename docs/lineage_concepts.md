@@ -180,6 +180,72 @@ graph TD
   OID7[vw_recent_orders_star_cte.OrderID] --> SOID[orders_snapshot.OrderID]
   CID7[vw_recent_orders_star_cte.CustomerID] --> SCID[orders_snapshot.CustomerID]
   ODT7[vw_recent_orders_star_cte.OrderDate] --> SODT[orders_snapshot.OrderDate]
+```
+
+#### Tabular function example (inline)
+SQL:
+```sql
+CREATE FUNCTION dbo.fn_customer_orders_inline
+(
+    @CustomerID INT,
+    @StartDate DATE,
+    @EndDate DATE
+)
+RETURNS TABLE
+AS
+RETURN
+(
+    SELECT
+        o.OrderID,
+        o.CustomerID,
+        o.OrderDate,
+        oi.ProductID,
+        CAST(oi.Quantity * oi.UnitPrice AS DECIMAL(18,2)) AS ExtendedPrice
+    FROM dbo.Orders AS o
+    INNER JOIN dbo.OrderItems AS oi ON o.OrderID = oi.OrderID
+    WHERE o.CustomerID = @CustomerID
+      AND o.OrderDate BETWEEN @StartDate AND @EndDate
+);
+```
+Lineage (function outputs treated as view-like):
+```mermaid
+graph TD
+  OID8[Orders.OrderID] --> FID[fn_customer_orders_inline.OrderID]
+  CID8[Orders.CustomerID] --> FCID[fn_customer_orders_inline.CustomerID]
+  ODT8[Orders.OrderDate] --> FDT[fn_customer_orders_inline.OrderDate]
+  PID8[OrderItems.ProductID] --> FPID[fn_customer_orders_inline.ProductID]
+  QTY8[OrderItems.Quantity] --> FEP[fn_customer_orders_inline.ExtendedPrice]
+  UPR8[OrderItems.UnitPrice] --> FEP
+```
+
+#### Procedure returning dataset example
+SQL:
+```sql
+CREATE PROCEDURE dbo.usp_customer_metrics_dataset
+    @CustomerID INT = NULL,
+    @StartDate DATE = NULL
+AS
+BEGIN
+    SELECT
+        c.CustomerID,
+        c.CustomerName,
+        COUNT(DISTINCT o.OrderID) AS TotalOrders,
+        SUM(oi.Quantity * oi.UnitPrice) AS TotalRevenue
+    FROM dbo.Customers AS c
+    LEFT JOIN dbo.Orders AS o ON c.CustomerID = o.CustomerID
+    LEFT JOIN dbo.OrderItems AS oi ON o.OrderID = oi.OrderID
+    WHERE (@CustomerID IS NULL OR c.CustomerID = @CustomerID)
+    GROUP BY c.CustomerID, c.CustomerName;
+END;
+```
+Lineage (procedure outputs treated as view-like):
+```mermaid
+graph TD
+  CID9[Customers.CustomerID] --> PCID[usp_customer_metrics_dataset.CustomerID]
+  CN9[Customers.CustomerName] --> PCN[usp_customer_metrics_dataset.CustomerName]
+  OID9[Orders.OrderID] --> PTO[usp_customer_metrics_dataset.TotalOrders]
+  QTY9[OrderItems.Quantity] --> PTR[usp_customer_metrics_dataset.TotalRevenue]
+  UPR9[OrderItems.UnitPrice] --> PTR
 ``` 
 
 ### Key definitions
@@ -188,6 +254,39 @@ graph TD
 - Expression: AST representing how an output is computed from inputs
 - Lineage edge: relation from input column(s) to an output column
 
+### Tabular functions and procedures in lineage
+Tabular functions and procedures that return datasets are treated as view-like objects in lineage analysis. They represent a transformation layer that can be used as inputs to other operations.
+
+#### Tabular function characteristics
+- **Inline table-valued functions (RETURN AS)**: Single SELECT statement, optimized by query optimizer
+- **Multi-statement table-valued functions (RETURN TABLE)**: Multiple statements with table variable, more complex logic
+- Both types accept parameters and return result sets that can be joined with other objects
+- Lineage shows them as outputs with their computed columns mapping back to source tables
+
+#### Procedure returning dataset characteristics
+- **Single SELECT statement**: Procedure ends with a SELECT that returns data
+- **Parameterized filtering**: Can accept parameters to control data scope
+- **EXEC into temp table**: Results can be captured with `INSERT INTO #temp EXEC procedure`
+- **Downstream usage**: Captured results become inputs to other operations
+- **Lineage visibility**: Procedure output columns show lineage to source tables and computed values
+
+#### Usage patterns
+```sql
+-- Using tabular function like a view
+SELECT f.*, p.Category 
+FROM dbo.fn_customer_orders_inline(1, '2024-01-01', '2024-12-31') AS f
+INNER JOIN dbo.Products AS p ON f.ProductID = p.ProductID;
+
+-- Using procedure output in workflow
+INSERT INTO #customer_metrics
+EXEC dbo.usp_customer_metrics_dataset @CustomerID = 1;
+
+-- Further processing of procedure results
+SELECT cm.*, 'High Value' AS Tier
+FROM #customer_metrics AS cm
+WHERE cm.TotalRevenue >= 10000;
+```
+
 ### Transformation taxonomy
 - IDENTITY/RENAME: direct pass-through or alias rename
 - CAST/TYPE_COERCION: explicit or implicit type changes
@@ -195,9 +294,14 @@ graph TD
 - STRING_PARSE: SUBSTRING, LEFT/RIGHT, CONCAT, etc.
 - CASE/IF: conditional branching
 - AGGREGATION: SUM, AVG, COUNT, MIN, MAX with GROUP BY keys
+- ARITHMETIC_AGGREGATION: arithmetic operations combined with aggregation functions
+- COMPLEX_AGGREGATION: multi-step calculations involving multiple aggregations and functions
 - WINDOW: functions over partitions and orderings
 - SET_OP: UNION/UNION ALL/INTERSECT/EXCEPT alignment by ordinal and type
 - CONSTANT: literals and NOW/GETDATE
+- DATE_FUNCTION: date/time calculations like DATEDIFF, DATEADD
+- DATE_FUNCTION_AGGREGATION: date functions applied to aggregated results
+- CASE_AGGREGATION: CASE statements applied to aggregated results
 - JOIN: keys do not create columns, but affect nullability and cardinality of outputs
 
 ### Granularity and graph model

@@ -1,0 +1,98 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": { "runId": "00000000-0000-0000-0000-000000000096" },
+  "job": { "namespace": "infotracker/examples", "name": "warehouse/sql/96_demo_usage_tvf_and_proc.json" },
+  "inputs": [
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.fn_customer_orders_inline" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.fn_customer_orders_mstvf" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Products" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.Customers" },
+    { "namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.customer_metrics_archive" }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "dbo.customer_metrics_archive",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "ArchiveDate": {
+              "inputFields": [],
+              "transformationType": "CONSTANT",
+              "transformationDescription": "GETDATE() constant value for archiving"
+            },
+            "CustomerID": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "CustomerID"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerID from procedure output via temp table"
+            },
+            "CustomerName": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "CustomerName"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerName from procedure output via temp table"
+            },
+            "CustomerType": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "CustomerType"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerType from procedure output via temp table"
+            },
+            "RegistrationDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "RegistrationDate"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "RegistrationDate from procedure output via temp table"
+            },
+            "TotalOrders": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "TotalOrders"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "TotalOrders from procedure output via temp table"
+            },
+            "UniqueProductsPurchased": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "UniqueProductsPurchased"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "UniqueProductsPurchased from procedure output via temp table"
+            },
+            "TotalItemsPurchased": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "TotalItemsPurchased"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "TotalItemsPurchased from procedure output via temp table"
+            },
+            "TotalRevenue": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "TotalRevenue"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "TotalRevenue from procedure output via temp table"
+            },
+            "AverageOrderValue": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "AverageOrderValue"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "AverageOrderValue from procedure output via temp table"
+            },
+            "LastOrderDate": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "LastOrderDate"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "LastOrderDate from procedure output via temp table"
+            },
+            "DaysSinceLastOrder": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "DaysSinceLastOrder"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "DaysSinceLastOrder from procedure output via temp table"
+            },
+            "CustomerActivityStatus": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "CustomerActivityStatus"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerActivityStatus from procedure output via temp table"
+            },
+            "OrdersPerDay": {
+              "inputFields": [ {"namespace": "mssql://localhost/InfoTrackerDW", "name": "dbo.usp_customer_metrics_dataset", "field": "OrdersPerDay"} ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrdersPerDay from procedure output via temp table"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

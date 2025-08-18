@@ -241,6 +241,7 @@ For detailed information:
 - `docs/cli_usage.md` — commands and options
 - `docs/breaking_changes.md` — definition and detection
 - `docs/edge_cases.md` — SELECT *, UNION, temp tables, etc.
+- `docs/advanced_use_cases.md` — tabular functions, procedures returning datasets
 - `docs/adapters.md` — interface and MSSQL specifics
 - `docs/architecture.md` — system and sequence diagrams
 - `docs/configuration.md` — configuration reference
