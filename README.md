@@ -12,6 +12,8 @@ Column-level SQL lineage extraction and impact analysis for MS SQL Server
 - **Configurable depth** - Control traversal depth with `--max-depth`
 - **Multiple output formats** - Text tables or JSON for scripting
 - **MSSQL support** - T-SQL dialect with temp tables, variables, and stored procedures
+- **Advanced SQL objects** - Support for table-valued functions (TVF) and dataset-returning procedures
+- **Temp table lineage** - Track EXEC into temp tables and propagate lineage downstream
 
 ## Requirements
 - Python 3.10+
@@ -68,26 +70,98 @@ InfoTracker supports flexible column selectors:
 - `selector+` - downstream dependencies (explicit)
 - `+selector+` - both upstream and downstream
 
+### Selector Cheat Sheet
+
+**Table wildcards:**
+```bash
+# All columns from a specific table
+infotracker impact -s "dbo.fct_sales.*"
+infotracker impact -s "STG.dbo.Orders.*"
+```
+
+**Column name matching:**
+```bash
+# Find all columns containing "revenue" (case-insensitive)
+infotracker impact -s "..revenue"
+
+# Find all columns containing "id" 
+infotracker impact -s "..id"
+
+# Use wildcards for pattern matching
+infotracker impact -s "..customer*"
+```
+
+**Direction examples:**
+```bash
+# Upstream: what feeds into this column
+infotracker impact -s "+dbo.fct_sales.Revenue"
+
+# Downstream: what uses this column
+infotracker impact -s "STG.dbo.Orders.OrderID+"
+
+# Both directions
+infotracker impact -s "+dbo.dim_customer.CustomerID+"
+```
+
+**Advanced SQL objects:**
+```bash
+# Table-valued function columns (upstream)
+infotracker impact -s "+dbo.fn_customer_orders_tvf.*"
+
+# Procedure dataset columns (upstream)  
+infotracker impact -s "+dbo.usp_customer_metrics_dataset.*"
+
+# Temp table lineage from EXEC
+infotracker impact -s "+#temp_table.*"
+```
+
 ## Examples
 
 ```bash
 # Extract lineage (run this first)
 infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
 
-# Find what feeds into a column (upstream)
-infotracker impact -s "+dbo.fct_sales.Revenue"
+# Basic column lineage
+infotracker impact -s "+dbo.fct_sales.Revenue"        # upstream sources
+infotracker impact -s "STG.dbo.Orders.OrderID+"      # downstream usage
 
-# Find what uses a column (downstream) 
-infotracker impact -s "STG.dbo.Orders.OrderID+"
+# Wildcard selectors
+infotracker impact -s "+..revenue+"                   # all revenue columns (both directions)
+infotracker impact -s "dbo.fct_sales.*"              # all columns from table
+infotracker --format json impact -s "..customer*"     # customer columns (JSON output)
 
-# Find all relationships for columns containing "revenue"
-infotracker impact -s "+..revenue+"
+# Advanced SQL objects (NEW)
+infotracker impact -s "+dbo.fn_customer_orders_tvf.*"      # TVF columns (upstream)
+infotracker impact -s "+dbo.usp_customer_metrics_dataset.*" # procedure columns (upstream)
 
-# Get all columns from a table
-infotracker --format json impact -s "dbo.fct_sales.*"
-
-# Limit traversal depth
+# Depth control
 infotracker impact -s "+dbo.Orders.OrderID" --max-depth 1
+
+# Demo the new features with the included examples
+infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+infotracker impact -s "+dbo.fn_customer_orders_inline.*"
+infotracker impact -s "+dbo.usp_customer_metrics_dataset.TotalRevenue"
+```
+
+### Copy-Paste Demo Commands
+
+Test the new TVF and procedure lineage features:
+
+```bash
+# 1. Extract all lineage (including new TVF/procedure support)
+infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+
+# 2. Test TVF lineage 
+infotracker --format text impact -s "+dbo.fn_customer_orders_tvf.*"
+
+# 3. Test procedure lineage
+infotracker --format text impact -s "+dbo.usp_customer_metrics_dataset.*"
+
+# 4. Test column name contains wildcard
+infotracker --format text impact -s "+..revenue"
+
+# 5. Show results in JSON format
+infotracker --format json impact -s "..total*" > tvf_lineage.json
 ```
 
 ## Output Format
@@ -96,10 +170,38 @@ Impact analysis returns these columns:
 - **from** - Source column (fully qualified)
 - **to** - Target column (fully qualified)  
 - **direction** - `upstream` or `downstream`
-- **transformation** - Type of transformation (`IDENTITY`, `ARITHMETIC`, `UNION`, `WINDOW`, etc.)
+- **transformation** - Type of transformation (`IDENTITY`, `ARITHMETIC`, `AGGREGATION`, `CASE_AGGREGATION`, `DATE_FUNCTION`, `WINDOW`, etc.)
 - **description** - Human-readable transformation description
 
 Results are automatically deduplicated. Use `--format json` for machine-readable output.
+
+### New Transformation Types
+
+The enhanced transformation taxonomy includes:
+- `ARITHMETIC_AGGREGATION` - Arithmetic operations combined with aggregation functions
+- `COMPLEX_AGGREGATION` - Multi-step calculations involving multiple aggregations  
+- `DATE_FUNCTION` - Date/time calculations like DATEDIFF, DATEADD
+- `DATE_FUNCTION_AGGREGATION` - Date functions applied to aggregated results
+- `CASE_AGGREGATION` - CASE statements applied to aggregated results
+
+### Advanced Object Support
+
+InfoTracker now supports advanced SQL Server objects:
+
+**Table-Valued Functions (TVF):**
+- Inline TVF (`RETURN AS SELECT`) - Parsed directly from SELECT statement
+- Multi-statement TVF (`RETURN @table TABLE`) - Extracts schema from table variable definition
+- Function parameters are tracked as filter metadata (don't create columns)
+
+**Dataset-Returning Procedures:**
+- Procedures ending with SELECT statement are treated as dataset sources
+- Output schema extracted from the final SELECT statement  
+- Parameters tracked as filter metadata affecting lineage scope
+
+**EXEC into Temp Tables:**
+- `INSERT INTO #temp EXEC procedure` patterns create edges from procedure columns to temp table columns
+- Temp table lineage propagates downstream to final targets
+- Supports complex workflow patterns combining functions, procedures, and temp tables
 
 ## Configuration
 

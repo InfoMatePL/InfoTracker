@@ -25,7 +25,14 @@ class SqlParser:
     def parse_sql_file(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse a SQL file and extract object information."""
         try:
-            # Parse the SQL statement
+            # First check if this is a function or procedure using string matching
+            sql_upper = sql_content.upper()
+            if "CREATE FUNCTION" in sql_upper or "CREATE OR ALTER FUNCTION" in sql_upper:
+                return self._parse_function_string(sql_content, object_hint)
+            elif "CREATE PROCEDURE" in sql_upper or "CREATE OR ALTER PROCEDURE" in sql_upper:
+                return self._parse_procedure_string(sql_content, object_hint)
+            
+            # Parse the SQL statement with SQLGlot
             statements = sqlglot.parse(sql_content, read=self.dialect)
             if not statements:
                 raise ValueError("No valid SQL statements found")
@@ -96,11 +103,15 @@ class SqlParser:
         )
     
     def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
-        """Parse CREATE TABLE or CREATE VIEW statement."""
+        """Parse CREATE TABLE, CREATE VIEW, CREATE FUNCTION, or CREATE PROCEDURE statement."""
         if statement.kind == "TABLE":
             return self._parse_create_table(statement, object_hint)
         elif statement.kind == "VIEW":
             return self._parse_create_view(statement, object_hint)
+        elif statement.kind == "FUNCTION":
+            return self._parse_create_function(statement, object_hint)
+        elif statement.kind == "PROCEDURE":
+            return self._parse_create_procedure(statement, object_hint)
         else:
             raise ValueError(f"Unsupported CREATE statement: {statement.kind}")
     
@@ -184,6 +195,71 @@ class SqlParser:
         return ObjectInfo(
             name=view_name,
             object_type="view",
+            schema=schema,
+            lineage=lineage,
+            dependencies=dependencies
+        )
+    
+    def _parse_create_function(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
+        """Parse CREATE FUNCTION statement (table-valued functions only)."""
+        function_name = self._get_table_name(statement.this, object_hint)
+        namespace = "mssql://localhost/InfoTrackerDW"
+        
+        # Check if this is a table-valued function
+        if not self._is_table_valued_function(statement):
+            # For scalar functions, create a simple object without lineage
+            return ObjectInfo(
+                name=function_name,
+                object_type="function",
+                schema=TableSchema(
+                    namespace=namespace,
+                    name=function_name,
+                    columns=[]
+                ),
+                lineage=[],
+                dependencies=set()
+            )
+        
+        # Handle table-valued functions
+        lineage, output_columns, dependencies = self._extract_tvf_lineage(statement, function_name)
+        
+        schema = TableSchema(
+            namespace=namespace,
+            name=function_name,
+            columns=output_columns
+        )
+        
+        # Register schema for future reference
+        self.schema_registry.register(schema)
+        
+        return ObjectInfo(
+            name=function_name,
+            object_type="function",
+            schema=schema,
+            lineage=lineage,
+            dependencies=dependencies
+        )
+    
+    def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
+        """Parse CREATE PROCEDURE statement."""
+        procedure_name = self._get_table_name(statement.this, object_hint)
+        namespace = "mssql://localhost/InfoTrackerDW"
+        
+        # Extract the procedure body and find the last SELECT statement
+        lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
+        
+        schema = TableSchema(
+            namespace=namespace,
+            name=procedure_name,
+            columns=output_columns
+        )
+        
+        # Register schema for future reference
+        self.schema_registry.register(schema)
+        
+        return ObjectInfo(
+            name=procedure_name,
+            object_type="procedure",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
@@ -821,3 +897,385 @@ class SqlParser:
         else:
             # Generic fallback
             return ['Column1', 'Column2', 'Column3']
+
+    def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
+        """Parse CREATE FUNCTION using string-based approach."""
+        function_name = self._extract_function_name(sql_content) or object_hint or "unknown_function"
+        namespace = "mssql://localhost/InfoTrackerDW"
+        
+        # Check if this is a table-valued function
+        if not self._is_table_valued_function_string(sql_content):
+            # For scalar functions, create a simple object without lineage
+            return ObjectInfo(
+                name=function_name,
+                object_type="function",
+                schema=TableSchema(
+                    namespace=namespace,
+                    name=function_name,
+                    columns=[]
+                ),
+                lineage=[],
+                dependencies=set()
+            )
+        
+        # Handle table-valued functions
+        lineage, output_columns, dependencies = self._extract_tvf_lineage_string(sql_content, function_name)
+        
+        schema = TableSchema(
+            namespace=namespace,
+            name=function_name,
+            columns=output_columns
+        )
+        
+        # Register schema for future reference
+        self.schema_registry.register(schema)
+        
+        return ObjectInfo(
+            name=function_name,
+            object_type="function",
+            schema=schema,
+            lineage=lineage,
+            dependencies=dependencies
+        )
+    
+    def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
+        """Parse CREATE PROCEDURE using string-based approach."""
+        procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
+        namespace = "mssql://localhost/InfoTrackerDW"
+        
+        # Extract the procedure body and find the last SELECT statement
+        lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
+        
+        schema = TableSchema(
+            namespace=namespace,
+            name=procedure_name,
+            columns=output_columns
+        )
+        
+        # Register schema for future reference
+        self.schema_registry.register(schema)
+        
+        return ObjectInfo(
+            name=procedure_name,
+            object_type="procedure",
+            schema=schema,
+            lineage=lineage,
+            dependencies=dependencies
+        )
+
+    def _extract_function_name(self, sql_content: str) -> Optional[str]:
+        """Extract function name from CREATE FUNCTION statement."""
+        match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+([^\s\(]+)', sql_content, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+    
+    def _extract_procedure_name(self, sql_content: str) -> Optional[str]:
+        """Extract procedure name from CREATE PROCEDURE statement."""
+        match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([^\s\(]+)', sql_content, re.IGNORECASE)
+        return match.group(1).strip() if match else None
+
+    def _is_table_valued_function_string(self, sql_content: str) -> bool:
+        """Check if this is a table-valued function (returns TABLE)."""
+        sql_upper = sql_content.upper()
+        return "RETURNS TABLE" in sql_upper or "RETURNS @" in sql_upper
+    
+    def _extract_tvf_lineage_string(self, sql_content: str, function_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str]]:
+        """Extract lineage from a table-valued function using string parsing."""
+        lineage = []
+        output_columns = []
+        dependencies = set()
+        
+        sql_upper = sql_content.upper()
+        
+        # Handle inline TVF (RETURN AS SELECT or RETURN (SELECT))
+        if "RETURN" in sql_upper and ("AS" in sql_upper or "(" in sql_upper):
+            select_sql = self._extract_select_from_return_string(sql_content)
+            if select_sql:
+                try:
+                    parsed = sqlglot.parse(select_sql, read=self.dialect)
+                    if parsed and isinstance(parsed[0], exp.Select):
+                        lineage, output_columns = self._extract_column_lineage(parsed[0], function_name)
+                        dependencies = self._extract_dependencies(parsed[0])
+                except Exception:
+                    # Fallback to basic analysis
+                    output_columns = self._extract_basic_select_columns(select_sql)
+                    dependencies = self._extract_basic_dependencies(select_sql)
+        
+        # Handle multi-statement TVF (RETURNS @table TABLE)
+        elif "RETURNS @" in sql_upper:
+            output_columns = self._extract_table_variable_schema_string(sql_content)
+            dependencies = self._extract_basic_dependencies(sql_content)
+        
+        return lineage, output_columns, dependencies
+    
+    def _extract_procedure_lineage_string(self, sql_content: str, procedure_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str]]:
+        """Extract lineage from a procedure using string parsing."""
+        lineage = []
+        output_columns = []
+        dependencies = set()
+        
+        # Find the last SELECT statement in the procedure body
+        last_select_sql = self._find_last_select_string(sql_content)
+        if last_select_sql:
+            try:
+                parsed = sqlglot.parse(last_select_sql, read=self.dialect)
+                if parsed and isinstance(parsed[0], exp.Select):
+                    lineage, output_columns = self._extract_column_lineage(parsed[0], procedure_name)
+                    dependencies = self._extract_dependencies(parsed[0])
+            except Exception:
+                # Fallback to basic analysis
+                output_columns = self._extract_basic_select_columns(last_select_sql)
+                dependencies = self._extract_basic_dependencies(last_select_sql)
+        
+        return lineage, output_columns, dependencies
+    
+    def _extract_select_from_return_string(self, sql_content: str) -> Optional[str]:
+        """Extract SELECT statement from RETURN clause using regex."""
+        # Handle RETURN (SELECT ...)
+        match = re.search(r'RETURN\s*\(\s*(SELECT.*?)\s*\)(?:\s*;)?$', sql_content, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        # Handle RETURN AS (SELECT ...)
+        match = re.search(r'RETURN\s+AS\s*\(\s*(SELECT.*?)\s*\)', sql_content, re.IGNORECASE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        
+        return None
+    
+    def _extract_table_variable_schema_string(self, sql_content: str) -> List[ColumnSchema]:
+        """Extract column schema from @table TABLE definition using regex."""
+        output_columns = []
+        
+        # Look for @Variable TABLE (column definitions)
+        match = re.search(r'@\w+\s+TABLE\s*\((.*?)\)', sql_content, re.IGNORECASE | re.DOTALL)
+        if match:
+            columns_def = match.group(1)
+            # Simple parsing of column definitions
+            for i, col_def in enumerate(columns_def.split(',')):
+                col_def = col_def.strip()
+                if col_def:
+                    parts = col_def.split()
+                    if len(parts) >= 2:
+                        col_name = parts[0].strip()
+                        col_type = parts[1].strip()
+                        output_columns.append(ColumnSchema(
+                            name=col_name,
+                            data_type=col_type,
+                            nullable=True,
+                            ordinal=i
+                        ))
+        
+        return output_columns
+    
+    def _find_last_select_string(self, sql_content: str) -> Optional[str]:
+        """Find the last standalone SELECT statement in SQL content."""
+        # Remove comments and normalize whitespace
+        cleaned_sql = re.sub(r'--.*?$', '', sql_content, flags=re.MULTILINE)
+        cleaned_sql = re.sub(r'/\*.*?\*/', '', cleaned_sql, flags=re.DOTALL)
+        
+        # Find all SELECT statements that are not part of INSERT/UPDATE/SET
+        select_pattern = r'(?<!INSERT\s)(?<!UPDATE\s)(?<!SET\s)(?<!FROM\s)(?<==\s)SELECT\s+.*?(?=(?:FROM|;|$))'
+        matches = list(re.finditer(select_pattern, cleaned_sql, re.IGNORECASE | re.DOTALL))
+        
+        if matches:
+            last_match = matches[-1]
+            # Try to capture the complete SELECT statement including FROM clause
+            remaining_sql = cleaned_sql[last_match.start():]
+            complete_select = self._extract_complete_select(remaining_sql)
+            return complete_select
+        
+        return None
+    
+    def _extract_complete_select(self, sql_fragment: str) -> str:
+        """Extract a complete SELECT statement including FROM, WHERE, etc."""
+        # Simple approach: find until next major keyword or end
+        keywords = ['GROUP BY', 'ORDER BY', 'HAVING', ';', 'END', 'GO']
+        
+        end_pos = len(sql_fragment)
+        for keyword in keywords:
+            pos = sql_fragment.upper().find(keyword)
+            if pos != -1 and pos < end_pos:
+                end_pos = pos
+        
+        return sql_fragment[:end_pos].strip()
+    
+    def _extract_basic_select_columns(self, select_sql: str) -> List[ColumnSchema]:
+        """Basic extraction of column names from SELECT statement."""
+        output_columns = []
+        
+        # Extract the SELECT list (between SELECT and FROM)
+        match = re.search(r'SELECT\s+(.*?)\s+FROM', select_sql, re.IGNORECASE | re.DOTALL)
+        if match:
+            select_list = match.group(1)
+            columns = [col.strip() for col in select_list.split(',')]
+            
+            for i, col in enumerate(columns):
+                # Handle aliases (column AS alias or column alias)
+                if ' AS ' in col.upper():
+                    col_name = col.split(' AS ')[-1].strip()
+                elif ' ' in col and not any(func in col.upper() for func in ['SUM', 'COUNT', 'MAX', 'MIN', 'AVG', 'CAST', 'CASE']):
+                    parts = col.strip().split()
+                    col_name = parts[-1]  # Last part is usually the alias
+                else:
+                    # Extract the base column name
+                    col_name = col.split('.')[-1] if '.' in col else col
+                    col_name = re.sub(r'[^\w]', '', col_name)  # Remove non-alphanumeric
+                
+                if col_name:
+                    output_columns.append(ColumnSchema(
+                        name=col_name,
+                        data_type="varchar",  # Default type
+                        nullable=True,
+                        ordinal=i
+                    ))
+        
+        return output_columns
+    
+    def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
+        """Basic extraction of table dependencies from SQL."""
+        dependencies = set()
+        
+        # Find FROM and JOIN clauses
+        from_matches = re.findall(r'FROM\s+([^\s\(]+)', sql_content, re.IGNORECASE)
+        join_matches = re.findall(r'JOIN\s+([^\s\(]+)', sql_content, re.IGNORECASE)
+        
+        for match in from_matches + join_matches:
+            table_name = match.strip()
+            # Clean up table name (remove aliases, schema qualifiers for dependency tracking)
+            if ' ' in table_name:
+                table_name = table_name.split()[0]
+            dependencies.add(table_name.lower())
+        
+        return dependencies
+
+    def _is_table_valued_function(self, statement: exp.Create) -> bool:
+        """Check if this is a table-valued function (returns TABLE)."""
+        # Simple heuristic: check if the function has RETURNS TABLE
+        sql_text = str(statement).upper()
+        return "RETURNS TABLE" in sql_text or "RETURNS @" in sql_text
+    
+    def _extract_tvf_lineage(self, statement: exp.Create, function_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str]]:
+        """Extract lineage from a table-valued function."""
+        lineage = []
+        output_columns = []
+        dependencies = set()
+        
+        sql_text = str(statement)
+        
+        # Handle inline TVF (RETURN AS SELECT)
+        if "RETURN AS" in sql_text.upper() or "RETURN(" in sql_text.upper():
+            # Find the SELECT statement in the RETURN clause
+            select_stmt = self._extract_select_from_return(statement)
+            if select_stmt:
+                lineage, output_columns = self._extract_column_lineage(select_stmt, function_name)
+                dependencies = self._extract_dependencies(select_stmt)
+        
+        # Handle multi-statement TVF (RETURN @table TABLE)
+        elif "RETURNS @" in sql_text.upper():
+            # Extract the table variable definition and find INSERT statements
+            output_columns = self._extract_table_variable_schema(statement)
+            lineage, dependencies = self._extract_mstvf_lineage(statement, function_name, output_columns)
+        
+        return lineage, output_columns, dependencies
+    
+    def _extract_procedure_lineage(self, statement: exp.Create, procedure_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str]]:
+        """Extract lineage from a procedure that returns a dataset."""
+        lineage = []
+        output_columns = []
+        dependencies = set()
+        
+        # Find the last SELECT statement in the procedure body
+        last_select = self._find_last_select_in_procedure(statement)
+        if last_select:
+            lineage, output_columns = self._extract_column_lineage(last_select, procedure_name)
+            dependencies = self._extract_dependencies(last_select)
+        
+        return lineage, output_columns, dependencies
+    
+    def _extract_select_from_return(self, statement: exp.Create) -> Optional[exp.Select]:
+        """Extract SELECT statement from RETURN AS clause."""
+        # This is a simplified implementation - in practice would need more robust parsing
+        try:
+            sql_text = str(statement)
+            return_as_match = re.search(r'RETURN\s*\(\s*(SELECT.*?)\s*\)', sql_text, re.IGNORECASE | re.DOTALL)
+            if return_as_match:
+                select_sql = return_as_match.group(1)
+                parsed = sqlglot.parse(select_sql, read=self.dialect)
+                if parsed and isinstance(parsed[0], exp.Select):
+                    return parsed[0]
+        except Exception:
+            pass
+        return None
+    
+    def _extract_table_variable_schema(self, statement: exp.Create) -> List[ColumnSchema]:
+        """Extract column schema from @table TABLE definition."""
+        # Simplified implementation - would need more robust parsing for production
+        output_columns = []
+        sql_text = str(statement)
+        
+        # Look for @Result TABLE (col1 type1, col2 type2, ...)
+        table_def_match = re.search(r'@\w+\s+TABLE\s*\((.*?)\)', sql_text, re.IGNORECASE | re.DOTALL)
+        if table_def_match:
+            columns_def = table_def_match.group(1)
+            # Parse column definitions
+            for i, col_def in enumerate(columns_def.split(',')):
+                col_parts = col_def.strip().split()
+                if len(col_parts) >= 2:
+                    col_name = col_parts[0].strip()
+                    col_type = col_parts[1].strip()
+                    output_columns.append(ColumnSchema(
+                        name=col_name,
+                        data_type=col_type,
+                        nullable=True,
+                        ordinal=i
+                    ))
+        
+        return output_columns
+    
+    def _extract_mstvf_lineage(self, statement: exp.Create, function_name: str, output_columns: List[ColumnSchema]) -> tuple[List[ColumnLineage], Set[str]]:
+        """Extract lineage from multi-statement table-valued function."""
+        lineage = []
+        dependencies = set()
+        
+        # Find INSERT statements into the @table variable
+        sql_text = str(statement)
+        insert_matches = re.finditer(r'INSERT\s+INTO\s+@\w+.*?SELECT(.*?)(?:FROM|$)', sql_text, re.IGNORECASE | re.DOTALL)
+        
+        for match in insert_matches:
+            try:
+                select_part = "SELECT" + match.group(1)
+                parsed = sqlglot.parse(select_part, read=self.dialect)
+                if parsed and isinstance(parsed[0], exp.Select):
+                    select_stmt = parsed[0]
+                    stmt_lineage, _ = self._extract_column_lineage(select_stmt, function_name)
+                    lineage.extend(stmt_lineage)
+                    dependencies.update(self._extract_dependencies(select_stmt))
+            except Exception:
+                continue
+        
+        return lineage, dependencies
+    
+    def _find_last_select_in_procedure(self, statement: exp.Create) -> Optional[exp.Select]:
+        """Find the last SELECT statement in a procedure body."""
+        sql_text = str(statement)
+        
+        # Find all SELECT statements that are not part of INSERT/UPDATE/DELETE
+        select_matches = list(re.finditer(r'(?<!INSERT\s)(?<!UPDATE\s)(?<!DELETE\s)SELECT\s+.*?(?=(?:FROM|$))', sql_text, re.IGNORECASE | re.DOTALL))
+        
+        if select_matches:
+            # Get the last SELECT statement
+            last_match = select_matches[-1]
+            try:
+                select_sql = last_match.group(0)
+                # Find the FROM clause and complete SELECT
+                from_match = re.search(r'FROM.*?(?=(?:WHERE|GROUP|ORDER|HAVING|;|$))', sql_text[last_match.end():], re.IGNORECASE | re.DOTALL)
+                if from_match:
+                    select_sql += from_match.group(0)
+                
+                parsed = sqlglot.parse(select_sql, read=self.dialect)
+                if parsed and isinstance(parsed[0], exp.Select):
+                    return parsed[0]
+            except Exception:
+                pass
+        
+        return None
