@@ -975,40 +975,7 @@ class SqlParser:
                 ))
         
         return lineage, output_columns
-        for table in select_stmt.find_all(exp.Table):
-            table_name = self._get_table_name(table)
-            if table_name != "unknown":
-                source_tables.append(table_name)
-        
-        if not source_tables:
-            return lineage, output_columns
-        
-        # For unqualified *, expand columns from all tables
-        ordinal = 0
-        for table_name in source_tables:
-            columns = self._infer_table_columns(table_name)
-            
-            for column_name in columns:
-                output_columns.append(ColumnSchema(
-                    name=column_name,
-                    data_type="unknown",
-                    nullable=True,
-                    ordinal=ordinal
-                ))
-                ordinal += 1
-                
-                lineage.append(ColumnLineage(
-                    output_column=column_name,
-                    input_fields=[ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=table_name,
-                        column_name=column_name
-                    )],
-                    transformation_type=TransformationType.IDENTITY,
-                    transformation_description=f"SELECT * (from {table_name})"
-                ))
-        
-        return lineage, output_columns
+
     
     def _handle_union_lineage(self, stmt: exp.Expression, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
         """Handle UNION operations."""
@@ -1257,13 +1224,7 @@ class SqlParser:
         
         return output_columns
         
-        end_pos = len(sql_fragment)
-        for keyword in keywords:
-            pos = sql_fragment.upper().find(keyword)
-            if pos != -1 and pos < end_pos:
-                end_pos = pos
-        
-        return sql_fragment[:end_pos].strip()
+
     
     def _extract_basic_select_columns(self, select_sql: str) -> List[ColumnSchema]:
         """Basic extraction of column names from SELECT statement."""
