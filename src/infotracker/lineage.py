@@ -63,8 +63,11 @@ class OpenLineageGenerator:
     
     def _build_outputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
         """Build outputs array with schema and lineage facets."""
+        # Use schema's namespace if available, otherwise default namespace
+        output_namespace = obj_info.schema.namespace if obj_info.schema.namespace else self.namespace
+        
         output = {
-            "namespace": self.namespace,
+            "namespace": output_namespace,
             "name": obj_info.schema.name,
             "facets": {}
         }

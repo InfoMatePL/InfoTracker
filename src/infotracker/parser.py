@@ -30,6 +30,117 @@ class SqlParser:
         """Set the default database for qualification."""
         self.default_database = default_database
     
+    def _preprocess_sql(self, sql: str) -> str:
+        """
+        Preprocess SQL to remove control lines and join INSERT INTO #temp EXEC patterns.
+        """
+        import re
+        
+        lines = sql.split('\n')
+        processed_lines = []
+        
+        for line in lines:
+            stripped_line = line.strip()
+            
+            # Skip lines starting with DECLARE, SET, PRINT (case-insensitive)
+            if re.match(r'(?i)^(DECLARE|SET|PRINT)\b', stripped_line):
+                continue
+            
+            # Skip IF OBJECT_ID('tempdb..#...') patterns and DROP TABLE #temp patterns
+            if (re.match(r"(?i)^IF\s+OBJECT_ID\('tempdb\.\.#", stripped_line) or
+                re.match(r'(?i)^DROP\s+TABLE\s+#\w+', stripped_line)):
+                continue
+            
+            processed_lines.append(line)
+        
+        # Join the lines back together
+        processed_sql = '\n'.join(processed_lines)
+        
+        # Join two-line INSERT INTO #temp + EXEC patterns
+        processed_sql = re.sub(
+            r'(?i)(INSERT\s+INTO\s+#\w+)\s*\n\s*(EXEC\b)',
+            r'\1 \2',
+            processed_sql
+        )
+        
+        return processed_sql
+    
+    def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
+        """
+        Fallback parser for INSERT INTO #temp EXEC pattern when SQLGlot fails.
+        """
+        import re
+        
+        # Look for INSERT INTO #temp EXEC pattern
+        pattern = r'(?is)INSERT\s+INTO\s+(#\w+)\s+EXEC\s+([^\s(]+)'
+        match = re.search(pattern, sql_content)
+        
+        if not match:
+            return None
+        
+        temp_table = match.group(1)  # e.g., "#customer_metrics"
+        proc_name = match.group(2)   # e.g., "dbo.usp_customer_metrics_dataset"
+        
+        # Qualify procedure name if needed
+        if '.' not in proc_name and self.default_database:
+            qualified_proc_name = f"{self.default_database}.dbo.{proc_name}"
+        else:
+            qualified_proc_name = proc_name
+        
+        # Create placeholder columns for the temp table
+        placeholder_columns = [
+            ColumnSchema(
+                name="output_col_1",
+                data_type="unknown",
+                nullable=True,
+                ordinal=0
+            ),
+            ColumnSchema(
+                name="output_col_2", 
+                data_type="unknown",
+                nullable=True,
+                ordinal=1
+            )
+        ]
+        
+        # Create schema for temp table
+        schema = TableSchema(
+            namespace="tempdb",
+            name=temp_table,
+            columns=placeholder_columns
+        )
+        
+        # Create lineage for each placeholder column
+        lineage = []
+        for col in placeholder_columns:
+            lineage.append(ColumnLineage(
+                output_column=col.name,
+                input_fields=[
+                    ColumnReference(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        table_name=qualified_proc_name,
+                        column_name="*"
+                    )
+                ],
+                transformation_type=TransformationType.EXEC,
+                transformation_description=f"INSERT INTO {temp_table} EXEC {proc_name}"
+            ))
+        
+        # Set dependencies to the procedure
+        dependencies = {qualified_proc_name}
+        
+        # Register schema in registry
+        self.schema_registry.register(schema)
+        
+        # Create and return ObjectInfo
+        return ObjectInfo(
+            name=temp_table,
+            object_type="temp_table",
+            schema=schema,
+            lineage=lineage,
+            dependencies=dependencies
+        )
+    
     def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
         """Find the last SELECT statement in SQL content using SQLGlot AST."""
         import sqlglot
@@ -55,8 +166,11 @@ class SqlParser:
             elif "CREATE PROCEDURE" in sql_upper or "CREATE OR ALTER PROCEDURE" in sql_upper:
                 return self._parse_procedure_string(sql_content, object_hint)
             
+            # Preprocess the SQL content to handle demo script patterns
+            preprocessed_sql = self._preprocess_sql(sql_content)
+            
             # Parse the SQL statement with SQLGlot
-            statements = sqlglot.parse(sql_content, read=self.dialect)
+            statements = sqlglot.parse(preprocessed_sql, read=self.dialect)
             if not statements:
                 raise ValueError("No valid SQL statements found")
             
@@ -73,6 +187,11 @@ class SqlParser:
                 raise ValueError(f"Unsupported statement type: {type(statement)}")
                 
         except Exception as e:
+            # Try fallback for INSERT INTO #temp EXEC pattern
+            fallback_result = self._try_insert_exec_fallback(sql_content, object_hint)
+            if fallback_result:
+                return fallback_result
+            
             logger.warning("parse failed: %s", e)
             # Return an object with error information
             return ObjectInfo(
