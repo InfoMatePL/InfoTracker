@@ -257,14 +257,18 @@ class Engine:
         
         for obj in objects:
             obj_name = obj.schema.name if obj.schema else obj.name
-            dependencies[obj_name] = set()
             
-            # Find dependencies from lineage input fields
-            for lineage in obj.lineage:
-                for input_field in lineage.input_fields:
-                    dep_name = input_field.table_name
-                    if dep_name != obj_name:  # Don't depend on self
-                        dependencies[obj_name].add(dep_name)
+            # Use ObjectInfo.dependencies first
+            if obj.dependencies:
+                dependencies[obj_name] = set(obj.dependencies)
+            else:
+                # Fallback to extracting dependencies from lineage.input_fields
+                dependencies[obj_name] = set()
+                for lineage in obj.lineage:
+                    for input_field in lineage.input_fields:
+                        dep_name = input_field.table_name
+                        if dep_name != obj_name:  # Don't depend on self
+                            dependencies[obj_name].add(dep_name)
         
         return dependencies
     
@@ -476,7 +480,7 @@ class Engine:
             Dict with results including exit_code (1 if breaking changes, 0 otherwise)
         """
         from .openlineage_utils import OpenLineageLoader, OLMapper
-        from .diff import BreakingChangeDetector
+        from .diff import BreakingChangeDetector, Severity
         
         try:
             # Load OpenLineage artifacts from both directories
@@ -491,18 +495,52 @@ class Engine:
             detector = BreakingChangeDetector()
             report = detector.compare(base_objects, head_objects)
             
-            # Determine exit code
-            exit_code = 1 if report.has_breaking else 0
+            # Filter changes based on severity threshold from config
+            threshold = self.config.severity_threshold.upper()
+            filtered_changes = []
+            
+            if threshold == "BREAKING":
+                # Only show BREAKING changes
+                filtered_changes = [c for c in report.changes if c.severity == Severity.BREAKING]
+            elif threshold == "POTENTIALLY_BREAKING":
+                # Show BREAKING and POTENTIALLY_BREAKING changes
+                filtered_changes = [c for c in report.changes if c.severity in [Severity.BREAKING, Severity.POTENTIALLY_BREAKING]]
+            else:  # NON_BREAKING
+                # Show all changes
+                filtered_changes = report.changes
+            
+            # Determine exit code based on threshold
+            exit_code = 0
+            if threshold == "BREAKING":
+                exit_code = 1 if any(c.severity == Severity.BREAKING for c in report.changes) else 0
+            elif threshold == "POTENTIALLY_BREAKING":
+                exit_code = 1 if any(c.severity in [Severity.BREAKING, Severity.POTENTIALLY_BREAKING] for c in report.changes) else 0
+            else:  # NON_BREAKING
+                exit_code = 1 if len(report.changes) > 0 else 0
+            
+            # Build filtered report
+            if filtered_changes:
+                filtered_rows = []
+                for change in filtered_changes:
+                    filtered_rows.append([
+                        change.object_name,
+                        change.column_name or "",
+                        change.change_type.value,
+                        change.severity.value,
+                        change.description
+                    ])
+            else:
+                filtered_rows = []
             
             return {
-                "columns": report.columns,
-                "rows": report.rows,
+                "columns": ["object", "column", "change_type", "severity", "description"],
+                "rows": filtered_rows,
                 "exit_code": exit_code,
                 "summary": {
-                    "total_changes": len(report.changes),
-                    "breaking_changes": len([c for c in report.changes if c.severity.value == "BREAKING"]),
-                    "potentially_breaking": len([c for c in report.changes if c.severity.value == "POTENTIALLY_BREAKING"]),
-                    "non_breaking": len([c for c in report.changes if c.severity.value == "NON_BREAKING"])
+                    "total_changes": len(filtered_changes),
+                    "breaking_changes": len([c for c in filtered_changes if c.severity.value == "BREAKING"]),
+                    "potentially_breaking": len([c for c in filtered_changes if c.severity.value == "POTENTIALLY_BREAKING"]),
+                    "non_breaking": len([c for c in filtered_changes if c.severity.value == "NON_BREAKING"])
                 }
             }
             

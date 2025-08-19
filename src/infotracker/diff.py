@@ -162,8 +162,18 @@ class BreakingChangeDetector:
         base_names = set(base_columns.keys())
         head_names = set(head_columns.keys())
         
-        # Column additions
-        for added_name in head_names - base_names:
+        # Detect column renames before processing additions/removals
+        removed = base_names - head_names
+        added = head_names - base_names
+        renamed_pairs = self._detect_column_renames(base_columns, head_columns, removed, added, base_obj, head_obj)
+        
+        # Remove renamed columns from added/removed sets
+        for old_name, new_name in renamed_pairs:
+            removed.discard(old_name)
+            added.discard(new_name)
+        
+        # Column additions (after removing renames)
+        for added_name in added:
             col = head_columns[added_name]
             severity = Severity.POTENTIALLY_BREAKING  # Could affect SELECT *
             self.changes.append(Change(
@@ -175,8 +185,8 @@ class BreakingChangeDetector:
                 description=f"Added column '{col.name}' ({col.data_type})"
             ))
         
-        # Column removals
-        for removed_name in base_names - head_names:
+        # Column removals (after removing renames)
+        for removed_name in removed:
             col = base_columns[removed_name]
             self.changes.append(Change(
                 change_type=ChangeType.COLUMN_REMOVED,
@@ -187,48 +197,58 @@ class BreakingChangeDetector:
                 description=f"Removed column '{col.name}'"
             ))
         
-        # Column changes for existing columns
-        for common_name in base_names & head_names:
-            base_col = base_columns[common_name]
-            head_col = head_columns[common_name]
-            
-            # Type changes
-            if base_col.data_type != head_col.data_type:
-                severity = self._classify_type_change_severity(base_col.data_type, head_col.data_type)
-                self.changes.append(Change(
-                    change_type=ChangeType.COLUMN_TYPE_CHANGED,
-                    severity=severity,
-                    object_name=base_obj.name,
-                    column_name=base_col.name,
-                    old_value=base_col.data_type,
-                    new_value=head_col.data_type,
-                    description=f"Changed column '{base_col.name}' type from {base_col.data_type} to {head_col.data_type}"
-                ))
-            
-            # Nullability changes
-            if base_col.nullable != head_col.nullable:
-                severity = Severity.BREAKING if not head_col.nullable else Severity.POTENTIALLY_BREAKING
-                self.changes.append(Change(
-                    change_type=ChangeType.COLUMN_NULLABILITY_CHANGED,
-                    severity=severity,
-                    object_name=base_obj.name,
-                    column_name=base_col.name,
-                    old_value="NULL" if base_col.nullable else "NOT NULL",
-                    new_value="NULL" if head_col.nullable else "NOT NULL",
-                    description=f"Changed column '{base_col.name}' nullability"
-                ))
-            
-            # Ordinal changes (column order)
-            if base_col.ordinal != head_col.ordinal:
-                self.changes.append(Change(
-                    change_type=ChangeType.COLUMN_ORDER_CHANGED,
-                    severity=Severity.POTENTIALLY_BREAKING,
-                    object_name=base_obj.name,
-                    column_name=base_col.name,
-                    old_value=base_col.ordinal,
-                    new_value=head_col.ordinal,
-                    description=f"Changed column '{base_col.name}' position from {base_col.ordinal} to {head_col.ordinal}"
-                ))
+        # Column changes for existing columns (including renamed ones)
+        for common_name in (base_names & head_names) | {new_name for _, new_name in renamed_pairs}:
+            # For renamed columns, use the new name to find the head column
+            if common_name in head_columns:
+                head_col = head_columns[common_name]
+                # Find corresponding base column (could be renamed)
+                base_col = None
+                for old_name, new_name in renamed_pairs:
+                    if new_name == common_name:
+                        base_col = base_columns[old_name]
+                        break
+                if not base_col and common_name in base_columns:
+                    base_col = base_columns[common_name]
+                
+                if base_col:
+                    # Type changes
+                    if base_col.data_type != head_col.data_type:
+                        severity = self._classify_type_change_severity(base_col.data_type, head_col.data_type)
+                        self.changes.append(Change(
+                            change_type=ChangeType.COLUMN_TYPE_CHANGED,
+                            severity=severity,
+                            object_name=base_obj.name,
+                            column_name=head_col.name,  # Use new name for renamed columns
+                            old_value=base_col.data_type,
+                            new_value=head_col.data_type,
+                            description=f"Changed column '{head_col.name}' type from {base_col.data_type} to {head_col.data_type}"
+                        ))
+                    
+                    # Nullability changes
+                    if base_col.nullable != head_col.nullable:
+                        severity = Severity.BREAKING if not head_col.nullable else Severity.POTENTIALLY_BREAKING
+                        self.changes.append(Change(
+                            change_type=ChangeType.COLUMN_NULLABILITY_CHANGED,
+                            severity=severity,
+                            object_name=base_obj.name,
+                            column_name=head_col.name,  # Use new name for renamed columns
+                            old_value="NULL" if base_col.nullable else "NOT NULL",
+                            new_value="NULL" if head_col.nullable else "NOT NULL",
+                            description=f"Changed column '{head_col.name}' nullability"
+                        ))
+                    
+                    # Ordinal changes (column order)
+                    if base_col.ordinal != head_col.ordinal:
+                        self.changes.append(Change(
+                            change_type=ChangeType.COLUMN_ORDER_CHANGED,
+                            severity=Severity.POTENTIALLY_BREAKING,
+                            object_name=base_obj.name,
+                            column_name=head_col.name,  # Use new name for renamed columns
+                            old_value=base_col.ordinal,
+                            new_value=head_col.ordinal,
+                            description=f"Changed column '{head_col.name}' position from {base_col.ordinal} to {head_col.ordinal}"
+                        ))
     
     def _detect_lineage_changes(self, base_obj: ObjectInfo, head_obj: ObjectInfo) -> None:
         """Detect lineage changes for columns."""
@@ -267,6 +287,102 @@ class BreakingChangeDetector:
                     description=f"Changed input dependencies for '{base_lin.output_column}'"
                 ))
     
+    def _detect_column_renames(self, base_columns: Dict[str, ColumnSchema], head_columns: Dict[str, ColumnSchema], 
+                               removed: Set[str], added: Set[str], base_obj: ObjectInfo, head_obj: ObjectInfo) -> List[tuple[str, str]]:
+        """
+        Detect column renames using scoring algorithm.
+        Returns list of (old_name, new_name) tuples.
+        """
+        if not removed or not added:
+            return []
+        
+        # Build lineage lookup for both objects
+        base_lineage = {lin.output_column.lower(): lin for lin in base_obj.lineage}
+        head_lineage = {lin.output_column.lower(): lin for lin in head_obj.lineage}
+        
+        renamed_pairs = []
+        
+        for old_name in list(removed):
+            best_score = 0
+            best_candidate = None
+            candidates_with_score = []
+            
+            old_col = base_columns[old_name]
+            old_lineage = base_lineage.get(old_name)
+            
+            for new_name in added:
+                new_col = head_columns[new_name]
+                score = 0
+                
+                # +2 for matching data type (case-insensitive)
+                if self._normalize_data_type(old_col.data_type) == self._normalize_data_type(new_col.data_type):
+                    score += 2
+                
+                # +2 for matching nullability
+                if old_col.nullable == new_col.nullable:
+                    score += 2
+                
+                # +3 for identical lineage input_fields or +1 for similar ordinal if no lineage
+                if old_lineage:
+                    new_lineage = head_lineage.get(new_name)
+                    if new_lineage and self._compare_lineage_input_fields(old_lineage, new_lineage):
+                        score += 3
+                else:
+                    # If no lineage, use ordinal proximity
+                    if abs(old_col.ordinal - new_col.ordinal) <= 1:
+                        score += 1
+                
+                # +1 for matching length/precision (if extractable from type)
+                if self._compare_type_precision(old_col.data_type, new_col.data_type):
+                    score += 1
+                
+                candidates_with_score.append((new_name, score))
+                
+                if score > best_score:
+                    best_score = score
+                    best_candidate = new_name
+            
+            # Check if best candidate has score >= 4 and is unambiguous
+            if best_score >= 4:
+                # Check for ties
+                tied_candidates = [name for name, score in candidates_with_score if score == best_score]
+                if len(tied_candidates) == 1:
+                    renamed_pairs.append((old_name, best_candidate))
+                    
+                    # Register the rename change
+                    self.changes.append(Change(
+                        change_type=ChangeType.COLUMN_RENAMED,
+                        severity=Severity.POTENTIALLY_BREAKING,
+                        object_name=base_obj.name,
+                        column_name=f"{old_col.name}→{head_columns[best_candidate].name}",
+                        description=f"Column renamed from '{old_col.name}' to '{head_columns[best_candidate].name}' with matching type/nullability/lineage"
+                    ))
+        
+        return renamed_pairs
+    
+    def _normalize_data_type(self, data_type: str) -> str:
+        """Normalize data type for comparison (case-insensitive)."""
+        return data_type.upper().strip()
+    
+    def _compare_lineage_input_fields(self, lineage1: ColumnLineage, lineage2: ColumnLineage) -> bool:
+        """Compare if two lineages have identical input fields."""
+        fields1 = {(ref.table_name, ref.column_name) for ref in lineage1.input_fields}
+        fields2 = {(ref.table_name, ref.column_name) for ref in lineage2.input_fields}
+        return fields1 == fields2
+    
+    def _compare_type_precision(self, type1: str, type2: str) -> bool:
+        """Compare if types have matching length/precision."""
+        import re
+        
+        # Extract precision info from types like VARCHAR(100), DECIMAL(10,2)
+        def extract_precision(type_str: str) -> tuple:
+            match = re.search(r'\(([^)]+)\)', type_str)
+            if match:
+                return tuple(match.group(1).split(','))
+            return ()
+        
+        return extract_precision(type1) == extract_precision(type2)
+
     def _classify_type_change_severity(self, old_type: str, new_type: str) -> Severity:
         """Classify the severity of a type change."""
         old_type = old_type.upper()
