@@ -344,50 +344,145 @@ class ColumnGraph:
     
     
     def find_columns_wildcard(self, selector: str) -> List[ColumnNode]:
-            """
-            Find columns matching a wildcard pattern.
-
-            Supports:
-            - Table wildcard:   <ns>.<schema>.<table>.*     → all columns of that table
-            - Column wildcard:  <optional_ns>..<pattern>    → match by COLUMN NAME only:
-                * if pattern contains any of [*?[]] → fnmatch on the column name
-                * otherwise → default to case-insensitive "contains"
-            - Fallback:         fnmatch on the full identifier "ns.schema.table.column"
-            """
-            import fnmatch as _fn
-
-            sel = (selector or "").strip().lower()
-
-            # 1) Table wildcard: "...schema.table.*"
-            if sel.endswith(".*"):
-                table_sel = sel[:-1]  # remove trailing '*', keep final dot
-                # simple prefix match on full key
-                return [node for key, node in self._nodes.items() if key.startswith(table_sel)]
-
-            # 2) Column wildcard: "<optional_ns>..<pattern>"
-            if ".." in sel:
-                ns_part, col_pat = sel.split("..", 1)
-                ns_part = ns_part.strip(".")
-                col_pat = col_pat.strip()
-
-                # if no explicit wildcard meta, treat as "contains"
-                has_meta = any(ch in col_pat for ch in "*?[]")
-
-                def col_name_matches(name: str) -> bool:
-                    name = (name or "").lower()
-                    if has_meta:
-                        return _fn.fnmatch(name, col_pat)
-                    return col_pat in name  # default: contains (case-insensitive)
-
-                if ns_part:
-                    ns_prefix = ns_part + "."
-                    return [
-                        node
-                        for key, node in self._nodes.items()
-                        if key.startswith(ns_prefix) and col_name_matches(getattr(node, "column_name", ""))
+        """
+        Find columns matching a wildcard pattern.
+        
+        Supports:
+        - Table wildcard:   <ns>.<schema>.<table>.*     → all columns of that table
+        - Column wildcard:  <optional_ns>..<pattern>    → match by COLUMN NAME only
+        - Fallback:         fnmatch on the full identifier "ns.schema.table.column"
+        """
+        import fnmatch as _fn
+        
+        # 1) Normalizacja i szybkie wyjścia
+        sel = (selector or "").strip()
+        low = sel.lower()
+        
+        # Pusty/niepełny wzorzec
+        if low in {".", ".."}:
+            return []
+        
+        if ".." in low:
+            ns_part, col_pat = low.split("..", 1)
+            if col_pat.strip() == "":
+                return []
+        
+        # 2) Table wildcard "….*" – obsłuż W OBU wariantach (z i bez namespace)
+        if low.endswith(".*"):
+            left = sel[:-2].strip()
+            if not left:
+                return []
+            
+            # Lokalny helper do dopasowania tabel
+            def _tbl_match(left: str, node_tbl: str) -> bool:
+                lp = (left or "").lower().split(".")
+                tp = (node_tbl or "").lower().split(".")
+                # dopasuj po końcówce: 3, 2 albo 1 segment
+                if len(lp) >= 3:
+                    return tp[-3:] == lp[-3:] or tp[-2:] == lp[-2:]
+                elif len(lp) == 2:
+                    return tp[-2:] == lp[-2:]
+                else:
+                    return tp[-1] == lp[-1] if lp else False
+            
+            if "://" in left:
+                # Z namespace - bardziej dokładne parsowanie
+                # Format: mssql://localhost/InfoTrackerDW.STG.dbo.Orders
+                if "." in left:
+                    # Znajdź pierwszą kropkę po namespace
+                    ns_end = left.find(".") 
+                    ns = left[:ns_end]
+                    table = left[ns_end + 1:]
+                    
+                    results = [
+                        node for node in self._nodes.values()
+                        if (node.namespace and node.namespace.lower().startswith(ns.lower()) and
+                            _tbl_match(table, node.table_name))
                     ]
                 else:
-                    return [node for node in self._nodes.values() if col_name_matches(getattr(node, "column_name", ""))]
-
-            # 3) Fallback: fnmatch on the full identifier
-            return [node for key, node in self._nodes.items() if _fn.fnmatch(key, sel)]
+                    results = []
+            else:
+                # Bez namespace
+                results = [
+                    node for node in self._nodes.values()
+                    if _tbl_match(left, node.table_name)
+                ]
+            
+            # Deduplikacja
+            tmp = {}
+            for n in results:
+                tmp[str(n).lower()] = n
+            return list(tmp.values())
+        
+        # 3) Column wildcard "<opcjonalny_prefix>..<column_pattern>" – dodaj semantykę CONTAINS
+        if ".." in low:
+            ns_part, col_pat = low.split("..", 1)
+            col_pat = col_pat.strip()
+            if col_pat == "":
+                return []
+            
+            # Sprawdź czy są wildcardy
+            has_wildcards = any(ch in col_pat for ch in "*?[]")
+            
+            def col_match(name: str) -> bool:
+                n = (name or "").lower()
+                return _fn.fnmatch(n, col_pat) if has_wildcards else (col_pat in n)
+            
+            if ns_part:
+                ns_part = ns_part.strip(".")
+                if "://" in ns_part:
+                    # Sprawdź czy po namespace jest kropka - wtedy reszta to prefiks tabeli
+                    if "." in ns_part:
+                        # Znajdź część po pierwszej kropce po namespace jako prefiks tabeli
+                        first_dot = ns_part.find(".")
+                        table_prefix = ns_part[first_dot + 1:].lower()
+                        results = [
+                            node for node in self._nodes.values()
+                            if (node.table_name and node.table_name.lower().startswith(table_prefix) and
+                                col_match(node.column_name))
+                        ]
+                    else:
+                        # Tylko namespace, bez prefiksu tabeli
+                        results = [
+                            node for node in self._nodes.values()
+                            if (node.namespace and node.namespace.lower().startswith(ns_part) and
+                                col_match(node.column_name))
+                        ]
+                else:
+                    # Brak namespace - traktuj jako prefiks tabeli
+                    results = [
+                        node for node in self._nodes.values()
+                        if (node.table_name and node.table_name.lower().startswith(ns_part) and
+                            col_match(node.column_name))
+                    ]
+            else:
+                results = [
+                    node for node in self._nodes.values() 
+                    if col_match(node.column_name)
+                ]
+            
+            # Deduplikacja
+            tmp = {}
+            for n in results:
+                tmp[str(n).lower()] = n
+            return list(tmp.values())
+        
+        # 4) Fallback na pełnym kluczu
+        if not any(ch in selector for ch in "*?[]"):
+            # Potraktuj jako "contains" po pełnym kluczu
+            results = [
+                node for key, node in self._nodes.items() 
+                if low in key.lower()
+            ]
+        else:
+            # Są wildcardy - użyj fnmatch
+            results = [
+                node for key, node in self._nodes.items() 
+                if _fn.fnmatch(key.lower(), low)
+            ]
+        
+        # Deduplikacja
+        tmp = {}
+        for n in results:
+            tmp[str(n).lower()] = n
+        return list(tmp.values())

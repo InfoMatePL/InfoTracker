@@ -24,6 +24,10 @@ class TestWildcardSelectors:
             ColumnNode("mssql://localhost/InfoTrackerDW", "INFOMART.dbo.dim_customer", "customer_id"),
         ]
         
+        # Add all nodes to the graph first
+        for node in nodes:
+            self.graph.add_node(node)
+        
         # Add edges
         edges = [
             ColumnEdge(nodes[4], nodes[5], TransformationType.IDENTITY, "Revenue lineage"),  # Orders.Revenue -> fct_sales.Revenue

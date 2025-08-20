@@ -26,6 +26,15 @@ class SqlParser:
         self.schema_registry = SchemaRegistry()
         self.default_database: Optional[str] = None  # Will be set from config
     
+    def _clean_proc_name(self, s: str) -> str:
+        """Clean procedure name by removing semicolons and parameters."""
+        return s.strip().rstrip(';').split('(')[0].strip()
+    
+    def _normalize_table_ident(self, s: str) -> str:
+        """Remove brackets and normalize table identifier."""
+        import re
+        return re.sub(r'[\[\]]', '', s)
+    
     def set_default_database(self, default_database: Optional[str]):
         """Set the default database for qualification."""
         self.default_database = default_database
@@ -71,27 +80,34 @@ class SqlParser:
     
     def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
         """
-        Fallback parser for INSERT INTO #temp EXEC pattern when SQLGlot fails.
+        Fallback parser for INSERT INTO ... EXEC pattern when SQLGlot fails.
+        Handles both temp tables and regular tables.
         """
         import re
         
-        # Look for INSERT INTO #temp EXEC pattern
-        pattern = r'(?is)INSERT\s+INTO\s+(#\w+)\s+EXEC\s+([^\s(]+)'
-        match = re.search(pattern, sql_content)
+        # Get preprocessed SQL
+        sql_pre = self._preprocess_sql(sql_content)
+        
+        # Look for INSERT INTO ... EXEC pattern (both temp and regular tables)
+        pattern = r'(?is)INSERT\s+INTO\s+([#\[\]\w.]+)\s+EXEC\s+([^\s(;]+)'
+        match = re.search(pattern, sql_pre)
         
         if not match:
             return None
         
-        temp_table = match.group(1)  # e.g., "#customer_metrics"
-        proc_name = match.group(2)   # e.g., "dbo.usp_customer_metrics_dataset"
+        raw_table = match.group(1)
+        raw_proc = match.group(2)
         
-        # Qualify procedure name if needed
-        if '.' not in proc_name and self.default_database:
-            qualified_proc_name = f"{self.default_database}.dbo.{proc_name}"
-        else:
-            qualified_proc_name = proc_name
+        # Clean and normalize names
+        table_name = self._normalize_table_ident(raw_table)
+        proc_name = self._clean_proc_name(raw_proc)
         
-        # Create placeholder columns for the temp table
+        # Determine if it's a temp table
+        is_temp = table_name.startswith('#')
+        namespace = "tempdb" if is_temp else "mssql://localhost/InfoTrackerDW"
+        object_type = "temp_table" if is_temp else "table"
+        
+        # Create placeholder columns
         placeholder_columns = [
             ColumnSchema(
                 name="output_col_1",
@@ -107,10 +123,10 @@ class SqlParser:
             )
         ]
         
-        # Create schema for temp table
+        # Create schema
         schema = TableSchema(
-            namespace="tempdb",
-            name=temp_table,
+            namespace=namespace,
+            name=table_name,
             columns=placeholder_columns
         )
         
@@ -122,24 +138,24 @@ class SqlParser:
                 input_fields=[
                     ColumnReference(
                         namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=qualified_proc_name,
+                        table_name=proc_name,  # Clean procedure name without semicolons
                         column_name="*"
                     )
                 ],
                 transformation_type=TransformationType.EXEC,
-                transformation_description=f"INSERT INTO {temp_table} EXEC {proc_name}"
+                transformation_description=f"INSERT INTO {table_name} EXEC {proc_name}"
             ))
         
-        # Set dependencies to the procedure
-        dependencies = {qualified_proc_name}
+        # Set dependencies to the clean procedure name
+        dependencies = {proc_name}
         
         # Register schema in registry
         self.schema_registry.register(schema)
         
-        # Create and return ObjectInfo
+        # Create and return ObjectInfo with table_name as name (not object_hint)
         return ObjectInfo(
-            name=temp_table,
-            object_type="temp_table",
+            name=table_name,
+            object_type=object_type,
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
@@ -287,7 +303,7 @@ class SqlParser:
                 # Extract procedure name (first identifier after EXEC)
                 parts = exec_text.split()
                 if len(parts) > 1:
-                    procedure_name = parts[1].strip('()').split('(')[0]
+                    procedure_name = self._clean_proc_name(parts[1])
                     dependencies.add(procedure_name)
             
             # For EXEC temp tables, we create placeholder columns since we can't determine 
