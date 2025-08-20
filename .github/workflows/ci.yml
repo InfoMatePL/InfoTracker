@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/requirements*.txt') }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev] || pip install -e .
+          pip install pytest
+
+      - name: Unit tests
+        run: pytest tests/
+
+      - name: Smoke: extract/impact/diff (no scripts, terminal only)
+        run: |
+          infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+          infotracker impact -s "+dbo.orders.total_amount+" --graph-dir build/lineage --max-depth 2 --format text
+          mkdir -p build/ol_base build/ol_head
+          infotracker extract --sql-dir sql_diff_demo/base --out-dir build/ol_base || true
+          infotracker extract --sql-dir sql_diff_demo/head_non --out-dir build/ol_head || true
+          infotracker diff --base build/ol_base --head build/ol_head --format text || true
