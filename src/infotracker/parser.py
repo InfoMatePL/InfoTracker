@@ -51,6 +51,10 @@ class SqlParser:
                 re.match(r'(?i)^DROP\s+TABLE\s+#\w+', stripped_line)):
                 continue
             
+            # Skip GO statements (SQL Server batch separator)
+            if re.match(r'(?im)^\s*GO\s*$', stripped_line):
+                continue
+            
             processed_lines.append(line)
         
         # Join the lines back together
@@ -615,7 +619,9 @@ class SqlParser:
             
         select_stmt = stmt
         
-        if not select_stmt.expressions:
+        # Try to get projections with fallback
+        projections = list(getattr(select_stmt, 'expressions', None) or [])
+        if not projections:
             return lineage, output_columns
         
         # Handle star expansion first
@@ -627,7 +633,7 @@ class SqlParser:
             return self._handle_union_lineage(select_stmt, view_name)
         
         # Standard column-by-column processing
-        for i, select_expr in enumerate(select_stmt.expressions):
+        for i, select_expr in enumerate(projections):
             if isinstance(select_expr, exp.Alias):
                 # Aliased column: SELECT column AS alias
                 output_name = str(select_expr.alias)
@@ -641,10 +647,15 @@ class SqlParser:
                     output_name = str(select_expr)
                 source_expr = select_expr
             
+            # Determine data type for ColumnSchema
+            data_type = "unknown"
+            if isinstance(source_expr, exp.Cast):
+                data_type = str(source_expr.to).upper()
+            
             # Create output column schema
             output_columns.append(ColumnSchema(
                 name=output_name,
-                data_type="unknown",  # Would need type inference
+                data_type=data_type,
                 nullable=True,
                 ordinal=i
             ))

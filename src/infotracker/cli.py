@@ -96,6 +96,7 @@ def diff(
     base: Optional[Path] = typer.Option(None, "--base", help="Directory containing base OpenLineage artifacts"),
     head: Optional[Path] = typer.Option(None, "--head", help="Directory containing head OpenLineage artifacts"),
     format: str = typer.Option("text", "--format", help="Output format: text|json"),
+    threshold: Optional[str] = typer.Option(None, "--threshold", help="Severity threshold: NON_BREAKING|POTENTIALLY_BREAKING|BREAKING"),
 ):
     """Compare two sets of OpenLineage artifacts for breaking changes."""
     cfg: RuntimeConfig = ctx.obj["cfg"]
@@ -105,7 +106,14 @@ def diff(
         console.print("[red]ERROR: Both --base and --head directories are required[/red]")
         raise typer.Exit(1)
     
-    result = engine.run_diff(base, head, format)
+    # Validate threshold if provided
+    if threshold is not None:
+        valid_thresholds = ["NON_BREAKING", "POTENTIALLY_BREAKING", "BREAKING"]
+        if threshold not in valid_thresholds:
+            console.print(f"[red]ERROR: Invalid threshold '{threshold}'. Must be one of: {', '.join(valid_thresholds)}[/red]")
+            raise typer.Exit(1)
+    
+    result = engine.run_diff(base, head, format, threshold=threshold)
     _emit(result, format)
     raise typer.Exit(code=result.get("exit_code", 0))
 

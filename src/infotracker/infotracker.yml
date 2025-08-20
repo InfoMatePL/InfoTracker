@@ -25,7 +25,7 @@ exclude:
 
 # Minimum severity level for breaking change detection
 # Options: NON_BREAKING, POTENTIALLY_BREAKING, BREAKING
-severity_threshold: BREAKING
+severity_threshold: NON_BREAKING
 
 # Objects to ignore during analysis (glob patterns)
 ignore:

@@ -475,6 +475,7 @@ class Engine:
             base_dir: Directory containing base OpenLineage JSON artifacts
             head_dir: Directory containing head OpenLineage JSON artifacts  
             format: Output format (text|json)
+            **kwargs: Additional options including 'threshold' to override config
             
         Returns:
             Dict with results including exit_code (1 if breaking changes, 0 otherwise)
@@ -495,8 +496,8 @@ class Engine:
             detector = BreakingChangeDetector()
             report = detector.compare(base_objects, head_objects)
             
-            # Filter changes based on severity threshold from config
-            threshold = self.config.severity_threshold.upper()
+            # Use threshold from CLI flag if provided, otherwise from config
+            threshold = (kwargs.get('threshold') or self.config.severity_threshold).upper()
             filtered_changes = []
             
             if threshold == "BREAKING":
