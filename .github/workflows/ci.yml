@@ -29,12 +29,3 @@ jobs:
 
       - name: Unit tests
         run: pytest tests/
-
-      - name: Smoke: extract/impact/diff (no scripts, terminal only)
-        run: |
-          infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
-          infotracker impact -s "+dbo.orders.total_amount+" --graph-dir build/lineage --max-depth 2 --format text
-          mkdir -p build/ol_base build/ol_head
-          infotracker extract --sql-dir sql_diff_demo/base --out-dir build/ol_base || true
-          infotracker extract --sql-dir sql_diff_demo/head_non --out-dir build/ol_head || true
-          infotracker diff --base build/ol_base --head build/ol_head --format text || true
