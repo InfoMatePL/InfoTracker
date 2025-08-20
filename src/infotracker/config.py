@@ -31,10 +31,28 @@ class RuntimeConfig:
 def load_config(path: Optional[Path]) -> RuntimeConfig:
     cfg = RuntimeConfig()
     if path is None:
-        # Try repo root default
-        default = Path("infotracker.yml")
-        if default.exists():
-            path = default
+        # Try package default first (works for installed packages)
+        try:
+            import importlib.resources
+            from . import __package__
+            
+            if hasattr(importlib.resources, 'files'):  # Python 3.9+
+                package_config = importlib.resources.files('infotracker') / 'infotracker.yml'
+                if package_config.is_file():
+                    path = Path(str(package_config))
+            else:  # Python 3.8 fallback
+                with importlib.resources.path('infotracker', 'infotracker.yml') as p:
+                    if p.exists():
+                        path = p
+        except (ImportError, AttributeError):
+            pass
+        
+        # Fallback to current directory (development mode)
+        if path is None:
+            default = Path("infotracker.yml")
+            if default.exists():
+                path = default
+    
     if path and path.exists():
         data = yaml.safe_load(path.read_text()) or {}
         for k, v in data.items():

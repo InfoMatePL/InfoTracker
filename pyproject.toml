@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "InfoTracker"
-version = "0.2.4"
+version = "0.2.6"
 description = "Column-level SQL lineage, impact analysis, and breaking-change detection (MS SQL first)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,13 +38,15 @@ infotracker = "infotracker.cli:entrypoint"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/infotracker"]
-only-include = ["src/infotracker"]
+force-include = { "src/infotracker/infotracker.yml" = "infotracker/infotracker.yml" }
 exclude = [
   "src/infotracker/tests",
   "src/infotracker/**/tests",
   "src/**/tests",
   "tests/",
   "tests/**",
+  "docs", "examples",
+  ".github", ".git", ".venv", ".gitignore","ProjectDescription.md",
 ]
 
 [tool.hatch.build.targets.sdist]
