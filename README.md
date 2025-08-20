@@ -1,58 +1,76 @@
 # InfoTracker
 
-Column-level SQL lineage extraction and impact analysis for MS SQL Server
+**Column-level SQL lineage extraction and impact analysis for MS SQL Server**
 
-## Features
+InfoTracker is a powerful command-line tool that parses T-SQL files and generates detailed column-level lineage in OpenLineage format. It supports advanced SQL Server features including table-valued functions, stored procedures, temp tables, and EXEC patterns.
 
-- **Column-level lineage** - Track data flow at the column level
-- **Parse SQL files** and generate OpenLineage-compatible JSON
-- **Impact analysis** - Find upstream and downstream column dependencies with flexible selectors
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://python.org)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PyPI](https://img.shields.io/badge/PyPI-InfoTracker-blue.svg)](https://pypi.org/project/InfoTracker/)
+
+## 🚀 Features
+
+- **Column-level lineage** - Track data flow at the column level with precise transformations
+- **Advanced SQL support** - T-SQL dialect with temp tables, variables, CTEs, and window functions
+- **Impact analysis** - Find upstream and downstream dependencies with flexible selectors
 - **Wildcard matching** - Support for table wildcards (`schema.table.*`) and column wildcards (`..pattern`)
-- **Direction control** - Query upstream (`+selector`), downstream (`selector+`), or both (`+selector+`)
-- **Configurable depth** - Control traversal depth with `--max-depth`
-- **Multiple output formats** - Text tables or JSON for scripting
-- **MSSQL support** - T-SQL dialect with temp tables, variables, and stored procedures
-- **Advanced SQL objects** - Support for table-valued functions (TVF) and dataset-returning procedures
-- **Temp table lineage** - Track EXEC into temp tables and propagate lineage downstream
+- **Breaking change detection** - Detect schema changes that could break downstream processes
+- **Multiple output formats** - Text tables or JSON for integration with other tools
+- **OpenLineage compatible** - Standard format for data lineage interoperability
+- **Advanced SQL objects** - Table-valued functions (TVF) and dataset-returning procedures
+- **Temp table tracking** - Full lineage through EXEC into temp tables
 
-## Requirements
-- Python 3.10+
-- Virtual environment (activated)
-- Basic SQL knowledge
-- Git and shell
+## 📦 Installation
 
-## Troubleshooting
-- **Error tracebacks on help commands**: Make sure you're running in an activated virtual environment
-- **Command not found**: Activate your virtual environment first
-- **Import errors**: Ensure all dependencies are installed with `pip install -e .`
-- **Column not found**: Use full URI format or check column_graph.json for exact names
-
-## Quickstart
-
-### Setup & Installation
+### From PyPI (Recommended)
 ```bash
-# Activate virtual environment first (REQUIRED)
+pip install InfoTracker
+```
 
-# Install dependencies
+### From GitHub
+```bash
+# Latest stable release
+pip install git+https://github.com/InfoMatePL/InfoTracker.git
+
+# Development version
+git clone https://github.com/InfoMatePL/InfoTracker.git
+cd InfoTracker
 pip install -e .
+```
 
-# Verify installation
+### Verify Installation
+```bash
 infotracker --help
 ```
 
-### Basic Usage
-```bash
-# 1. Extract lineage from SQL files (builds column graph)
-infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+## ⚡ Quick Start
 
-# 2. Run impact analysis
-infotracker impact -s "STG.dbo.Orders.OrderID"  # downstream dependencies
-infotracker impact -s "+STG.dbo.Orders.OrderID" # upstream sources
+### 1. Extract Lineage
+```bash
+# Extract lineage from SQL files
+infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
 ```
 
-## Selector Syntax
+### 2. Run Impact Analysis
+```bash
+# Find what feeds into a column (upstream)
+infotracker impact -s "+STG.dbo.Orders.OrderID"
 
-InfoTracker supports flexible column selectors:
+# Find what uses a column (downstream)  
+infotracker impact -s "STG.dbo.Orders.OrderID+"
+
+# Both directions
+infotracker impact -s "+dbo.fct_sales.Revenue+"
+```
+
+### 3. Detect Breaking Changes
+```bash
+# Compare two versions of your schema
+infotracker diff --base build/lineage --head build/lineage_new
+```
+## 📖 Selector Syntax
+
+InfoTracker supports flexible column selectors for precise impact analysis:
 
 | Selector Format | Description | Example |
 |-----------------|-------------|---------|
@@ -61,8 +79,7 @@ InfoTracker supports flexible column selectors:
 | `database.schema.table.column` | Database-qualified format | `STG.dbo.Orders.OrderID` |
 | `schema.table.*` | Table wildcard (all columns) | `dbo.fct_sales.*` |
 | `..pattern` | Column wildcard (name contains pattern) | `..revenue` |
-| `.pattern` | Alias for column wildcard | `.orderid` |
-| Full URI | Complete namespace format | `mssql://localhost/InfoTrackerDW.STG.dbo.Orders.OrderID` |
+| `..pattern*` | Column wildcard with fnmatch | `..customer*` |
 
 ### Direction Control
 - `selector` - downstream dependencies (default)
@@ -70,40 +87,32 @@ InfoTracker supports flexible column selectors:
 - `selector+` - downstream dependencies (explicit)
 - `+selector+` - both upstream and downstream
 
-### Selector Cheat Sheet
+## 💡 Examples
 
-**Table wildcards:**
+### Basic Usage
+```bash
+# Extract lineage first (always run this before impact analysis)
+infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+
+# Basic column lineage
+infotracker impact -s "+dbo.fct_sales.Revenue"        # What feeds this column?
+infotracker impact -s "STG.dbo.Orders.OrderID+"      # What uses this column?
+```
+
+### Wildcard Selectors
 ```bash
 # All columns from a specific table
 infotracker impact -s "dbo.fct_sales.*"
 infotracker impact -s "STG.dbo.Orders.*"
-```
 
-**Column name matching:**
-```bash
 # Find all columns containing "revenue" (case-insensitive)
 infotracker impact -s "..revenue"
 
-# Find all columns containing "id" 
-infotracker impact -s "..id"
-
-# Use wildcards for pattern matching
+# Find all columns starting with "customer" 
 infotracker impact -s "..customer*"
 ```
 
-**Direction examples:**
-```bash
-# Upstream: what feeds into this column
-infotracker impact -s "+dbo.fct_sales.Revenue"
-
-# Downstream: what uses this column
-infotracker impact -s "STG.dbo.Orders.OrderID+"
-
-# Both directions
-infotracker impact -s "+dbo.dim_customer.CustomerID+"
-```
-
-**Advanced SQL objects:**
+### Advanced SQL Objects
 ```bash
 # Table-valued function columns (upstream)
 infotracker impact -s "+dbo.fn_customer_orders_tvf.*"
@@ -115,54 +124,33 @@ infotracker impact -s "+dbo.usp_customer_metrics_dataset.*"
 infotracker impact -s "+#temp_table.*"
 ```
 
-## Examples
-
+### Output Formats
 ```bash
-# Extract lineage (run this first)
-infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+# Text output (default, human-readable)
+infotracker impact -s "+..revenue"
 
-# Basic column lineage
-infotracker impact -s "+dbo.fct_sales.Revenue"        # upstream sources
-infotracker impact -s "STG.dbo.Orders.OrderID+"      # downstream usage
+# JSON output (machine-readable)
+infotracker --format json impact -s "..customer*" > customer_lineage.json
 
-# Wildcard selectors
-infotracker impact -s "+..revenue+"                   # all revenue columns (both directions)
-infotracker impact -s "dbo.fct_sales.*"              # all columns from table
-infotracker --format json impact -s "..customer*"     # customer columns (JSON output)
-
-# Advanced SQL objects (NEW)
-infotracker impact -s "+dbo.fn_customer_orders_tvf.*"      # TVF columns (upstream)
-infotracker impact -s "+dbo.usp_customer_metrics_dataset.*" # procedure columns (upstream)
-
-# Depth control
-infotracker impact -s "+dbo.Orders.OrderID" --max-depth 1
-
-# Demo the new features with the included examples
-infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
-infotracker impact -s "+dbo.fn_customer_orders_inline.*"
-infotracker impact -s "+dbo.usp_customer_metrics_dataset.TotalRevenue"
+# Control traversal depth
+infotracker impact -s "+dbo.Orders.OrderID" --max-depth 2
 ```
 
-### Copy-Paste Demo Commands
-
-Test the new TVF and procedure lineage features:
-
+### Breaking Change Detection
 ```bash
-# 1. Extract all lineage (including new TVF/procedure support)
-infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+# Extract baseline
+infotracker extract --sql-dir sql_v1 --out-dir build/baseline
 
-# 2. Test TVF lineage 
-infotracker --format text impact -s "+dbo.fn_customer_orders_tvf.*"
+# Extract new version  
+infotracker extract --sql-dir sql_v2 --out-dir build/current
 
-# 3. Test procedure lineage
-infotracker --format text impact -s "+dbo.usp_customer_metrics_dataset.*"
+# Detect breaking changes
+infotracker diff --base build/baseline --head build/current
 
-# 4. Test column name contains wildcard
-infotracker --format text impact -s "+..revenue"
-
-# 5. Show results in JSON format
-infotracker --format json impact -s "..total*" > tvf_lineage.json
+# Filter by severity
+infotracker diff --base build/baseline --head build/current --threshold BREAKING
 ```
+
 
 ## Output Format
 
@@ -210,45 +198,73 @@ InfoTracker follows this configuration precedence:
 2. **infotracker.yml** config file - project defaults  
 3. **Built-in defaults** (lowest priority) - fallback values
 
+## 🔧 Configuration
+
 Create an `infotracker.yml` file in your project root:
+
 ```yaml
-default_adapter: mssql
-sql_dir: examples/warehouse/sql
-out_dir: build/lineage
-include: ["*.sql"]
-exclude: ["*_wip.sql"]
+sql_dirs:
+  - "sql/"
+  - "models/"
+out_dir: "build/lineage"
+exclude_dirs: 
+  - "__pycache__"
+  - ".git"
+severity_threshold: "POTENTIALLY_BREAKING"
 ```
 
-## Documentation
+### Configuration Options
 
-For detailed information:
-- `docs/overview.md` — what it is, goals, scope
-- `docs/algorithm.md` — how extraction works
-- `docs/lineage_concepts.md` — core concepts with visuals
-- `docs/cli_usage.md` — commands and options
-- `docs/breaking_changes.md` — definition and detection
-- `docs/edge_cases.md` — SELECT *, UNION, temp tables, etc.
-- `docs/adapters.md` — interface and MSSQL specifics
-- `docs/architecture.md` — system and sequence diagrams
-- `docs/configuration.md` — configuration reference
-- `docs/openlineage_mapping.md` — how outputs map to OpenLineage
-- `docs/faq.md` — common questions
+| Setting | Description | Default | Examples |
+|---------|-------------|---------|----------|
+| `sql_dirs` | Directories to scan for SQL files | `["."]` | `["sql/", "models/"]` |
+| `out_dir` | Output directory for lineage files | `"lineage"` | `"build/artifacts"` |
+| `exclude_dirs` | Directories to skip | `[]` | `["__pycache__", "node_modules"]` |
+| `severity_threshold` | Breaking change detection level | `"NON_BREAKING"` | `"BREAKING"` |
 
-#### Documentation
-- `docs/overview.md` — what it is, goals, scope
-- `docs/algorithm.md` — how extraction works
-- `docs/lineage_concepts.md` — core concepts with visuals
-- `docs/cli_usage.md` — commands and options
-- `docs/breaking_changes.md` — definition and detection
-- `docs/edge_cases.md` — SELECT *, UNION, temp tables, etc.
-- `docs/advanced_use_cases.md` — tabular functions, procedures returning datasets
-- `docs/adapters.md` — interface and MSSQL specifics
-- `docs/architecture.md` — system and sequence diagrams
-- `docs/configuration.md` — configuration reference
-- `docs/openlineage_mapping.md` — how outputs map to OpenLineage
-- `docs/faq.md` — common questions
-- `docs/dbt_integration.md` — how to use with dbt projects
+## 📚 Documentation
+
+- **[Architecture](docs/architecture.md)** - Core concepts and design
+- **[Lineage Concepts](docs/lineage_concepts.md)** - Data lineage fundamentals  
+- **[CLI Usage](docs/cli_usage.md)** - Complete command reference
+- **[Configuration](docs/configuration.md)** - Advanced configuration options
+- **[DBT Integration](docs/dbt_integration.md)** - Using with DBT projects
+- **[OpenLineage Mapping](docs/openlineage_mapping.md)** - Output format specification
+- **[Breaking Changes](docs/breaking_changes.md)** - Change detection and severity levels
+- **[Advanced Use Cases](docs/advanced_use_cases.md)** - TVFs, stored procedures, and complex scenarios
+- **[Edge Cases](docs/edge_cases.md)** - SELECT *, UNION, temp tables handling
+- **[FAQ](docs/faq.md)** - Common questions and troubleshooting
+
+## 🧪 Testing
+
+```bash
+# Run all tests
+pytest
+
+# Run specific test categories
+pytest tests/test_parser.py     # Parser functionality
+pytest tests/test_wildcard.py   # Wildcard selectors
+pytest tests/test_adapter.py    # SQL dialect adapters
+
+# Run with coverage
+pytest --cov=infotracker --cov-report=html
+```
 
 
-## License
-MIT (or your team’s preferred license) 
+
+
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- [SQLGlot](https://github.com/tobymao/sqlglot) - SQL parsing library
+- [OpenLineage](https://openlineage.io/) - Data lineage standard
+- [Typer](https://typer.tiangolo.com/) - CLI framework
+- [Rich](https://rich.readthedocs.io/) - Terminal formatting
+
+---
+
+**InfoTracker** - Making database schema evolution safer, one column at a time. 🎯 
