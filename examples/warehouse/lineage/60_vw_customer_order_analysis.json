@@ -1,0 +1,149 @@
+{
+  "eventType": "COMPLETE",
+  "eventTime": "2025-01-01T00:00:00Z",
+  "run": {
+    "runId": "00000000-0000-0000-0000-000000000060"
+  },
+  "job": {
+    "namespace": "infotracker/examples",
+    "name": "warehouse/sql/60_vw_customer_order_analysis.sql"
+  },
+  "inputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "Orders"
+    }
+  ],
+  "outputs": [
+    {
+      "namespace": "mssql://localhost/InfoTrackerDW",
+      "name": "vw_customer_order_analysis",
+      "facets": {
+        "columnLineage": {
+          "_producer": "https://github.com/OpenLineage/OpenLineage",
+          "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+          "fields": {
+            "OrderID": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "OrderID"
+                }
+              ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrderID from Orders.OrderID"
+            },
+            "CustomerID": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "CustomerID"
+                }
+              ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "CustomerID from Orders.CustomerID"
+            },
+            "OrderDate": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "OrderDate"
+                }
+              ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "OrderDate from Orders.OrderDate"
+            },
+            "TotalAmount": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "TotalAmount"
+                }
+              ],
+              "transformationType": "IDENTITY",
+              "transformationDescription": "TotalAmount from Orders.TotalAmount"
+            },
+            "customer_order_rank": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "CustomerID"
+                },
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "OrderDate"
+                }
+              ],
+              "transformationType": "WINDOW_FUNCTION",
+              "transformationDescription": "ROW_NUMBER() OVER (...)"
+            },
+            "prev_order_amount": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "TotalAmount"
+                },
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "CustomerID"
+                },
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "OrderDate"
+                }
+              ],
+              "transformationType": "WINDOW_FUNCTION",
+              "transformationDescription": "LAG(TotalAmount) OVER (...)"
+            },
+            "customer_lifetime_value": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "TotalAmount"
+                },
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "CustomerID"
+                }
+              ],
+              "transformationType": "WINDOW_FUNCTION",
+              "transformationDescription": "SUM(TotalAmount) OVER (...)"
+            },
+            "rolling_avg_amount": {
+              "inputFields": [
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "TotalAmount"
+                },
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "CustomerID"
+                },
+                {
+                  "namespace": "mssql://localhost/InfoTrackerDW",
+                  "name": "Orders",
+                  "field": "OrderDate"
+                }
+              ],
+              "transformationType": "WINDOW_FUNCTION",
+              "transformationDescription": "AVG(TotalAmount) OVER (...)"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

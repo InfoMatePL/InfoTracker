@@ -55,6 +55,11 @@ BEGIN
     WHERE (@CustomerID IS NULL OR c.CustomerID = @CustomerID)
       AND (@IncludeInactive = 1 OR c.IsActive = 1)
       AND (o.OrderDate IS NULL OR o.OrderDate BETWEEN @StartDate AND @EndDate)
+<<<<<<< HEAD
+    GROUP BY c.CustomerID, c.CustomerName, c.CustomerType, c.RegistrationDate
+    HAVING COUNT(DISTINCT o.OrderID) > 0
+    ORDER BY TotalRevenue DESC;
+=======
     GROUP BY 
         c.CustomerID, 
         c.CustomerName, 
@@ -62,4 +67,5 @@ BEGIN
         c.RegistrationDate
     HAVING COUNT(DISTINCT o.OrderID) > 0  -- Only customers with orders
     ORDER BY TotalRevenue DESC, TotalOrders DESC;
+>>>>>>> main
 END;

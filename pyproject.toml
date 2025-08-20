@@ -1,0 +1,88 @@
+[build-system]
+requires = ["hatchling>=1.26.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "InfoTracker"
+version = "0.3.0"
+description = "Column-level SQL lineage, impact analysis, and breaking-change detection (MS SQL first)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "InfoTracker Authors" }]
+keywords = ["data-lineage", "openlineage", "sql", "mssql", "lineage", "impact-analysis"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+  "Environment :: Console",
+]
+dependencies = ["typer","click", "rich", "shellingham",
+  "sqlglot>=23.0.0",
+  "PyYAML>=6.0.1",
+  "networkx>=3.3",
+  "pydantic>=2.8.2",
+  "packaging>=24.0"
+]
+
+
+[project.urls]
+homepage = "https://example.com/infotracker"
+documentation = "https://example.com/infotracker/docs"
+
+[project.scripts]
+infotracker = "infotracker.cli:entrypoint"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/infotracker"]
+force-include = { "src/infotracker/infotracker.yml" = "infotracker/infotracker.yml" }
+exclude = [
+  "src/infotracker/tests",
+  "src/infotracker/**/tests",
+  "src/**/tests",
+  "tests/",
+  "tests/**",
+  "docs", "examples",
+  ".github", ".git", ".venv", ".gitignore","ProjectDescription.md",
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "tests", "tests/**",
+  "docs", "examples",
+  ".github", ".git", ".venv", ".gitignore","ProjectDescription.md",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+strict = false
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4.0",
+  "pytest-cov>=4.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests"
+]

@@ -1,0 +1,42 @@
+# Środowiska wirtualne
+.venv/
+infotracker-env/
+
+# Pliki i katalogi build
+build/
+dist/
+*.egg-info/
+
+# Cache Pythona
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pliki systemowe
+.DS_Store
+Thumbs.db
+
+# Pliki konfiguracyjne IDE
+.vscode/
+.idea/
+
+# Logi
+*.log
+
+# Zrzuty i pliki tymczasowe
+*.tmp
+*.temp
+
+# Pliki wygenerowane automatycznie
+docs/_build/
+
+# Ignoruj wszystkie pliki Pythona z 'test' lub 'phase' w nazwie
+(?i)*test*.py
+(?i)*phase*.py
+(?i)*test*.md
+(?i)*phase*.md
+InfoTracker/PHASE2_COMPLETE.md
+InfoTracker/PHASE3_PLAN.md
+InfoTracker/test_phase2.py
+InfoTracker/test_comprehensive.py

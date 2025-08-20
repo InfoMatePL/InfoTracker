@@ -1,0 +1,4 @@
+exclude tests/*
+exclude tests/**/*
+exclude */tests/*
+include infotracker.yml

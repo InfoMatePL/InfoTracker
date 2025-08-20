@@ -1,4 +1,4 @@
-CREATE VIEW dbo.vw_orders_union_star AS
-SELECT * FROM dbo.Orders WHERE OrderStatus = 'shipped'
+CREATE VIEW EDW_CORE.dbo.vw_orders_union_star AS
+SELECT * FROM STG.dbo.Orders WHERE Status = 'shipped'
 UNION ALL
-SELECT * FROM dbo.Orders WHERE OrderStatus = 'delivered'; 
+SELECT * FROM STG.dbo.Orders WHERE Status = 'delivered'; 

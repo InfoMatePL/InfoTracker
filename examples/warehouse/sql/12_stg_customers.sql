@@ -1,8 +1,10 @@
-CREATE VIEW dbo.stg_customers AS
+CREATE VIEW STG.dbo.stg_customers AS
 SELECT
     c.CustomerID,
     c.CustomerName,
-    c.Email,
-    RIGHT(c.Email, LEN(c.Email) - CHARINDEX('@', c.Email)) AS EmailDomain,
+    CASE
+        WHEN c.Email IS NOT NULL THEN SUBSTRING(c.Email, CHARINDEX('@', c.Email) + 1, LEN(c.Email))
+        ELSE NULL
+    END AS EmailDomain,
     c.SignupDate
-FROM dbo.Customers AS c; 
+FROM STG.dbo.Customers AS c; 

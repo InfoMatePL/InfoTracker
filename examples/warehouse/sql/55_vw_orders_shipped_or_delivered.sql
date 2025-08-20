@@ -1,4 +1,4 @@
-CREATE VIEW dbo.vw_orders_shipped_or_delivered AS
+CREATE VIEW EDW_CORE.dbo.vw_orders_shipped_or_delivered AS
 SELECT *
-FROM dbo.Orders
-WHERE OrderStatus IN ('shipped','delivered'); 
+FROM STG.dbo.Orders
+WHERE Status IN ('shipped','delivered'); 

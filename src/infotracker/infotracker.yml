@@ -1,0 +1,45 @@
+# InfoTracker Configuration
+# This file contains default settings for InfoTracker CLI commands
+
+# Default SQL adapter to use
+default_adapter: mssql
+
+# Default database name (optional)
+default_database: WarehouseDB
+
+# Directory containing SQL files to analyze
+sql_dir: examples/warehouse/sql
+
+# Directory to output lineage JSON files
+out_dir: build/lineage
+
+# File patterns to include (glob patterns)
+include:
+  - "*.sql"
+
+# File patterns to exclude (glob patterns)
+exclude:
+  - "*_wip.sql"
+  - "**/temp/**"
+  - "**/archive/**"
+
+# Minimum severity level for breaking change detection
+# Options: NON_BREAKING, POTENTIALLY_BREAKING, BREAKING
+severity_threshold: NON_BREAKING
+
+# Objects to ignore during analysis (glob patterns)
+ignore:
+  - "dbo.temp_*"
+  - "sys.*"
+  - "information_schema.*"
+
+# Path to catalog file for schema metadata (optional)
+catalog: null
+
+# Default log level
+# Options: debug, info, warn, error
+log_level: info
+
+# Default output format
+# Options: text, json
+output_format: text
