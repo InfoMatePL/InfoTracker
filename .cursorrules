@@ -1,0 +1,105 @@
+# InfoTracker – Cursor Rules
+# Krótkie reguły dla automatycznych zmian w projekcie (parser/engine/CLI/diff/OL).
+
+# ✱ ZASADY OGÓLNE
+- Nie zmieniaj publicznych interfejsów CLI (nazwy komend i flag): extract, impact, diff.
+- Zachowaj kompatybilność plików wyjściowych (OpenLineage JSON, format tabel tekstowych).
+- Nie usuwaj dokumentacji ani komentarzy TODO; dopisuj „// NOTE(cursor): …” gdzie uzasadniasz decyzję.
+- Logowanie: use WARNING dla problemów użytkownika (parse/cycle), DEBUG dla szczegółów; nie spamuj INFO.
+- Deterministyczność: zachowaj stabilne sortowanie (po object_name, ordinal) i stabilne ID runów.
+- Każda zmiana, która dotyka semantyki, musi mieć test(y) w `tests/` i przechodzić `pytest -q`.
+- Nie dodawaj twardych zależności zewnętrznych; trzymaj się stdlib + obecnych pakietów.
+
+# ✱ PARSER (T-SQL)
+- Zawsze uruchamiaj pre-processing przed sqlglot.parse:
+  - Usuń linie zaczynające się od DECLARE/SET/PRINT.
+  - Usuń GO (puste batche).
+  - Usuń jednowierszowe IF OBJECT_ID('tempdb..#…') … DROP TABLE #… i gołe DROP TABLE #… (temp tables housekeeping).
+  - Sklej dwuliniowe „INSERT INTO #tmp” + następna „EXEC …” do jednej linii: „INSERT INTO #tmp EXEC …”.
+- Fallback gdy parse się wywala:
+  - Rozpoznaj `INSERT INTO <tabela|#temp> EXEC <proc>` (obsłuż zarówno temp jak i zwykłe tabele).
+  - Wyczyść nazwę procedury (_bez_ końcowego `;` i bez `()`).
+  - Zwróć ObjectInfo:
+    - name = nazwa tabeli (temp → `#…`), object_type = temp_table|table,
+    - schema: 2 placeholderowe kolumny (nullable=True),
+    - dependencies = {proc_name},
+    - lineage: ColumnReference(table_name=proc_name, column_name="*", transformation_type=EXEC).
+- SELECT/CAST:
+  - Projekcje pobieraj defensywnie: expressions | projections | args["expressions"].
+  - Dla `CAST(... AS TYPE)` ustaw ColumnSchema.data_type na docelowy typ (np. DECIMAL(10,2), NVARCHAR(50)).
+- Kwalifikacja:
+  - Temp-tabele zawsze pod `namespace="tempdb"`.
+  - Mssql dataset namespace: `mssql://localhost/InfoTrackerDW` (chyba że user ustawi w configu).
+
+# ✱ ENGINE
+- Graf zależności buduj z `ObjectInfo.dependencies`. Jeśli puste → fallback na tabele z `lineage.input_fields`.
+- Topologiczne sortowanie nie może polegać na kolejności plików.
+- Przy „circular/missing deps” loguj WARNING i przetwarzaj mimo wszystko (best-effort).
+
+# ✱ OPENLINEAGE
+- Dla outputs dodawaj facet `schema` dla wszystkich obiektów z kolumnami (tabele, widoki, proc/fn z wynikami).
+- Dodawaj facet `columnLineage` gdy istnieje lineage.
+- Namespace i nazwy datasetów muszą być spójne w całym repo.
+
+# ✱ DIFF
+- Klasyfikacja zmian:
+  - COLUMN_TYPE_CHANGED → BREAKING.
+  - COLUMN_RENAMED → POTENTIALLY_BREAKING (wykrywanie: typ/nullability/lineage zgodne; heurystyka łącząca pary).
+  - COLUMN_ADDED → NON_BREAKING jeśli nullable, w przeciwnym razie POTENTIALLY_BREAKING.
+  - OBJECT_REMOVED/ADDED → BREAKING.
+- Honoruj `severity_threshold` z configu w filtrze wyświetlania i exit code:
+  - BREAKING → tylko breaking zmiany.
+  - POTENTIALLY_BREAKING → breaking + potentially.
+  - NON_BREAKING → wszystkie zmiany.
+
+# ✱ WILDCARDY (ColumnGraph.find_columns_wildcard)
+- Pusty/pół-pusty wzorzec (`"."`, "`..`", "`ns..`" bez patternu kolumny) → zwracaj pustą listę.
+- `schema.table.*`:
+  - Dopasowuj case-insensitive po końcówce nazwy tabeli (sufiks 3/2/1 segmentów), niezależnie od obecności bazy.
+- `..pattern` i `prefix..pattern`:
+  - `pattern` bez metaznaków działa jako „contains” (case-insensitive); z metaznakami → `fnmatch`.
+  - `prefix` z `://` filtruje po namespace, bez `://` po `table_name` (startswith).
+- Zawsze deduplikuj węzły przed zwrotem.
+
+# ✱ CLI
+- Nie dodawaj nowych flag bez uzasadnienia. Dozwolone: `--graph-dir`, `--out`, `--format`, `--config`.
+- (Opcjonalnie) możesz dodać `--threshold` do `diff`, ale musi honorować wartości z configu (flagą tylko nadpisujesz).
+
+# ✱ TESTY
+- Dodawaj test przy każdej zmianie heurystyki parsera/diff/wildcard.
+- W testach `INSERT … EXEC` nazwę procedury porównuj bez `;`.
+- W testach wildcardów – sprawdzaj zarówno tryb exact (`schema.table.*`), jak i contains (`..customer*`), z i bez namespace.
+
+# ✱ KOMITY / PR-Y
+- Commity: konwencja
+  - feat(parser|engine|cli|diff|models): …
+  - fix(parser|engine|…): …
+  - chore(logging|tests|ci): …
+- PR ma być mały i atomowy; zawiera opis zmiany, wpływ na diff/impact, link do testów.
+- Nie łącz refaktoru z funkcjonalną zmianą w jednym PR (chyba że to mechaniczny lint bez ryzyka).
+
+# ✱ TYPOWE AUTO-NAPRAWY DOZWOLONE
+- Usuwanie martwego kodu po `return`.
+- Wstawienie brakujących `GO` między wieloma `CREATE` w jednym pliku przykładowym.
+- Dodanie brakującego `CREATE` przed `VIEW` gdy wykryto wzorzec `;VIEW … AS` (demo).
+- Normalizacja nazw procedur (usunięcie `;`/`()`).
+
+# ✱ CO JEST ZABRONIONE
+- Zmiana semantyki outputu OpenLineage (np. inny kształt JSON).
+- Wyciszanie ostrzeżeń bez adresowania przyczyny (np. „pass” w except).
+- Wymiana parsera SQL lub dodawanie ciężkich zależności.
+
+# ✱ SZYBKIE POLECENIA (smoke)
+- extract: `infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage`
+- impact: `infotracker impact -s "+dbo.orders.total_amount+" --graph-dir build/lineage --max-depth 3`
+- diff: `infotracker --config tmp.yml diff --base build/ol_base --head build/ol_head --format text`
+- tests: `pytest -q` lub selektywnie `pytest -k wildcard -q`
+
+# ✱ KONTEKST PROJEKTU (dla agenta)
+- Projekt: InfoTracker – lineage/diff dla MSSQL z OL artifacts; moduły: parser.py, engine.py, diff.py, models.py, lineage.py, cli.py.
+- Najważniejsze kontrakty: ObjectInfo, ColumnSchema, ColumnLineage, ColumnGraph.
+- Kluczowe inwarianty:
+  - parser: preprocess + fallback dla INSERT INTO … EXEC,
+  - engine: deps z ObjectInfo.dependencies,
+  - diff: filtr po severity_threshold,
+  - models: wildcardy case-insensitive + dopasowanie po sufiksie tabeli.
