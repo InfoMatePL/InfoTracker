@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 import yaml
 
 from .adapters import get_adapter
+from .io_utils import read_text_safely
 from .models import (
     ObjectInfo,
     ColumnSchema,
@@ -35,6 +36,7 @@ class ExtractRequest:
     include: Optional[List[str]] = None
     exclude: Optional[List[str]] = None
     fail_on_warn: bool = False
+    encoding: str = "auto"
 
 
 @dataclass
@@ -149,7 +151,7 @@ class Engine:
         # Phase 1: Parse all SQL files and collect objects
         for sql_path in sql_files:
             try:
-                sql_text = sql_path.read_text(encoding="utf-8")
+                sql_text = read_text_safely(sql_path, encoding=req.encoding)
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
                 
                 # Store mapping for later processing
@@ -179,7 +181,7 @@ class Engine:
                 
             sql_path = sql_file_map[obj_name]
             try:
-                sql_text = sql_path.read_text(encoding="utf-8")
+                sql_text = read_text_safely(sql_path, encoding=req.encoding)
                 
                 # Parse with updated schema registry (now has dependencies resolved)
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
