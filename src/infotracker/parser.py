@@ -25,6 +25,7 @@ class SqlParser:
         self.dialect = dialect
         self.schema_registry = SchemaRegistry()
         self.default_database: Optional[str] = None  # Will be set from config
+        self.current_database: Optional[str] = None  # Track current database context
     
     def _clean_proc_name(self, s: str) -> str:
         """Clean procedure name by removing semicolons and parameters."""
@@ -32,18 +33,67 @@ class SqlParser:
     
     def _normalize_table_ident(self, s: str) -> str:
         """Remove brackets and normalize table identifier."""
-        import re
         return re.sub(r'[\[\]]', '', s)
     
     def set_default_database(self, default_database: Optional[str]):
         """Set the default database for qualification."""
         self.default_database = default_database
     
+    def _extract_database_from_use_statement(self, content: str) -> Optional[str]:
+        """Extract database name from USE statement at the beginning of file."""
+        lines = content.strip().split('\n')
+        for line in lines[:10]:  # Check first 10 lines
+            line = line.strip()
+            if not line or line.startswith('--'):
+                continue
+            
+            # Match USE :DBNAME: or USE [database] or USE database
+            use_match = re.match(r'USE\s+(?::([^:]+):|(?:\[([^\]]+)\]|(\w+)))', line, re.IGNORECASE)
+            if use_match:
+                db_name = use_match.group(1) or use_match.group(2) or use_match.group(3)
+                logger.debug(f"Found USE statement, setting database to: {db_name}")
+                return db_name
+            
+            # If we hit a non-comment, non-USE statement, stop looking
+            if not line.startswith(('USE', 'DECLARE', 'SET', 'PRINT')):
+                break
+        
+        return None
+    
+    def _get_full_table_name(self, table_name: str) -> str:
+        """Get full table name with database prefix using current or default database."""
+        # Use current database from USE statement or fall back to default
+        db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
+        
+        if '.' not in table_name:
+            # Just table name - use database and default schema
+            return f"{db_to_use}.dbo.{table_name}"
+        
+        parts = table_name.split('.')
+        if len(parts) == 2:
+            # schema.table - add database
+            return f"{db_to_use}.{table_name}"
+        elif len(parts) == 3:
+            # database.schema.table - use as is
+            return table_name
+        else:
+            # Fallback
+            return f"{db_to_use}.dbo.{table_name}"
+    
     def _preprocess_sql(self, sql: str) -> str:
         """
         Preprocess SQL to remove control lines and join INSERT INTO #temp EXEC patterns.
+        Also extracts database context from USE statements.
         """
-        import re
+        
+        
+        # Extract database from USE statement first
+        db_from_use = self._extract_database_from_use_statement(sql)
+        if db_from_use:
+            self.current_database = db_from_use
+        else:
+            # Ensure current_database is set to default if no USE statement found
+            self.current_database = self.default_database
         
         lines = sql.split('\n')
         processed_lines = []
@@ -64,6 +114,10 @@ class SqlParser:
             if re.match(r'(?im)^\s*GO\s*$', stripped_line):
                 continue
             
+            # Skip USE <db> lines (we already extracted DB context)
+            if re.match(r'(?i)^\s*USE\b', stripped_line):
+                continue
+
             processed_lines.append(line)
         
         # Join the lines back together
@@ -76,14 +130,36 @@ class SqlParser:
             processed_sql
         )
         
+        # Cut to first significant statement
+        processed_sql = self._cut_to_first_statement(processed_sql)
+        
         return processed_sql
+    
+    def _cut_to_first_statement(self, sql: str) -> str:
+        """
+        Cut SQL content to start from the first significant statement.
+        Looks for: CREATE [OR ALTER] VIEW|TABLE|FUNCTION|PROCEDURE, ALTER, SELECT...INTO, INSERT...EXEC
+        """
+        
+        
+        pattern = re.compile(
+            r'(?is)'                                # DOTALL + IGNORECASE
+            r'(?:'
+            r'CREATE\s+(?:OR\s+ALTER\s+)?(?:VIEW|TABLE|FUNCTION|PROCEDURE)\b'
+            r'|ALTER\s+(?:VIEW|TABLE|FUNCTION|PROCEDURE)\b'
+            r'|SELECT\b.*?\bINTO\b'                # SELECT ... INTO (może być w wielu liniach)
+            r'|INSERT\s+INTO\b.*?\bEXEC\b'
+            r')'
+        )
+        m = pattern.search(sql)
+        return sql[m.start():] if m else sql
     
     def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
         """
         Fallback parser for INSERT INTO ... EXEC pattern when SQLGlot fails.
         Handles both temp tables and regular tables.
         """
-        import re
+        
         
         # Get preprocessed SQL
         sql_pre = self._preprocess_sql(sql_content)
@@ -104,8 +180,16 @@ class SqlParser:
         
         # Determine if it's a temp table
         is_temp = table_name.startswith('#')
+        
+        # For regular tables, use full qualified name with database context
+        if not is_temp:
+            table_name = self._get_full_table_name(table_name)
+        
         namespace = "tempdb" if is_temp else "mssql://localhost/InfoTrackerDW"
         object_type = "temp_table" if is_temp else "table"
+        
+        # Get full procedure name for dependencies and lineage
+        proc_full_name = self._get_full_table_name(proc_name)
         
         # Create placeholder columns
         placeholder_columns = [
@@ -138,16 +222,16 @@ class SqlParser:
                 input_fields=[
                     ColumnReference(
                         namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=proc_name,  # Clean procedure name without semicolons
+                        table_name=proc_full_name,  # Use full procedure name with database context
                         column_name="*"
                     )
                 ],
                 transformation_type=TransformationType.EXEC,
-                transformation_description=f"INSERT INTO {table_name} EXEC {proc_name}"
+                transformation_description=f"INSERT INTO {table_name} EXEC {proc_full_name}"
             ))
         
-        # Set dependencies to the clean procedure name
-        dependencies = {proc_name}
+        # Set dependencies to the full procedure name
+        dependencies = {proc_full_name}
         
         # Register schema in registry
         self.schema_registry.register(schema)
@@ -178,6 +262,9 @@ class SqlParser:
     
     def parse_sql_file(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse a SQL file and extract object information."""
+        # Reset current database to default for each file
+        self.current_database = self.default_database
+        
         try:
             # First check if this is a function or procedure using string matching
             sql_upper = sql_content.upper()
@@ -187,6 +274,7 @@ class SqlParser:
                 return self._parse_procedure_string(sql_content, object_hint)
             
             # Preprocess the SQL content to handle demo script patterns
+            # This will also extract and set current_database from USE statements
             preprocessed_sql = self._preprocess_sql(sql_content)
             
             # Parse the SQL statement with SQLGlot
