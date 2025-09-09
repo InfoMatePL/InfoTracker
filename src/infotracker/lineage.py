@@ -72,8 +72,10 @@ class OpenLineageGenerator:
             "facets": {}
         }
         
-        # Add schema facet for all objects with known columns (tables, views, functions, procedures)
-        if obj_info.schema and obj_info.schema.columns:
+        # Add schema facet only for base tables (not views, functions, procedures)
+        # Views should only have columnLineage, not schema
+        if (obj_info.schema and obj_info.schema.columns and 
+            obj_info.object_type in ['table', 'temp_table']):
             output["facets"]["schema"] = self._build_schema_facet(obj_info)
         
         # Add column lineage facet only if we have lineage (views, not tables)
