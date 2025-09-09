@@ -26,7 +26,7 @@ class OpenLineageGenerator:
         # Build the OpenLineage event
         event = {
             "eventType": "COMPLETE",
-            "eventTime": "2025-01-01T00:00:00Z",  # Fixed timestamp for consistency
+            "eventTime": datetime.now().isoformat() + "Z",
             "run": {"runId": run_id},
             "job": {
                 "namespace": job_namespace,
