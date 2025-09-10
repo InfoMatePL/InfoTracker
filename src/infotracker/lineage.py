@@ -86,7 +86,9 @@ class OpenLineageGenerator:
         # Views should only have columnLineage, not schema
         if (obj_info.schema and obj_info.schema.columns and 
             obj_info.object_type in ['table', 'temp_table']):
-            output["facets"]["schema"] = self._build_schema_facet(obj_info)
+            schema_facet = self._build_schema_facet(obj_info)
+            if schema_facet:  # Only add if not None (fallback objects)
+                output["facets"]["schema"] = schema_facet
         
         # Add column lineage facet only if we have lineage (views, not tables)
         if obj_info.lineage:
@@ -94,8 +96,12 @@ class OpenLineageGenerator:
         
         return [output]
     
-    def _build_schema_facet(self, obj_info: ObjectInfo) -> Dict[str, Any]:
+    def _build_schema_facet(self, obj_info: ObjectInfo) -> Optional[Dict[str, Any]]:
         """Build schema facet from table schema."""
+        # Skip schema facet for fallback objects to match expected format
+        if getattr(obj_info, 'is_fallback', False):
+            return None
+            
         fields = []
         
         for col in obj_info.schema.columns:

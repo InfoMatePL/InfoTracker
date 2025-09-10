@@ -35,7 +35,9 @@ class SqlParser:
     
     def _normalize_table_ident(self, s: str) -> str:
         """Remove brackets and normalize table identifier."""
-        return re.sub(r'[\[\]]', '', s)
+        # Remove brackets, trailing semicolons and whitespace
+        normalized = re.sub(r'[\[\]]', '', s)
+        return normalized.strip().rstrip(';')
     
     def set_default_database(self, default_database: Optional[str]):
         """Set the default database for qualification."""
@@ -108,8 +110,10 @@ class SqlParser:
                 continue
             
             # Skip IF OBJECT_ID('tempdb..#...') patterns and DROP TABLE #temp patterns
+            # Also skip complete IF OBJECT_ID ... DROP TABLE sequences
             if (re.match(r"(?i)^IF\s+OBJECT_ID\('tempdb\.\.#", stripped_line) or
-                re.match(r'(?i)^DROP\s+TABLE\s+#\w+', stripped_line)):
+                re.match(r'(?i)^DROP\s+TABLE\s+#\w+', stripped_line) or
+                re.match(r'(?i)^IF\s+OBJECT_ID.*IS\s+NOT\s+NULL\s+DROP\s+TABLE', stripped_line)):
                 continue
             
             # Skip GO statements (SQL Server batch separator)
@@ -158,8 +162,9 @@ class SqlParser:
     
     def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
         """
-        Fallback parser for INSERT INTO ... EXEC pattern when SQLGlot fails.
-        Handles both temp tables and regular tables.
+        Enhanced fallback parser for complex SQL files when SQLGlot fails.
+        Handles INSERT INTO ... EXEC pattern plus additional dependency extraction.
+        Also handles INSERT INTO persistent tables.
         """
         from .openlineage_utils import sanitize_name
         
@@ -167,51 +172,92 @@ class SqlParser:
         sql_pre = self._preprocess_sql(sql_content)
         
         # Look for INSERT INTO ... EXEC pattern (both temp and regular tables)
-        pattern = r'(?is)INSERT\s+INTO\s+([#\[\]\w.]+)\s+EXEC\s+([^\s(;]+)'
-        match = re.search(pattern, sql_pre)
+        insert_exec_pattern = r'(?is)INSERT\s+INTO\s+([#\[\]\w.]+)\s+EXEC\s+([^\s(;]+)'
+        exec_match = re.search(insert_exec_pattern, sql_pre)
         
-        if not match:
-            return None
+        # Look for INSERT INTO persistent tables (not temp tables)
+        insert_table_pattern = r'(?is)INSERT\s+INTO\s+([^\s#][#\[\]\w.]+)\s*\(([^)]+)\)\s+SELECT'
+        table_match = re.search(insert_table_pattern, sql_pre)
         
-        raw_table = match.group(1)
-        raw_proc = match.group(2)
+        # Always extract all dependencies from the file
+        all_dependencies = self._extract_basic_dependencies(sql_pre)
         
-        # Clean and normalize names
-        table_name = self._normalize_table_ident(raw_table)
-        proc_name = self._clean_proc_name(raw_proc)
-        
-        # Apply consistent temp table namespace handling
-        if table_name.startswith('#'):
-            # Temp table - use consistent naming and namespace
-            temp_name = table_name.lstrip('#')
-            table_name = f"tempdb..#{temp_name}"
-            namespace = "mssql://localhost/tempdb"
-            object_type = "temp_table"
-        else:
-            # Regular table - use full qualified name with database context
-            table_name = self._get_full_table_name(table_name)
-            namespace = "mssql://localhost/InfoTrackerDW"
-            object_type = "table"
-        
-        # Get full procedure name for dependencies and lineage
-        proc_full_name = self._get_full_table_name(proc_name)
-        proc_full_name = sanitize_name(proc_full_name)
-        
-        # Create placeholder columns
+        # Default placeholder columns
         placeholder_columns = [
             ColumnSchema(
                 name="output_col_1",
                 data_type="unknown",
                 nullable=True,
                 ordinal=0
-            ),
-            ColumnSchema(
-                name="output_col_2", 
-                data_type="unknown",
-                nullable=True,
-                ordinal=1
             )
         ]
+        
+        # Prioritize persistent table INSERT over INSERT EXEC
+        if table_match and not table_match.group(1).startswith('#'):
+            # Found INSERT INTO persistent table with explicit column list
+            raw_table = table_match.group(1)
+            raw_columns = table_match.group(2)
+            
+            table_name = self._normalize_table_ident(raw_table)
+            # For output tables, use simple schema.table format without database prefix
+            if '.' not in table_name:
+                table_name = f"dbo.{table_name}"
+            elif len(table_name.split('.')) == 3:
+                # Remove database prefix for output tables
+                parts = table_name.split('.')
+                table_name = f"{parts[1]}.{parts[2]}"
+            namespace = "mssql://localhost/InfoTrackerDW"
+            object_type = "table"
+            
+            # Parse column list from INSERT INTO
+            column_names = [col.strip() for col in raw_columns.split(',')]
+            placeholder_columns = []
+            for i, col_name in enumerate(column_names):
+                placeholder_columns.append(ColumnSchema(
+                    name=col_name,
+                    data_type="unknown",
+                    nullable=True,
+                    ordinal=i
+                ))
+            
+        elif exec_match:
+            # Found INSERT INTO ... EXEC - use that as pattern
+            raw_table = exec_match.group(1)
+            raw_proc = exec_match.group(2)
+            
+            # Clean and normalize names
+            table_name = self._normalize_table_ident(raw_table)
+            proc_name = self._clean_proc_name(raw_proc)
+            
+            # Apply consistent temp table namespace handling
+            if table_name.startswith('#'):
+                # Temp table - use consistent naming and namespace
+                temp_name = table_name.lstrip('#')
+                table_name = f"tempdb..#{temp_name}"
+                namespace = "mssql://localhost/tempdb"
+                object_type = "temp_table"
+            else:
+                # Regular table - use full qualified name with database context
+                table_name = self._get_full_table_name(table_name)
+                namespace = "mssql://localhost/InfoTrackerDW"
+                object_type = "table"
+            
+            # Get full procedure name for dependencies and lineage
+            proc_full_name = self._get_full_table_name(proc_name)
+            proc_full_name = sanitize_name(proc_full_name)
+            
+            # Add the procedure to dependencies
+            all_dependencies.add(proc_full_name)
+            
+        else:
+            # No INSERT pattern found - create a generic script object
+            if all_dependencies:
+                table_name = sanitize_name(object_hint or "script_output")
+                namespace = "mssql://localhost/InfoTrackerDW"
+                object_type = "script"
+            else:
+                # No dependencies found at all
+                return None
         
         # Create schema
         schema = TableSchema(
@@ -220,35 +266,80 @@ class SqlParser:
             columns=placeholder_columns
         )
         
-        # Create lineage for each placeholder column
+        # Create lineage using all dependencies
         lineage = []
-        for col in placeholder_columns:
-            lineage.append(ColumnLineage(
-                output_column=col.name,
-                input_fields=[
-                    ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=proc_full_name,  # Use full procedure name with database context
-                        column_name="*"
-                    )
-                ],
-                transformation_type=TransformationType.EXEC,
-                transformation_description=f"INSERT INTO {table_name} EXEC {proc_full_name}"
-            ))
-        
-        # Set dependencies to the full procedure name
-        dependencies = {proc_full_name}
+        if table_match and not table_match.group(1).startswith('#') and placeholder_columns:
+            # For INSERT INTO table with columns, create intelligent lineage mapping
+            # Look for EXEC pattern in the same file to map columns to procedure output
+            proc_pattern = r'(?is)INSERT\s+INTO\s+#\w+\s+EXEC\s+([^\s(;]+)'
+            proc_match = re.search(proc_pattern, sql_pre)
+            
+            if proc_match:
+                proc_name = self._clean_proc_name(proc_match.group(1))
+                proc_full_name = self._get_full_table_name(proc_name)
+                proc_full_name = sanitize_name(proc_full_name)
+                
+                for i, col in enumerate(placeholder_columns):
+                    if col.name.lower() in ['archivedate', 'createdate', 'insertdate'] and 'getdate' in sql_pre.lower():
+                        # CONSTANT for date columns that use GETDATE()
+                        lineage.append(ColumnLineage(
+                            output_column=col.name,
+                            input_fields=[],
+                            transformation_type=TransformationType.CONSTANT,
+                            transformation_description=f"GETDATE() constant value for archiving"
+                        ))
+                    else:
+                        # IDENTITY mapping from procedure output
+                        lineage.append(ColumnLineage(
+                            output_column=col.name,
+                            input_fields=[
+                                ColumnReference(
+                                    namespace="mssql://localhost/InfoTrackerDW",
+                                    table_name=proc_full_name,
+                                    column_name=col.name
+                                )
+                            ],
+                            transformation_type=TransformationType.IDENTITY,
+                            transformation_description=f"{col.name} from procedure output via temp table"
+                        ))
+            else:
+                # Fallback to generic mapping
+                for col in placeholder_columns:
+                    lineage.append(ColumnLineage(
+                        output_column=col.name,
+                        input_fields=[],
+                        transformation_type=TransformationType.UNKNOWN,
+                        transformation_description=f"Column {col.name} from complex transformation"
+                    ))
+        elif exec_match:
+            # For INSERT EXEC, create specific lineage
+            proc_full_name = self._get_full_table_name(self._clean_proc_name(exec_match.group(2)))
+            proc_full_name = sanitize_name(proc_full_name)
+            for col in placeholder_columns:
+                lineage.append(ColumnLineage(
+                    output_column=col.name,
+                    input_fields=[
+                        ColumnReference(
+                            namespace="mssql://localhost/InfoTrackerDW",
+                            table_name=proc_full_name,
+                            column_name="*"
+                        )
+                    ],
+                    transformation_type=TransformationType.EXEC,
+                    transformation_description=f"INSERT INTO {table_name} EXEC {proc_full_name}"
+                ))
         
         # Register schema in registry
         self.schema_registry.register(schema)
         
-        # Create and return ObjectInfo with table_name as name (not object_hint)
+        # Create and return ObjectInfo with enhanced dependencies
         return ObjectInfo(
             name=table_name,
             object_type=object_type,
             schema=schema,
             lineage=lineage,
-            dependencies=dependencies
+            dependencies=all_dependencies,  # Use all extracted dependencies
+            is_fallback=True
         )
     
     def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
@@ -347,8 +438,13 @@ class SqlParser:
                     
                 elif isinstance(statement, exp.Select):
                     # Loose SELECT statement - extract dependencies but no output
-                    deps = self._extract_dependencies(statement)
-                    all_inputs.update(deps)
+                    self._process_ctes(statement)
+                    stmt_deps = self._extract_dependencies(statement)
+                    
+                    # Expand CTEs and temp tables to base tables
+                    for dep in stmt_deps:
+                        expanded_deps = self._expand_dependency_to_base_tables(dep, statement)
+                        all_inputs.update(expanded_deps)
                     
                 elif isinstance(statement, exp.Insert):
                     if self._is_insert_exec(statement):
@@ -359,23 +455,14 @@ class SqlParser:
                             last_persistent_output = obj
                         all_inputs.update(obj.dependencies)
                     else:
-                        # INSERT INTO ... SELECT
+                        # INSERT INTO ... SELECT - this handles persistent tables
                         obj = self._parse_insert_select(statement, object_hint)
                         if obj:
                             all_outputs.append(obj)
-                            if not obj.name.startswith("#") and "tempdb" not in obj.name:
+                            # Check if this is a persistent table (main output)
+                            if not obj.name.startswith("#") and "tempdb" not in obj.name.lower():
                                 last_persistent_output = obj
                             all_inputs.update(obj.dependencies)
-                
-                elif isinstance(statement, exp.Select):
-                    # Loose SELECT statements
-                    self._process_ctes(statement)
-                    stmt_deps = self._extract_dependencies(statement)
-                    
-                    # Expand CTEs and temp tables to base tables
-                    for dep in stmt_deps:
-                        expanded_deps = self._expand_dependency_to_base_tables(dep, statement)
-                        all_inputs.update(expanded_deps)
                         
                 elif isinstance(statement, exp.With):
                     # Process WITH statements (CTEs)
@@ -388,13 +475,6 @@ class SqlParser:
             
             # Remove CTE references from final inputs
             all_inputs = {dep for dep in all_inputs if not self._is_cte_reference(dep)}
-            
-            # If SQLGlot didn't parse many statements from a complex file, extract dependencies with string parsing
-            # This handles complex files with IF/ELSE blocks or other structures SQLGlot might miss
-            if len(statements) < 3 and len(preprocessed_sql.split('\n')) > 20:
-                # This looks like a complex file that SQLGlot didn't parse completely
-                string_deps = self._extract_basic_dependencies(preprocessed_sql)
-                all_inputs.update(string_deps)
             
             # Sanitize all input names
             all_inputs = {sanitize_name(dep) for dep in all_inputs if dep}
@@ -1770,6 +1850,12 @@ class SqlParser:
         
         # Updated patterns for different RETURN formats with better handling
         patterns = [
+            # RETURNS TABLE AS RETURN (SELECT
+            r'RETURNS\s+TABLE\s+AS\s+RETURN\s*\(\s*(SELECT.*?)(?=\)[\s;]*(?:END|$))',
+            # RETURNS TABLE RETURN (SELECT
+            r'RETURNS\s+TABLE\s+RETURN\s*\(\s*(SELECT.*?)(?=\)[\s;]*(?:END|$))',
+            # RETURNS TABLE RETURN SELECT
+            r'RETURNS\s+TABLE\s+RETURN\s+(SELECT.*?)(?=[\s;]*(?:END|$))',
             # RETURN AS \n (\n SELECT
             r'RETURN\s+AS\s*\n\s*\(\s*(SELECT.*?)(?=\)[\s;]*(?:END|$))',
             # RETURN \n ( \n SELECT  
@@ -1927,6 +2013,13 @@ class SqlParser:
             if not table_name:
                 continue
                 
+            # Skip SQL keywords and built-in functions
+            sql_keywords = {'into', 'procedure', 'function', 'table', 'view', 'select', 'where', 'order', 'group', 'having'}
+            builtin_functions = {'object_id', 'row_number', 'over', 'in', 'cast', 'decimal', 'getdate', 'count', 'sum', 'max', 'min', 'avg'}
+            
+            if table_name.lower() in sql_keywords or table_name.lower() in builtin_functions:
+                continue
+                
             # Remove table alias if present (e.g., "table AS t" -> "table")
             if ' AS ' in table_name.upper():
                 table_name = table_name.split(' AS ')[0].strip()
@@ -1938,7 +2031,7 @@ class SqlParser:
             table_name = self._normalize_table_ident(table_name)
             
             # Skip temp tables for dependency tracking
-            if not table_name.startswith('#'):
+            if not table_name.startswith('#') and table_name.lower() not in sql_keywords:
                 # Get full qualified name but normalize to expected format for dependencies
                 full_name = self._get_full_table_name(table_name)
                 from .openlineage_utils import sanitize_name

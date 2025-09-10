@@ -29,6 +29,8 @@ class TransformationType(Enum):
     DATE_FUNCTION_AGGREGATION = "DATE_FUNCTION_AGGREGATION"
     CASE_AGGREGATION = "CASE_AGGREGATION"
     EXEC = "EXEC"
+    CONSTANT = "CONSTANT"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass
@@ -83,6 +85,7 @@ class ObjectInfo:
     schema: TableSchema
     lineage: List[ColumnLineage] = field(default_factory=list)
     dependencies: Set[str] = field(default_factory=set)  # Tables this object depends on
+    is_fallback: bool = field(default=False)  # Whether this was created by fallback parsing
 
 
 class SchemaRegistry:
