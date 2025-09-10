@@ -3,5 +3,5 @@ SELECT
     p.ProductID,
     p.ProductName,
     p.Category,
-    p.UnitPrice
+    p.Price
 FROM STG.dbo.Products AS p;
