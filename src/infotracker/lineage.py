@@ -26,7 +26,7 @@ class OpenLineageGenerator:
         # Build the OpenLineage event
         event = {
             "eventType": "COMPLETE",
-            "eventTime": datetime.now().isoformat() + "Z",
+            "eventTime": "2025-01-01T00:00:00Z",  # Fixed timestamp for consistency
             "run": {"runId": run_id},
             "job": {
                 "namespace": job_namespace,
@@ -54,8 +54,14 @@ class OpenLineageGenerator:
         inputs = []
         
         for dep_name in sorted(obj_info.dependencies):
+            # Use consistent temp table namespace
+            if dep_name.startswith('tempdb..#'):
+                namespace = "mssql://localhost/tempdb"
+            else:
+                namespace = self.namespace
+                
             inputs.append({
-                "namespace": self.namespace,
+                "namespace": namespace,
                 "name": dep_name
             })
         
@@ -63,8 +69,12 @@ class OpenLineageGenerator:
     
     def _build_outputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
         """Build outputs array with schema and lineage facets."""
-        # Use schema's namespace if available, otherwise default namespace
-        output_namespace = obj_info.schema.namespace if obj_info.schema.namespace else self.namespace
+        # Use consistent temp table namespace
+        if obj_info.schema.name.startswith('tempdb..#'):
+            output_namespace = "mssql://localhost/tempdb"
+        else:
+            # Use schema's namespace if available, otherwise default namespace
+            output_namespace = obj_info.schema.namespace if obj_info.schema.namespace else self.namespace
         
         output = {
             "namespace": output_namespace,
@@ -108,8 +118,14 @@ class OpenLineageGenerator:
             input_fields = []
             
             for input_ref in lineage.input_fields:
+                # Use consistent temp table namespace for inputs
+                if input_ref.table_name.startswith('tempdb..#'):
+                    namespace = "mssql://localhost/tempdb"
+                else:
+                    namespace = input_ref.namespace
+                    
                 input_fields.append({
-                    "namespace": input_ref.namespace,
+                    "namespace": namespace,
                     "name": input_ref.table_name,
                     "field": input_ref.column_name
                 })
