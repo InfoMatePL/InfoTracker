@@ -37,3 +37,5 @@ docs/_build/
 (?i)*test*.md
 (?i)*phase*.md
 examples/warehouse/sql2
+
+*.txt
