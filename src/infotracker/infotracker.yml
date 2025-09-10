@@ -5,7 +5,7 @@
 default_adapter: mssql
 
 # Default database name (optional)
-default_database: WarehouseDB
+default_database:
 
 # Directory containing SQL files to analyze
 sql_dir: examples/warehouse/sql
