@@ -12,12 +12,13 @@ import yaml
 
 from .adapters import get_adapter
 from .io_utils import read_text_safely
+from .lineage import emit_ol_from_object
 from .models import (
-    ObjectInfo,
+    ObjectInfo, 
+    ColumnNode, 
     ColumnSchema,
     TableSchema,
     ColumnGraph,
-    ColumnNode,
     ColumnEdge,
     TransformationType,
 )
@@ -193,9 +194,12 @@ class Engine:
                     # Also register in adapter's parser for lineage generation
                     adapter.parser.schema_registry.register(obj_info.schema)
 
-                # Generate OpenLineage with resolved schema context
-                ol_raw = adapter.extract_lineage(sql_text, object_hint=sql_path.stem)
-                ol_payload: Dict[str, Any] = json.loads(ol_raw) if isinstance(ol_raw, str) else ol_raw
+                # Generate OpenLineage directly from resolved ObjectInfo
+                ol_payload = emit_ol_from_object(
+                    obj_info,
+                    quality_metrics=True,
+                    virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", False),
+                )
 
                 # Save to file
                 target = out_dir / f"{sql_path.stem}.json"
@@ -203,15 +207,25 @@ class Engine:
 
                 outputs.append([str(sql_path), str(target)])
 
-                # Check for warnings
+                # Check for warnings with enhanced diagnostics
                 out0 = (ol_payload.get("outputs") or [])
                 out0 = out0[0] if out0 else {}
                 facets = out0.get("facets", {})
                 has_schema_fields = bool(facets.get("schema", {}).get("fields"))
                 has_col_lineage = bool(facets.get("columnLineage", {}).get("fields"))
 
-                if getattr(obj_info, "object_type", "unknown") == "unknown" or not (has_schema_fields or has_col_lineage):
+                # Enhanced warning classification
+                warning_reason = None
+                if getattr(obj_info, "object_type", "unknown") == "unknown":
+                    warning_reason = "UNKNOWN_OBJECT_TYPE"
+                elif hasattr(obj_info, 'no_output_reason') and obj_info.no_output_reason:
+                    warning_reason = obj_info.no_output_reason
+                elif not (has_schema_fields or has_col_lineage):
+                    warning_reason = "NO_SCHEMA_OR_LINEAGE"
+
+                if warning_reason:
                     warnings += 1
+                    logger.warning("Object %s: %s", obj_info.name, warning_reason)
 
             except Exception as e:
                 warnings += 1

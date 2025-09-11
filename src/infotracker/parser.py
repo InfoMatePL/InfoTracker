@@ -1937,8 +1937,6 @@ class SqlParser:
                 )
         
         return None
-        
-        return None
     
     def _extract_function_name(self, sql_content: str) -> Optional[str]:
         """Extract function name from CREATE FUNCTION statement."""
@@ -2360,24 +2358,31 @@ class SqlParser:
             
             # Skip temp tables for dependency tracking
             if not table_name.startswith('#') and table_name.lower() not in sql_keywords:
-                # Get full qualified name but normalize to expected format for dependencies
+                # Get full qualified name for consistent dependency tracking
                 full_name = self._get_full_table_name(table_name)
                 from .openlineage_utils import sanitize_name
                 full_name = sanitize_name(full_name)
                 
-                # For dependencies, use simplified format to match expected fixtures
+                # Always use fully qualified format: database.schema.table
+                # This ensures consistent topological sorting
                 parts = full_name.split('.')
-                if len(parts) >= 3 and parts[1] == 'dbo':
-                    # database.dbo.table -> table (match expected fixture format)
-                    simplified = parts[2]
-                elif len(parts) >= 2:
-                    simplified = f"{parts[-2]}.{parts[-1]}"  # schema.table
+                if len(parts) >= 3:
+                    qualified_name = full_name  # Already has database.schema.table
+                elif len(parts) == 2:
+                    # schema.table -> add default database
+                    db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
+                    qualified_name = f"{db_to_use}.{full_name}"
                 else:
-                    simplified = table_name
+                    # just table -> add default database and schema
+                    db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
+                    qualified_name = f"{db_to_use}.dbo.{table_name}"
                     
-                # Exclude output tables from dependencies
-                if simplified not in insert_targets:
-                    dependencies.add(simplified)
+                # Check if this is an output table (exclude from dependencies)
+                output_check_parts = qualified_name.split('.')
+                if len(output_check_parts) >= 2:
+                    simplified_for_check = f"{output_check_parts[-2]}.{output_check_parts[-1]}"
+                    if simplified_for_check not in insert_targets:
+                        dependencies.add(qualified_name)
         
         return dependencies
 

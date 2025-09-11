@@ -82,10 +82,10 @@ class OpenLineageGenerator:
             "facets": {}
         }
         
-        # Add schema facet only for base tables (not views, functions, procedures)
+        # Add schema facet for tables and procedures with columns
         # Views should only have columnLineage, not schema
         if (obj_info.schema and obj_info.schema.columns and 
-            obj_info.object_type in ['table', 'temp_table']):
+            obj_info.object_type in ['table', 'temp_table', 'procedure']):
             schema_facet = self._build_schema_facet(obj_info)
             if schema_facet:  # Only add if not None (fallback objects)
                 output["facets"]["schema"] = schema_facet
@@ -158,8 +158,11 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
     if obj.object_type == "procedure" and virtual_proc_outputs and obj.schema and obj.schema.columns:
         name = f"procedures.{obj.name}"
     
-    # Build inputs from dependencies
-    inputs = [{"namespace": ns, "name": dep} for dep in sorted(obj.dependencies)]
+    # Build inputs from dependencies with proper namespaces
+    def _ns_for(dep: str) -> str:
+        return "mssql://localhost/tempdb" if dep.startswith("tempdb..#") else "mssql://localhost/InfoTrackerDW"
+    
+    inputs = [{"namespace": _ns_for(dep), "name": dep} for dep in sorted(obj.dependencies)]
     
     # Build output facets
     facets = {}
