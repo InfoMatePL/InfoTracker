@@ -147,3 +147,75 @@ class OpenLineageGenerator:
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
             "fields": fields
         }
+
+
+def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_outputs=False) -> dict:
+    """Emit OpenLineage JSON directly from ObjectInfo without re-parsing."""
+    ns = obj.schema.namespace if obj.schema else "mssql://localhost/InfoTrackerDW"
+    name = obj.schema.name if obj.schema else obj.name
+    
+    # Handle virtual procedure outputs
+    if obj.object_type == "procedure" and virtual_proc_outputs and obj.schema and obj.schema.columns:
+        name = f"procedures.{obj.name}"
+    
+    # Build inputs from dependencies
+    inputs = [{"namespace": ns, "name": dep} for dep in sorted(obj.dependencies)]
+    
+    # Build output facets
+    facets = {}
+    
+    # Add schema facet if we have columns and it's not a fallback object
+    if obj.schema and obj.schema.columns and not getattr(obj, 'is_fallback', False):
+        facets["schema"] = {
+            "_producer": "https://github.com/OpenLineage/OpenLineage",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
+            "fields": [{"name": c.name, "type": c.data_type} for c in obj.schema.columns]
+        }
+    
+    # Add column lineage facet if we have lineage
+    if obj.lineage:
+        lineage_fields = {}
+        for ln in obj.lineage:
+            lineage_fields[ln.output_column] = {
+                "inputFields": [
+                    {"namespace": f.namespace, "name": f.table_name, "field": f.column_name} 
+                    for f in ln.input_fields
+                ],
+                "transformationType": ln.transformation_type.value,
+                "transformationDescription": ln.transformation_description
+            }
+        
+        facets["columnLineage"] = {
+            "_producer": "https://github.com/OpenLineage/OpenLineage",
+            "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
+            "fields": lineage_fields
+        }
+    
+    # Add quality metrics if requested
+    if quality_metrics:
+        covered = 0
+        if obj.schema and obj.schema.columns:
+            covered = sum(1 for c in obj.schema.columns 
+                         if any(ln.output_column == c.name and ln.input_fields for ln in obj.lineage))
+        
+        facets["quality"] = {
+            "lineageCoverage": (covered / max(1, len(obj.schema.columns) if obj.schema else 1)),
+            "isFallback": bool(getattr(obj, 'is_fallback', False)),
+            "reasonCode": getattr(obj, 'no_output_reason', None)
+        }
+    
+    # Build the complete event
+    event = {
+        "eventType": "COMPLETE", 
+        "eventTime": "2025-01-01T00:00:00Z",
+        "run": {"runId": "00000000-0000-0000-0000-000000000000"},
+        "job": {"namespace": "infotracker/examples", "name": f"warehouse/sql/{obj.name}.sql"},
+        "inputs": inputs,
+        "outputs": [{
+            "namespace": ns,
+            "name": name,
+            "facets": facets
+        }]
+    }
+    
+    return event

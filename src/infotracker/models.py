@@ -86,6 +86,7 @@ class ObjectInfo:
     lineage: List[ColumnLineage] = field(default_factory=list)
     dependencies: Set[str] = field(default_factory=set)  # Tables this object depends on
     is_fallback: bool = field(default=False)  # Whether this was created by fallback parsing
+    no_output_reason: Optional[str] = field(default=None)  # Reason for no persistent output
 
 
 class SchemaRegistry:

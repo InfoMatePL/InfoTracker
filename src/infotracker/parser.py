@@ -353,7 +353,48 @@ class SqlParser:
                 return None
             return str(selects[-1])
         except Exception:
-            return None
+            # Fallback to string-based SELECT extraction for procedures
+            return self._find_last_select_string_fallback(sql_content)
+
+    def _find_last_select_string_fallback(self, sql_content: str) -> str | None:
+        """Fallback method to find last SELECT using string parsing."""
+        try:
+            # For procedures, find the last SELECT statement that goes to the end of the procedure
+            # Look for the last occurrence of SELECT and take everything until END
+            
+            # First, find all SELECT positions
+            select_positions = []
+            for match in re.finditer(r'\bSELECT\b', sql_content, re.IGNORECASE):
+                select_positions.append(match.start())
+            
+            if not select_positions:
+                return None
+            
+            # Take the last SELECT position
+            last_select_pos = select_positions[-1]
+            
+            # Get everything from the last SELECT to the end, but stop at END
+            remaining_content = sql_content[last_select_pos:]
+            
+            # Find the procedure END (but not CASE END)
+            # Look for END at the start of a line or END followed by semicolon
+            end_pattern = r'(?i)(?:^|\n)\s*END\s*(?:;|\s*$)'
+            end_match = re.search(end_pattern, remaining_content)
+            
+            if end_match:
+                last_select = remaining_content[:end_match.start()].strip()
+            else:
+                last_select = remaining_content.strip()
+            
+            # Clean up any trailing semicolons
+            last_select = re.sub(r';\s*$', '', last_select)
+            
+            return last_select
+                
+        except Exception as e:
+            logger.debug(f"Fallback SELECT extraction failed: {e}")
+            
+        return None
     
     def parse_sql_file(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse a SQL file and extract object information."""
@@ -463,6 +504,19 @@ class SqlParser:
                             if not obj.name.startswith("#") and "tempdb" not in obj.name.lower():
                                 last_persistent_output = obj
                             all_inputs.update(obj.dependencies)
+                
+                # Extra: guard for INSERT variants parsed oddly by SQLGlot (Command inside expression)
+                elif hasattr(statement, "this") and isinstance(statement, exp.Table) and "INSERT" in str(statement).upper():
+                    # Best-effort: try _parse_insert_select fallback if AST is quirky
+                    try:
+                        obj = self._parse_insert_select(statement, object_hint)
+                        if obj:
+                            all_outputs.append(obj)
+                            if not obj.name.startswith("#") and "tempdb" not in obj.name.lower():
+                                last_persistent_output = obj
+                            all_inputs.update(obj.dependencies)
+                    except Exception:
+                        pass
                         
                 elif isinstance(statement, exp.With):
                     # Process WITH statements (CTEs)
@@ -502,6 +556,11 @@ class SqlParser:
                     lineage=[],
                     dependencies=all_inputs
                 )
+                # Add no-output reason for diagnostics
+                if not self.current_database and not self.default_database:
+                    main_object.no_output_reason = "UNKNOWN_DB_CONTEXT"
+                else:
+                    main_object.no_output_reason = "NO_PERSISTENT_OUTPUT_DETECTED"
             
             if main_object:
                 return main_object
@@ -860,7 +919,27 @@ class SqlParser:
         procedure_name = self._get_table_name(statement.this, object_hint)
         namespace = "mssql://localhost/InfoTrackerDW"
         
-        # Extract the procedure body and find the last SELECT statement
+        # Extract the procedure body and find materialized outputs (SELECT INTO, INSERT INTO)
+        materialized_outputs = self._extract_procedure_outputs(statement)
+        
+        # If we have materialized outputs, return the last one instead of the procedure
+        if materialized_outputs:
+            last_output = materialized_outputs[-1]
+            # Extract lineage for the materialized output
+            lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
+            
+            # Update the output object with proper lineage and dependencies
+            last_output.lineage = lineage
+            last_output.dependencies = dependencies
+            if output_columns:
+                last_output.schema = TableSchema(
+                    namespace=last_output.schema.namespace,
+                    name=last_output.name,
+                    columns=output_columns
+                )
+            return last_output
+        
+        # Fall back to regular procedure parsing if no materialized outputs
         lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
         
         schema = TableSchema(
@@ -872,13 +951,87 @@ class SqlParser:
         # Register schema for future reference
         self.schema_registry.register(schema)
         
-        return ObjectInfo(
+        # Add reason for procedure with no materialized output
+        obj = ObjectInfo(
             name=procedure_name,
             object_type="procedure",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
         )
+        obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
+        return obj
+    
+    def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
+        """Extract materialized outputs (SELECT INTO, INSERT INTO) from procedure body."""
+        outputs = []
+        sql_text = str(statement)
+        
+        # Look for SELECT ... INTO patterns
+        select_into_pattern = r'(?i)SELECT\s+.*?\s+INTO\s+([^\s,]+)'
+        select_into_matches = re.findall(select_into_pattern, sql_text, re.DOTALL)
+        
+        for table_match in select_into_matches:
+            table_name = table_match.strip()
+            # Skip temp tables
+            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                # Normalize table name - remove database prefix for output
+                normalized_name = self._normalize_table_name_for_output(table_name)
+                outputs.append(ObjectInfo(
+                    name=normalized_name,
+                    object_type="table",
+                    schema=TableSchema(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        name=normalized_name,
+                        columns=[]
+                    ),
+                    lineage=[],
+                    dependencies=set()
+                ))
+        
+        # Look for INSERT INTO patterns (non-temp tables)
+        insert_into_pattern = r'(?i)INSERT\s+INTO\s+([^\s,\(]+)'
+        insert_into_matches = re.findall(insert_into_pattern, sql_text)
+        
+        for table_match in insert_into_matches:
+            table_name = table_match.strip()
+            # Skip temp tables
+            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                normalized_name = self._normalize_table_name_for_output(table_name)
+                # Check if we already have this table from SELECT INTO
+                if not any(output.name == normalized_name for output in outputs):
+                    outputs.append(ObjectInfo(
+                        name=normalized_name,
+                        object_type="table",
+                        schema=TableSchema(
+                            namespace="mssql://localhost/InfoTrackerDW",
+                            name=normalized_name,
+                            columns=[]
+                        ),
+                        lineage=[],
+                        dependencies=set()
+                    ))
+        
+        return outputs
+    
+    def _normalize_table_name_for_output(self, table_name: str) -> str:
+        """Normalize table name for output - remove database prefix, keep schema.table format."""
+        from .openlineage_utils import sanitize_name
+        
+        # Clean up the table name
+        table_name = sanitize_name(table_name)
+        
+        # Remove database prefix if present (keep only schema.table)
+        parts = table_name.split('.')
+        if len(parts) >= 3:
+            # database.schema.table -> schema.table
+            return f"{parts[-2]}.{parts[-1]}"
+        elif len(parts) == 2:
+            # schema.table -> keep as is
+            return table_name
+        else:
+            # just table -> add dbo prefix
+            return f"dbo.{table_name}"
     
     def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None) -> str:
         """Extract table name from expression and qualify with current or default database."""
@@ -1694,7 +1847,25 @@ class SqlParser:
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
         namespace = "mssql://localhost/InfoTrackerDW"
         
-        # Extract the procedure body and find the last SELECT statement
+        # First, check if this procedure has materialized outputs (SELECT INTO, INSERT INTO)
+        # If so, return the materialized table instead of the procedure
+        materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
+        if materialized_output:
+            # Extract dependencies and lineage for the materialized output
+            lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
+            
+            # Update the materialized output with lineage and dependencies
+            materialized_output.lineage = lineage
+            materialized_output.dependencies = dependencies
+            if output_columns:
+                materialized_output.schema = TableSchema(
+                    namespace=materialized_output.schema.namespace,
+                    name=materialized_output.name,
+                    columns=output_columns
+                )
+            return materialized_output
+        
+        # Fall back to regular procedure parsing if no materialized outputs
         lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
         
         schema = TableSchema(
@@ -1706,14 +1877,69 @@ class SqlParser:
         # Register schema for future reference
         self.schema_registry.register(schema)
         
-        return ObjectInfo(
+        obj = ObjectInfo(
             name=procedure_name,
             object_type="procedure",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
         )
+        obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
+        return obj
 
+    def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> Optional[ObjectInfo]:
+        """Extract materialized output (SELECT INTO, INSERT INTO) from procedure using string parsing."""
+        # Filter out comment lines to avoid false positives
+        lines = sql_content.split('\n')
+        sql_lines = [line for line in lines if not line.strip().startswith('--')]
+        filtered_content = '\n'.join(sql_lines)
+        
+        # Look for SELECT ... INTO patterns (persistent tables only)
+        select_into_pattern = r'(?i)SELECT\s+.*?\s+INTO\s+([^\s,\r\n]+)'
+        select_into_matches = re.findall(select_into_pattern, filtered_content, re.DOTALL)
+        
+        for table_match in select_into_matches:
+            table_name = table_match.strip()
+            # Skip temp tables
+            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                normalized_name = self._normalize_table_name_for_output(table_name)
+                return ObjectInfo(
+                    name=normalized_name,
+                    object_type="table",
+                    schema=TableSchema(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        name=normalized_name,
+                        columns=[]
+                    ),
+                    lineage=[],
+                    dependencies=set()
+                )
+        
+        # Look for INSERT INTO patterns (persistent tables only)
+        insert_into_pattern = r'(?i)INSERT\s+INTO\s+([^\s,\(\r\n]+)'
+        insert_into_matches = re.findall(insert_into_pattern, filtered_content)
+        
+        for table_match in insert_into_matches:
+            table_name = table_match.strip()
+            # Skip temp tables
+            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                normalized_name = self._normalize_table_name_for_output(table_name)
+                return ObjectInfo(
+                    name=normalized_name,
+                    object_type="table",
+                    schema=TableSchema(
+                        namespace="mssql://localhost/InfoTrackerDW",
+                        name=normalized_name,
+                        columns=[]
+                    ),
+                    lineage=[],
+                    dependencies=set()
+                )
+        
+        return None
+        
+        return None
+    
     def _extract_function_name(self, sql_content: str) -> Optional[str]:
         """Extract function name from CREATE FUNCTION statement."""
         match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+([^\s\(]+)', sql_content, re.IGNORECASE)
@@ -1774,8 +2000,9 @@ class SqlParser:
                     lineage, output_columns = self._extract_column_lineage(parsed[0], procedure_name)
                     dependencies = self._extract_dependencies(parsed[0])
             except Exception:
-                # Fallback to basic analysis
+                # Fallback to basic analysis with string-based lineage
                 output_columns = self._extract_basic_select_columns(last_select_sql)
+                lineage = self._extract_basic_lineage_from_select(last_select_sql, output_columns, procedure_name)
                 dependencies = self._extract_basic_dependencies(last_select_sql)
         
         # Additionally, extract dependencies from the entire procedure body
@@ -1940,7 +2167,108 @@ class SqlParser:
                     ))
         
         return output_columns
+
+    def _extract_basic_lineage_from_select(self, select_sql: str, output_columns: List[ColumnSchema], object_name: str) -> List[ColumnLineage]:
+        """Extract basic lineage information from SELECT statement using string parsing."""
+        lineage = []
+        
+        try:
+            # Extract table aliases from FROM and JOIN clauses
+            table_aliases = self._extract_table_aliases_from_select(select_sql)
+            
+            # Parse the SELECT list to match columns with their sources
+            select_match = re.search(r'SELECT\s+(.*?)\s+FROM', select_sql, re.IGNORECASE | re.DOTALL)
+            if not select_match:
+                return lineage
+                
+            select_list = select_match.group(1)
+            column_expressions = [col.strip() for col in select_list.split(',')]
+            
+            for i, (output_col, col_expr) in enumerate(zip(output_columns, column_expressions)):
+                # Try to find source table and column
+                source_table, source_column, transformation_type = self._parse_column_expression(col_expr, table_aliases)
+                
+                if source_table and source_column:
+                    lineage.append(ColumnLineage(
+                        column_name=output_col.name,
+                        table_name=object_name,
+                        source_column=source_column,
+                        source_table=source_table,
+                        transformation_type=transformation_type,
+                        transformation_description=f"Column derived from {source_table}.{source_column}"
+                    ))
+            
+        except Exception as e:
+            logger.debug(f"Basic lineage extraction failed: {e}")
+            
+        return lineage
     
+    def _extract_table_aliases_from_select(self, select_sql: str) -> Dict[str, str]:
+        """Extract table aliases from FROM and JOIN clauses."""
+        aliases = {}
+        
+        # Find FROM clause and all JOIN clauses
+        from_join_pattern = r'(?i)\b(?:FROM|JOIN)\s+([^\s]+)(?:\s+AS\s+)?(\w+)?'
+        matches = re.findall(from_join_pattern, select_sql)
+        
+        for table_name, alias in matches:
+            clean_table = table_name.strip()
+            clean_alias = alias.strip() if alias else None
+            
+            if clean_alias:
+                aliases[clean_alias] = clean_table
+            else:
+                # If no alias, use the table name itself
+                table_short = clean_table.split('.')[-1]  # Get last part after dots
+                aliases[table_short] = clean_table
+                
+        return aliases
+    
+    def _parse_column_expression(self, col_expr: str, table_aliases: Dict[str, str]) -> tuple[str, str, TransformationType]:
+        """Parse a column expression to find source table, column, and transformation type."""
+        col_expr = col_expr.strip()
+        
+        # Handle aliases - remove the alias part for analysis
+        if ' AS ' in col_expr.upper():
+            col_expr = col_expr.split(' AS ')[0].strip()
+        elif ' ' in col_expr and not any(func in col_expr.upper() for func in ['SUM', 'COUNT', 'MAX', 'MIN', 'AVG', 'CAST', 'CASE']):
+            # Implicit alias - take everything except the last word
+            parts = col_expr.split()
+            if len(parts) > 1:
+                col_expr = ' '.join(parts[:-1]).strip()
+        
+        # Determine transformation type and extract source
+        if any(func in col_expr.upper() for func in ['SUM(', 'COUNT(', 'MAX(', 'MIN(', 'AVG(']):
+            transformation_type = TransformationType.AGGREGATION
+        elif 'CASE' in col_expr.upper():
+            transformation_type = TransformationType.CONDITIONAL
+        elif any(op in col_expr for op in ['+', '-', '*', '/']):
+            transformation_type = TransformationType.ARITHMETIC
+        else:
+            transformation_type = TransformationType.IDENTITY
+        
+        # Extract the main column reference (e.g., "c.CustomerID" from "c.CustomerID")
+        col_match = re.search(r'(\w+)\.(\w+)', col_expr)
+        if col_match:
+            alias = col_match.group(1)
+            column = col_match.group(2)
+            
+            if alias in table_aliases:
+                table_name = table_aliases[alias]
+                # Normalize table name
+                if not table_name.startswith('dbo.') and '.' not in table_name:
+                    table_name = f"dbo.{table_name}"
+                return table_name, column, transformation_type
+        
+        # If no table alias found, try to extract just column name
+        simple_col_match = re.search(r'\b(\w+)\b', col_expr)
+        if simple_col_match:
+            column = simple_col_match.group(1)
+            # Return unknown table
+            return "unknown_table", column, transformation_type
+            
+        return None, None, transformation_type
+
     def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
         """Basic extraction of table dependencies from SQL."""
         dependencies = set()
