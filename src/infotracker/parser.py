@@ -641,7 +641,19 @@ class SqlParser:
             # Count how many CREATE statements we have
             create_function_count = sql_upper.count('CREATE FUNCTION') + sql_upper.count('CREATE OR ALTER FUNCTION')
             create_procedure_count = sql_upper.count('CREATE PROCEDURE') + sql_upper.count('CREATE OR ALTER PROCEDURE')
-            
+            create_table_count = sql_upper.count('CREATE TABLE') + sql_upper.count('CREATE OR ALTER TABLE')
+
+            if create_table_count == 1 and all(x == 0 for x in [create_function_count, create_procedure_count]):
+                # spróbuj najpierw AST; jeśli SQLGlot zwróci Command albo None — fallback stringowy
+                try:
+                    normalized_sql = self._normalize_tsql(sql_content)
+                    statements = sqlglot.parse(self._preprocess_sql(normalized_sql), read=self.dialect) or []
+                    st = statements[0] if statements else None
+                    if st and isinstance(st, exp.Create) and (getattr(st, "kind", "") or "").upper() == "TABLE":
+                        return self._parse_create_table(st, object_hint)
+                except Exception:
+                    pass
+                return self._parse_create_table_string(sql_content, object_hint)
             # If it's a single function or procedure, use string-based approach
             if create_function_count == 1 and create_procedure_count == 0:
                 return self._parse_function_string(sql_content, object_hint)
@@ -1061,6 +1073,60 @@ class SqlParser:
             dependencies=set()
         )
     
+    def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None) -> ObjectInfo:
+        # 1) Wyciągnij nazwę tabeli
+        m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
+        table_name = self._get_full_table_name(self._normalize_table_ident(m.group(1))) if m else (object_hint or "dbo.unknown_table")
+        namespace = "mssql://localhost/InfoTrackerDW"
+
+        # 2) Wyciągnij definicję kolumn (wnętrze pierwszych nawiasów po CREATE TABLE)
+        body = ""
+        b = re.search(r'(?is)CREATE\s+TABLE\s+[^\(]+\((.*)\)', sql)
+        if b:
+            # utnij po zamknięciu pierwszego poziomu nawiasów (na wszelki)
+            body = b.group(1)
+
+        # 3) Podziel na wiersze definicji kolumn (odetnij constrainty tabelowe)
+        lines = []
+        depth = 0
+        token = []
+        for ch in body:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                lines.append(''.join(token).strip())
+                token = []
+            else:
+                token.append(ch)
+        if token:
+            lines.append(''.join(token).strip())
+        # odfiltruj klauzule constraintów tabelowych
+        col_lines = [ln for ln in lines if not re.match(r'(?i)^(CONSTRAINT|PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK)\b', ln)]
+
+        cols: List[ColumnSchema] = []
+        for i, ln in enumerate(col_lines):
+            # nazwa kolumny w nawiasach/[] lub goła
+            m = re.match(r'\s*(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_][\w$#]*))\s+(.*)$', ln)
+            if not m:
+                continue
+            col_name = next(g for g in m.groups()[:3] if g)
+            rest = m.group(4)
+
+            # typ: pierwszy token (może być typu NVARCHAR(100) itp.) — bierz nazwę typu + (opcjonalnie) długość
+            t = re.match(r'(?i)\s*([A-Za-z_][\w$]*)(\s*\([^\)]*\))?', rest)
+            dtype = (t.group(1) + (t.group(2) or '')).strip().lower() if t else "unknown"
+
+            # nullable / not null
+            nullable = not re.search(r'(?i)\bNOT\s+NULL\b', rest)
+
+            cols.append(ColumnSchema(name=col_name, data_type=dtype, nullable=nullable, ordinal=i))
+
+        schema = TableSchema(namespace=namespace, name=table_name, columns=cols)
+        self.schema_registry.register(schema)
+        return ObjectInfo(name=table_name, object_type="table", schema=schema, lineage=[], dependencies=set())
+
     def _parse_create_view(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE VIEW statement."""
         view_name = self._get_table_name(statement.this, object_hint)
@@ -2597,6 +2663,16 @@ class SqlParser:
         for match in all_matches:
             table_name = match.strip()
             
+            sql_keywords = {'into', 'procedure', 'function', 'table', 'view', 'select', 'where', 'order', 'group', 'having'}
+            builtin_functions = {
+                'object_id','row_number','over','in','cast','convert','try_convert','decimal',
+                'getdate','sysdatetime','count','sum','max','min','avg',
+                'datediff','dateadd','format','isnull','coalesce','iif',
+                'len','charindex','left','right','substring','stuff','replace','upper','lower','trim',
+                'error_message','error_number','error_severity','error_state','error_line','suser_sname',
+                'exists','not','and','or','case','when','then','else','end'
+            }
+
             # jeżeli to wzorzec funkcji: "NAME(...)" – pomiń
             if re.search(r'\w+\s*\(', table_name):
                 continue
@@ -2609,15 +2685,7 @@ class SqlParser:
                 continue
                 
             # Skip SQL keywords and built-in functions
-            sql_keywords = {'into', 'procedure', 'function', 'table', 'view', 'select', 'where', 'order', 'group', 'having'}
-            builtin_functions = {
-                'object_id','row_number','over','in','cast','convert','try_convert','decimal',
-                'getdate','sysdatetime','count','sum','max','min','avg',
-                'datediff','dateadd','format','isnull','coalesce','iif',
-                'len','charindex','left','right','substring','stuff','replace','upper','lower','trim',
-                'error_message','error_number','error_severity','error_state','error_line','suser_sname',
-                'exists','not','and','or','case','when','then','else','end'
-            }
+            
             if table_name.lower() in sql_keywords or table_name.lower() in builtin_functions:
                 continue
                 

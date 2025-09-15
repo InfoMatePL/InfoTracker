@@ -37,7 +37,7 @@ class OpenLineageGenerator:
         # Build the OpenLineage event
         event = {
             "eventType": "COMPLETE",
-            "eventTime": "2025-01-01T00:00:00Z",  # Fixed timestamp for consistency
+            "eventTime": datetime.now().isoformat()[:19] + "Z",
             "run": {"runId": run_id},
             "job": {
                 "namespace": job_namespace,
@@ -225,7 +225,7 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
     # Build the complete event
     event = {
         "eventType": "COMPLETE", 
-        "eventTime": "2025-01-01T00:00:00Z",
+        "eventTime": datetime.now().isoformat()[:19] + "Z",
         "run": {"runId": "00000000-0000-0000-0000-000000000000"},
         "job": {"namespace": "infotracker/examples", "name": f"warehouse/sql/{obj.name}.sql"},
         "inputs": inputs,

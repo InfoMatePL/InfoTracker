@@ -198,7 +198,7 @@ class Engine:
                 ol_payload = emit_ol_from_object(
                     obj_info,
                     quality_metrics=True,
-                    virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", False),
+                    virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
                 )
 
                 # Save to file
