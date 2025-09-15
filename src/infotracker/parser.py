@@ -39,6 +39,233 @@ class SqlParser:
         normalized = re.sub(r'[\[\]]', '', s)
         return normalized.strip().rstrip(';')
     
+    def _normalize_tsql(self, text: str) -> str:
+        """Normalize T-SQL to improve sqlglot parsing compatibility."""
+        t = text.replace("\r\n", "\n")
+        
+        # Strip technical banners and settings
+        t = re.sub(r"^\s*SET\s+(ANSI_NULLS|QUOTED_IDENTIFIER)\s+(ON|OFF)\s*;?\s*$", "", t, flags=re.I|re.M)
+        t = re.sub(r"^\s*GO\s*;?\s*$", "", t, flags=re.I|re.M)
+        
+        # Remove column-level COLLATE clauses (keeps DDL simple)
+        t = re.sub(r"\s+COLLATE\s+[A-Za-z0-9_]+", "", t, flags=re.I)
+        
+        # Normalize T-SQL specific functions to standard equivalents
+        t = re.sub(r"\bISNULL\s*\(", "COALESCE(", t, flags=re.I)
+        
+        # Convert IIF to CASE WHEN (basic conversion for simple cases)
+        t = re.sub(r"\bIIF\s*\(", "CASE WHEN ", t, flags=re.I)
+        
+        return t
+    
+    def _rewrite_ast(self, root: exp.Expression) -> exp.Expression:
+        """Rewrite AST nodes for better T-SQL compatibility."""
+        for node in list(root.walk()):
+            # Convert CONVERT(T, x [, style]) to CAST(x AS T)
+            if isinstance(node, exp.Convert):
+                target_type = node.args.get("to")
+                source_expr = node.args.get("expression")
+                if target_type and source_expr:
+                    cast_node = exp.Cast(this=source_expr, to=target_type)
+                    node.replace(cast_node)
+            
+            # Mark HASHBYTES(...) nodes for special handling
+            if isinstance(node, exp.Anonymous) and (node.name or "").upper() == "HASHBYTES":
+                node.set("is_hashbytes", True)
+        
+        return root
+    
+    def _split_fqn(self, fqn: str):
+        """Split fully qualified name into database, schema, table components."""
+        parts = (fqn or "").split(".")
+        if len(parts) >= 3: 
+            return parts[0], parts[1], ".".join(parts[2:])
+        if len(parts) == 2: 
+            return (self.current_database or self.default_database), parts[0], parts[1]
+        return (self.current_database or self.default_database), "dbo", (parts[0] if parts else None)
+    
+    def _qualify_table(self, tbl: exp.Table) -> str:
+        """Get fully qualified table name from Table expression."""
+        name = tbl.name
+        sch = getattr(tbl, "db", None) or "dbo"
+        db = getattr(tbl, "catalog", None) or self.current_database or self.default_database
+        return ".".join([p for p in [db, sch, name] if p])
+    
+    def _build_alias_maps(self, select_exp: exp.Select):
+        """Build maps for table aliases and derived table columns."""
+        alias_map = {}       # alias_lower -> DB.sch.tbl
+        derived_cols = {}    # (alias_lower, out_col_lower) -> list[exp.Column] (base cols of subquery projection)
+
+        # Plain tables
+        for t in select_exp.find_all(exp.Table):
+            a = getattr(t, "alias", None) or t.args.get("alias")
+            alias = None
+            if a:
+                # Handle both string aliases and alias objects
+                if hasattr(a, "name"):
+                    alias = a.name.lower()
+                else:
+                    alias = str(a).lower()
+            fqn = self._qualify_table(t)
+            if alias: 
+                alias_map[alias] = fqn
+            alias_map[t.name.lower()] = fqn
+
+        # Derived tables (subqueries with alias)
+        for sq in select_exp.find_all(exp.Subquery):
+            a = getattr(sq, "alias", None) or sq.args.get("alias")
+            if not a: 
+                continue
+            # Handle both string aliases and alias objects
+            if hasattr(a, "name"):
+                alias = a.name.lower()
+            else:
+                alias = str(a).lower()
+            inner = sq.this if isinstance(sq.this, exp.Select) else None
+            if not inner:
+                continue
+            idx = 0
+            for proj in (inner.expressions or []):
+                if isinstance(proj, exp.Alias):
+                    out_name = (proj.alias or proj.alias_or_name)
+                    target = proj.this
+                else:
+                    out_name = f"col_{idx+1}"
+                    target = proj
+                key = (alias, (out_name or "").lower())
+                derived_cols[key] = list(target.find_all(exp.Column))
+                idx += 1
+
+        return alias_map, derived_cols
+    
+    def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
+        """Append a column reference to the output list after resolving aliases."""
+        qual = (col_exp.table or "").lower()
+        table_fqn = alias_map.get(qual)
+        if not table_fqn:
+            return
+        db, sch, tbl = self._split_fqn(table_fqn)
+        out_list.append(ColumnReference(
+            namespace=f"mssql://localhost/{db}" if db else "mssql://localhost",
+            table_name=table_fqn,  # Use full qualified name for consistency
+            column_name=col_exp.name
+        ))
+    
+    def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derived_cols: dict):
+        """Collect input column references for an expression, resolving derived table aliases."""
+        inputs = []
+        for col in expr.find_all(exp.Column):
+            qual = (col.table or "").lower()
+            key = (qual, col.name.lower())
+            base_cols = derived_cols.get(key)
+            if base_cols:
+                # This column comes from a derived table - use its base columns
+                for b in base_cols:
+                    self._append_column_ref(inputs, b, alias_map)
+                continue
+            # Regular table column
+            self._append_column_ref(inputs, col, alias_map)
+        return inputs
+    
+    def _get_schema(self, db: str, sch: str, tbl: str):
+        """Get schema information for a table."""
+        ns = f"mssql://localhost/{db}" if db else None
+        key = f"{sch}.{tbl}"
+        if hasattr(self.schema_registry, "get"):
+            return self.schema_registry.get(ns, key)
+        # Fallback for different registry implementations
+        return self.schema_registry.get((ns, key))
+    
+    def _type_of_column(self, col_exp, alias_map):
+        """Get the data type of a column from schema registry."""
+        qual = (getattr(col_exp, "table", None) or "").lower()
+        fqn = alias_map.get(qual)
+        if not fqn:
+            return None
+        db, sch, tbl = self._split_fqn(fqn)
+        schema = self._get_schema(db, sch, tbl)
+        if not schema:
+            return None
+        c = schema.get_column(col_exp.name)
+        return c.data_type if c else None
+    
+    def _infer_type(self, expr, alias_map) -> str:
+        """Infer data type for an expression."""
+        if isinstance(expr, exp.Cast):
+            t = expr.args.get("to")
+            return str(t) if t else "unknown"
+        if isinstance(expr, exp.Convert):
+            t = expr.args.get("to")
+            return str(t) if t else "unknown"
+        if isinstance(expr, (exp.Trim, exp.Upper, exp.Lower)):
+            base = expr.find(exp.Column)
+            return self._type_of_column(base, alias_map) or "nvarchar"
+        if isinstance(expr, exp.Coalesce):
+            types = []
+            for a in (expr.args.get("expressions") or []):
+                if isinstance(a, exp.Column):
+                    types.append(self._type_of_column(a, alias_map))
+                elif isinstance(a, exp.Literal):
+                    types.append("nvarchar" if a.is_string else "numeric")
+            tset = [t for t in types if t]
+            if any(t and "nvarchar" in t.lower() for t in tset): 
+                return "nvarchar"
+            if any(t and "varchar" in t.lower() for t in tset): 
+                return "varchar"
+            return tset[0] if tset else "unknown"
+        s = str(expr).upper()
+        if "HASHBYTES(" in s or "MD5(" in s:
+            return "binary(16)"
+        if isinstance(expr, exp.Column):
+            return self._type_of_column(expr, alias_map) or "unknown"
+        return "unknown"
+    
+    def _short_desc(self, expr) -> str:
+        """Generate a short transformation description."""
+        return " ".join(str(expr).split())[:250]
+    
+    def _extract_view_header_cols(self, create_exp) -> list[str]:
+        """Extract column names from CREATE VIEW (col1, col2, ...) AS pattern."""
+        exprs = getattr(create_exp, "expressions", None) or create_exp.args.get("expressions") or []
+        cols = []
+        for e in exprs:
+            n = getattr(e, "name", None)
+            if n: 
+                cols.append(str(n).strip("[]"))
+            else: 
+                cols.append(str(e).strip().strip("[]"))
+        return cols
+    
+    def _apply_view_header_names(self, create_exp, select_exp, obj: ObjectInfo):
+        """Apply header column names to view schema and lineage by position."""
+        header = self._extract_view_header_cols(create_exp)
+        if not header:
+            return
+        projs = list(select_exp.expressions or [])
+        for i, _ in enumerate(projs):
+            out_name = header[i] if i < len(header) else f"col_{i+1}"
+            # Update schema
+            if i < len(obj.schema.columns):
+                obj.schema.columns[i].name = out_name
+                obj.schema.columns[i].ordinal = i
+            else:
+                obj.schema.columns.append(ColumnSchema(
+                    name=out_name, 
+                    data_type="unknown", 
+                    nullable=True, 
+                    ordinal=i
+                ))
+            # Update lineage
+            if i < len(obj.lineage):
+                obj.lineage[i].output_column = out_name
+            else:
+                obj.lineage.append(ColumnLineage(
+                    output_column=out_name, 
+                    input_fields=[], 
+                    transformation_type=TransformationType.EXPRESSION, 
+                    transformation_description=""
+                ))
+    
     def set_default_database(self, default_database: Optional[str]):
         """Set the default database for qualification."""
         self.default_database = default_database
@@ -434,13 +661,18 @@ class SqlParser:
             
             # Preprocess the SQL content to handle demo script patterns
             # This will also extract and set current_database from USE statements
-            preprocessed_sql = self._preprocess_sql(sql_content)
+            normalized_sql = self._normalize_tsql(sql_content)
+            preprocessed_sql = self._preprocess_sql(normalized_sql)
             
             # For files with complex IF/ELSE blocks, also try string-based extraction
             # This is needed for demo scripts like 96_demo_usage_tvf_and_proc.sql
             string_deps = set()
             # Parse all SQL statements with SQLGlot
             statements = sqlglot.parse(preprocessed_sql, read=self.dialect)
+            
+            # Apply AST rewrites to improve parsing
+            if statements:
+                statements = [self._rewrite_ast(s) for s in statements]
             if not statements:
                 # If SQLGlot parsing fails completely, try to extract dependencies with string parsing
                 dependencies = self._extract_basic_dependencies(preprocessed_sql)
@@ -866,13 +1098,20 @@ class SqlParser:
         # Register schema for future reference
         self.schema_registry.register(schema)
         
-        return ObjectInfo(
+        # Create object
+        obj = ObjectInfo(
             name=view_name,
             object_type="view",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
         )
+        
+        # Apply header column names if CREATE VIEW (col1, col2, ...) AS pattern
+        if isinstance(select_stmt, exp.Select):
+            self._apply_view_header_names(statement, select_stmt, obj)
+        
+        return obj
     
     def _parse_create_function(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION statement (table-valued functions only)."""
@@ -1161,7 +1400,7 @@ class SqlParser:
         return dependencies
     
     def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
-        """Extract column lineage from SELECT or UNION statement."""
+        """Extract column lineage from SELECT or UNION statement using enhanced alias mapping."""
         lineage = []
         output_columns = []
         
@@ -1174,6 +1413,9 @@ class SqlParser:
             return lineage, output_columns
             
         select_stmt = stmt
+        
+        # Build alias maps for proper resolution
+        alias_map, derived_cols = self._build_alias_maps(select_stmt)
         
         # Try to get projections with fallback
         projections = list(getattr(select_stmt, 'expressions', None) or [])
@@ -1188,39 +1430,59 @@ class SqlParser:
         if self._has_union(select_stmt):
             return self._handle_union_lineage(select_stmt, view_name)
         
-        # Standard column-by-column processing
-        for i, select_expr in enumerate(projections):
-            if isinstance(select_expr, exp.Alias):
-                # Aliased column: SELECT column AS alias
-                output_name = str(select_expr.alias)
-                source_expr = select_expr.this
+        # Enhanced column-by-column processing
+        ordinal = 0
+        for proj in projections:
+            # Decide output name using enhanced logic
+            if isinstance(proj, exp.Alias):
+                out_name = proj.alias or proj.alias_or_name
+                inner = proj.this
             else:
-                # Direct column reference or expression
-                # For direct column references, extract just the column name
-                if isinstance(select_expr, exp.Column):
-                    output_name = str(select_expr.this)  # Just the column name, not table.column
-                else:
-                    output_name = str(select_expr)
-                source_expr = select_expr
+                # Generate smart fallback names based on expression type
+                s = str(proj).upper()
+                if "HASHBYTES(" in s or "MD5(" in s: 
+                    out_name = "hash_expr"
+                elif isinstance(proj, exp.Coalesce): 
+                    out_name = "coalesce_expr"
+                elif isinstance(proj, (exp.Trim, exp.Upper, exp.Lower)): 
+                    col = proj.find(exp.Column)
+                    out_name = (col.name if col else "text_expr")
+                elif isinstance(proj, (exp.Cast, exp.Convert)): 
+                    out_name = "cast_expr"
+                elif isinstance(proj, exp.Column): 
+                    out_name = proj.name
+                else: 
+                    out_name = "calc_expr"
+                inner = proj
+
+            # Collect input fields using enhanced resolution
+            inputs = self._collect_inputs_for_expr(inner, alias_map, derived_cols)
             
-            # Determine data type for ColumnSchema
-            data_type = "unknown"
-            if isinstance(source_expr, exp.Cast):
-                data_type = str(source_expr.to).upper()
+            # Infer output type using enhanced type system
+            out_type = self._infer_type(inner, alias_map)
             
-            # Create output column schema
-            output_columns.append(ColumnSchema(
-                name=output_name,
-                data_type=data_type,
-                nullable=True,
-                ordinal=i
+            # Determine transformation type
+            if isinstance(inner, (exp.Cast, exp.Convert)):
+                ttype = TransformationType.CAST
+            elif isinstance(inner, exp.Column):
+                ttype = TransformationType.IDENTITY
+            else:
+                ttype = TransformationType.EXPRESSION
+
+            # Create lineage and schema entries
+            lineage.append(ColumnLineage(
+                output_column=out_name,
+                input_fields=inputs,
+                transformation_type=ttype,
+                transformation_description=self._short_desc(inner),
             ))
-            
-            # Extract lineage for this column
-            col_lineage = self._analyze_expression_lineage(
-                output_name, source_expr, select_stmt
-            )
-            lineage.append(col_lineage)
+            output_columns.append(ColumnSchema(
+                name=out_name, 
+                data_type=out_type, 
+                nullable=True, 
+                ordinal=ordinal
+            ))
+            ordinal += 1
         
         return lineage, output_columns
     

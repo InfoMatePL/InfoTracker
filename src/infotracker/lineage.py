@@ -10,6 +10,17 @@ from typing import Dict, List, Any, Optional
 from .models import ObjectInfo, ColumnLineage, TransformationType
 
 
+def _ns_for_dep(dep: str, default_ns: str) -> str:
+    """Determine namespace for a dependency based on its database context."""
+    d = (dep or "").strip()
+    dl = d.lower()
+    if dl.startswith("tempdb..#") or dl.startswith("#"):
+        return "mssql://localhost/tempdb"
+    parts = d.split(".")
+    db = parts[0] if len(parts) >= 3 else None
+    return f"mssql://localhost/{db}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
+
+
 class OpenLineageGenerator:
     """Generates OpenLineage-compliant JSON from ObjectInfo."""
     
@@ -158,11 +169,8 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
     if obj.object_type == "procedure" and virtual_proc_outputs and obj.schema and obj.schema.columns:
         name = f"procedures.{obj.name}"
     
-    # Build inputs from dependencies with proper namespaces
-    def _ns_for(dep: str) -> str:
-        return "mssql://localhost/tempdb" if dep.startswith("tempdb..#") else "mssql://localhost/InfoTrackerDW"
-    
-    inputs = [{"namespace": _ns_for(dep), "name": dep} for dep in sorted(obj.dependencies)]
+    # Build inputs from dependencies with per-dependency namespaces
+    inputs = [{"namespace": _ns_for_dep(dep, ns), "name": dep} for dep in sorted(obj.dependencies)]
     
     # Build output facets
     facets = {}
