@@ -2597,14 +2597,27 @@ class SqlParser:
         for match in all_matches:
             table_name = match.strip()
             
+            # jeżeli to wzorzec funkcji: "NAME(...)" – pomiń
+            if re.search(r'\w+\s*\(', table_name):
+                continue
+            # wymagaj nazwy w postaci schemat.katalog lub przynajmniej identyfikatora bez słów kluczowych
+            if table_name.lower() in builtin_functions:
+                continue
+
             # Skip empty matches
             if not table_name:
                 continue
                 
             # Skip SQL keywords and built-in functions
             sql_keywords = {'into', 'procedure', 'function', 'table', 'view', 'select', 'where', 'order', 'group', 'having'}
-            builtin_functions = {'object_id', 'row_number', 'over', 'in', 'cast', 'decimal', 'getdate', 'count', 'sum', 'max', 'min', 'avg'}
-            
+            builtin_functions = {
+                'object_id','row_number','over','in','cast','convert','try_convert','decimal',
+                'getdate','sysdatetime','count','sum','max','min','avg',
+                'datediff','dateadd','format','isnull','coalesce','iif',
+                'len','charindex','left','right','substring','stuff','replace','upper','lower','trim',
+                'error_message','error_number','error_severity','error_state','error_line','suser_sname',
+                'exists','not','and','or','case','when','then','else','end'
+            }
             if table_name.lower() in sql_keywords or table_name.lower() in builtin_functions:
                 continue
                 

@@ -110,7 +110,7 @@ class OpenLineageGenerator:
     def _build_schema_facet(self, obj_info: ObjectInfo) -> Optional[Dict[str, Any]]:
         """Build schema facet from table schema."""
         # Skip schema facet for fallback objects to match expected format
-        if getattr(obj_info, 'is_fallback', False):
+        if getattr(obj_info, 'is_fallback', False) and obj_info.object_type not in ('table', 'temp_table'):
             return None
             
         fields = []
@@ -170,13 +170,20 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
         name = f"procedures.{obj.name}"
     
     # Build inputs from dependencies with per-dependency namespaces
-    inputs = [{"namespace": _ns_for_dep(dep, ns), "name": dep} for dep in sorted(obj.dependencies)]
-    
+    if obj.lineage:
+        input_pairs = {(f.namespace, f.table_name) 
+                    for ln in obj.lineage for f in ln.input_fields}
+        inputs = [{"namespace": ns, "name": name} for (ns, name) in sorted(input_pairs)]
+    else:
+        inputs = [{"namespace": _ns_for_dep(dep, ns), "name": dep} 
+                for dep in sorted(obj.dependencies)]
     # Build output facets
     facets = {}
     
     # Add schema facet if we have columns and it's not a fallback object
-    if obj.schema and obj.schema.columns and not getattr(obj, 'is_fallback', False):
+    if (obj.object_type in ('table', 'temp_table', 'procedure') 
+        and obj.schema and obj.schema.columns 
+        and not getattr(obj, 'is_fallback', False)):
         facets["schema"] = {
             "_producer": "https://github.com/OpenLineage/OpenLineage",
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
