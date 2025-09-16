@@ -303,7 +303,7 @@ class Engine:
             if not ready:
                 # Circular dependency or missing dependency - process remaining arbitrarily
                 ready = [next(iter(remaining.keys()))]
-                logger.warning("Circular or missing dependencies detected, processing: %s", ready[0])
+                logger.info("Circular or missing dependencies detected, processing: %s", ready[0])
             
             # Process ready nodes
             for node in ready:

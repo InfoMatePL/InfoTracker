@@ -572,7 +572,9 @@ class SqlParser:
     def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
         """Find the last SELECT statement in SQL content using SQLGlot AST."""
         try:
-            parsed = sqlglot.parse(sql_content, read=dialect)
+            normalized = self._normalize_tsql(sql_content)
+            preprocessed = self._preprocess_sql(normalized)
+            parsed = sqlglot.parse(preprocessed, read=self.dialect)
             selects = []
             for stmt in parsed:
                 selects.extend(list(stmt.find_all(exp.Select)))
@@ -2201,19 +2203,27 @@ class SqlParser:
         # First, check if this procedure has materialized outputs (SELECT INTO, INSERT INTO)
         # If so, return the materialized table instead of the procedure
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
+        # BACKFILL: spróbuj schematu z rejestru
+        ns = materialized_output.schema.namespace
+        tbl = materialized_output.schema.name
+        known = None
         if materialized_output:
-            # Extract dependencies and lineage for the materialized output
-            lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
-            
-            # Update the materialized output with lineage and dependencies
-            materialized_output.lineage = lineage
-            materialized_output.dependencies = dependencies
-            if output_columns:
-                materialized_output.schema = TableSchema(
-                    namespace=materialized_output.schema.namespace,
-                    name=materialized_output.name,
-                    columns=output_columns
-                )
+            if hasattr(self.schema_registry, "get"):
+                known = self.schema_registry.get(ns, tbl)
+            else:
+                known = self.schema_registry.get((ns, tbl))
+            if known and getattr(known, "columns", None):
+                materialized_output.schema = known
+            else:
+                # Fallback: wyciągnij listę kolumn z INSERT INTO (...), jeśli jest
+                cols = self._extract_insert_into_columns(sql_content)
+                if cols:
+                    materialized_output.schema = TableSchema(
+                        namespace=ns,
+                        name=tbl,
+                        columns=[ColumnSchema(name=c, data_type="unknown", nullable=True, ordinal=i)
+                                for i, c in enumerate(cols)]
+                    )
             return materialized_output
         
         # Fall back to regular procedure parsing if no materialized outputs
@@ -2361,6 +2371,23 @@ class SqlParser:
         
         return lineage, output_columns, dependencies
     
+    def _extract_insert_into_columns(self, sql_content: str) -> list[str]:
+        m = re.search(r'(?is)INSERT\s+INTO\s+[^\s(]+\s*\((.*?)\)', sql_content)
+        if not m:
+            return []
+        inner = m.group(1)
+        cols = []
+        for raw in inner.split(','):
+            col = raw.strip()
+            # zbij aliasy i nawiasy, zostaw samą nazwę
+            col = col.split('.')[-1]
+            col = re.sub(r'[^\w]', '', col)
+            if col:
+                cols.append(col)
+        return cols
+
+
+
     def _extract_first_create_statement(self, sql_content: str, statement_type: str) -> str:
         """Extract the first CREATE statement of the specified type."""
         patterns = {
