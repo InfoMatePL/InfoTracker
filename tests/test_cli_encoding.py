@@ -204,8 +204,9 @@ ORDER BY year, month;
 
 def test_cli_help_shows_encoding_option(runner):
     """Test that CLI help shows encoding option with choices."""
-    result = runner.invoke(app, ['extract', '--help'])
     
+    result = runner.invoke(app, ['extract', '--help'], env={'NO_COLOR':'1', 'PY_COLORS':'0', 'TERM':'dumb'})
+
     assert result.exit_code == 0
     assert '--encoding' in result.stdout
     assert '-e' in result.stdout
