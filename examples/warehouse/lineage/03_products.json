@@ -16,7 +16,7 @@
             { "name": "ProductID", "type": "int" },
             { "name": "ProductName", "type": "nvarchar(100)" },
             { "name": "Category", "type": "nvarchar(50)" },
-            { "name": "UnitPrice", "type": "decimal(10,2)" }
+            { "name": "Price", "type": "decimal(10,2)" }
           ]
         }
       }

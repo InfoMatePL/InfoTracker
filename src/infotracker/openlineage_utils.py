@@ -163,3 +163,19 @@ def qualify_identifier(identifier: str, default_database: Optional[str] = None) 
     else:
         # Already fully qualified
         return identifier
+
+
+def sanitize_name(name: str) -> str:
+    """Sanitize object name by removing trailing semicolons and whitespace.
+    
+    Args:
+        name: Object name to sanitize
+        
+    Returns:
+        Sanitized name
+    """
+    if not name:
+        return name
+    
+    # Remove trailing semicolons and whitespace
+    return name.rstrip(';').strip()

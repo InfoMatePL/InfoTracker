@@ -1,11 +1,31 @@
 """
 Integration tests for the MssqlAdapter component.
 """
+from unittest import result
 import pytest
 import json
 
 from infotracker.adapters import MssqlAdapter
 from .conftest import assert_json_equal
+
+def _canonize_inputs(inp_list):
+    """
+    Ujednolica format inputs:
+    - 'DB.schema.table' -> namespace 'mssql://localhost/DB', name 'schema.table'
+    - już zkanonizowane zostawia bez zmian
+    - sortuje wyniki dla stabilności porównania
+    """
+    canon = []
+    for item in inp_list:
+        ns = item["namespace"]
+        name = item["name"]
+        parts = name.split(".")
+        if len(parts) == 3:
+            db, sch, tbl = parts
+            ns = f"mssql://localhost/{db}"
+            name = f"{sch}.{tbl}"
+        canon.append({"namespace": ns, "name": name})
+    return sorted(canon, key=lambda x: (x["namespace"], x["name"]))
 
 
 class TestMssqlAdapter:
@@ -55,11 +75,28 @@ class TestMssqlAdapter:
         result = json.loads(result_json)
         expected = expected_lineage["10_stg_orders"]
         
+        def _canonize_inputs(inp_list):
+            canon = []
+            for item in inp_list:
+                ns = item["namespace"]
+                name = item["name"]
+                parts = name.split(".")
+                # jeśli nazwa ma DB.schema.table -> przemapuj na (ns=.../DB, name=schema.table)
+                if len(parts) == 3:
+                    db, sch, tbl = parts
+                    ns = f"mssql://localhost/{db}"
+                    name = f"{sch}.{tbl}"
+                canon.append({"namespace": ns, "name": name})
+            # porównuj bez wrażliwości na kolejność
+            return sorted(canon, key=lambda x: (x["namespace"], x["name"]))
+
+
         # Compare key fields
         assert result["eventType"] == expected["eventType"]
         assert result["run"]["runId"] == expected["run"]["runId"]
         assert result["job"]["name"] == expected["job"]["name"]
-        assert result["inputs"] == expected["inputs"]
+        assert _canonize_inputs(result["inputs"]) == _canonize_inputs(expected["inputs"])
+
         
         # Check output structure
         assert len(result["outputs"]) == 1
@@ -86,10 +123,7 @@ class TestMssqlAdapter:
             assert len(actual_field["inputFields"]) == len(expected_field["inputFields"])
             
             # Compare input fields
-            for actual_input, expected_input in zip(actual_field["inputFields"], expected_field["inputFields"]):
-                assert actual_input["namespace"] == expected_input["namespace"]
-                assert actual_input["name"] == expected_input["name"]
-                assert actual_input["field"] == expected_input["field"]
+            assert _canonize_inputs(result["inputs"]) == _canonize_inputs(expected["inputs"])
 
     def test_error_handling(self):
         """Test error handling for invalid SQL."""

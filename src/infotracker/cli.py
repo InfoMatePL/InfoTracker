@@ -12,6 +12,7 @@ from rich.table import Table
 
 from .config import load_config, RuntimeConfig
 from .engine import ExtractRequest, ImpactRequest, DiffRequest, Engine
+from .io_utils import get_supported_encodings
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="InfoTracker CLI")
@@ -54,8 +55,16 @@ def extract(
     fail_on_warn: bool = typer.Option(False),
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
     exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
+    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files", show_choices=True),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    
+    # Validate encoding
+    supported = get_supported_encodings()
+    if encoding not in supported:
+        console.print(f"[red]ERROR: Unsupported encoding '{encoding}'. Supported: {', '.join(supported)}[/red]")
+        raise typer.Exit(1)
+    
     engine = Engine(cfg)
     req = ExtractRequest(
         sql_dir=sql_dir or Path(cfg.sql_dir),
@@ -65,6 +74,7 @@ def extract(
         include=include or cfg.include,
         exclude=exclude or cfg.exclude,
         fail_on_warn=fail_on_warn,
+        encoding=encoding,
     )
     result = engine.run_extract(req)
     _emit(result, cfg.output_format)
