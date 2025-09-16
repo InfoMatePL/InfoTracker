@@ -20,6 +20,10 @@ def _ns_for_dep(dep: str, default_ns: str) -> str:
     db = parts[0] if len(parts) >= 3 else None
     return f"mssql://localhost/{db}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
 
+def _strip_db_prefix(name: str) -> str:
+    parts = (name or "").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
+
 
 class OpenLineageGenerator:
     """Generates OpenLineage-compliant JSON from ObjectInfo."""
@@ -171,12 +175,21 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
     
     # Build inputs from dependencies with per-dependency namespaces
     if obj.lineage:
-        input_pairs = {(f.namespace, f.table_name) 
-                    for ln in obj.lineage for f in ln.input_fields}
-        inputs = [{"namespace": ns, "name": name} for (ns, name) in sorted(input_pairs)]
+        input_pairs = {
+            (f.namespace, f.table_name)
+            for ln in obj.lineage
+            for f in ln.input_fields
+            if getattr(f, "namespace", None) and getattr(f, "table_name", None)
+        }
+        if input_pairs:
+            inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(input_pairs)]
+        else:
+            inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
+                      for dep in sorted(obj.dependencies)]
     else:
-        inputs = [{"namespace": _ns_for_dep(dep, ns), "name": dep} 
-                for dep in sorted(obj.dependencies)]
+        inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
+                  for dep in sorted(obj.dependencies)]
+
     # Build output facets
     facets = {}
     

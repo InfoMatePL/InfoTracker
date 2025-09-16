@@ -1079,12 +1079,27 @@ class SqlParser:
         table_name = self._get_full_table_name(self._normalize_table_ident(m.group(1))) if m else (object_hint or "dbo.unknown_table")
         namespace = "mssql://localhost/InfoTrackerDW"
 
-        # 2) Wyciągnij definicję kolumn (wnętrze pierwszych nawiasów po CREATE TABLE)
-        body = ""
-        b = re.search(r'(?is)CREATE\s+TABLE\s+[^\(]+\((.*)\)', sql)
-        if b:
-            # utnij po zamknięciu pierwszego poziomu nawiasów (na wszelki)
-            body = b.group(1)
+        # 2) Wyciągnij definicję kolumn (balansowane nawiasy od pierwszego '(' po nazwie)
+        s = self._normalize_tsql(sql)
+        m = re.search(r'(?is)\bCREATE\s+TABLE\s+([^\s(]+)', s)
+        start = s.find('(', m.end()) if m else -1
+        if start == -1:
+            schema = TableSchema(namespace=namespace, name=table_name, columns=[])
+            self.schema_registry.register(schema)
+            return ObjectInfo(name=table_name, object_type="table", schema=schema, lineage=[], dependencies=set())
+
+        depth, i, end = 0, start, len(s)
+        while i < len(s):
+            ch = s[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        body = s[start+1:end]
 
         # 3) Podziel na wiersze definicji kolumn (odetnij constrainty tabelowe)
         lines = []
@@ -1115,8 +1130,14 @@ class SqlParser:
             rest = m.group(4)
 
             # typ: pierwszy token (może być typu NVARCHAR(100) itp.) — bierz nazwę typu + (opcjonalnie) długość
-            t = re.match(r'(?i)\s*([A-Za-z_][\w$]*)(\s*\([^\)]*\))?', rest)
-            dtype = (t.group(1) + (t.group(2) or '')).strip().lower() if t else "unknown"
+            # typ:  lub varchar(32)
+            t = re.match(r'(?i)\s*(?:\[(?P<t1>[^\]]+)\]|(?P<t2>[A-Za-z_][\w$]*))\s*(?:\(\s*(?P<args>[^)]*?)\s*\))?', rest)
+            if t:
+                tname = (t.group('t1') or t.group('t2') or '').upper()
+                targs = t.group('args')
+                dtype = f"{tname}({targs})" if targs else tname
+            else:
+                dtype = "UNKNOWN"
 
             # nullable / not null
             nullable = not re.search(r'(?i)\bNOT\s+NULL\b', rest)
@@ -2172,6 +2193,8 @@ class SqlParser:
     
     def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE PROCEDURE using string-based approach."""
+        # Znormalizuj nagłówki SET/GO, COLLATE itd.
+        sql_content = self._normalize_tsql(sql_content)
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
         namespace = "mssql://localhost/InfoTrackerDW"
         
@@ -2607,7 +2630,32 @@ class SqlParser:
         # Match schema.table.name or table patterns
         from_pattern = r'FROM\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
         join_pattern = r'JOIN\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
-        
+        update_pattern = r'UPDATE\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
+        delete_from_pattern = r'DELETE\s+FROM\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
+        merge_into_pattern = r'MERGE\s+INTO\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
+
+
+        sql_keywords = {
+            'select','from','join','on','where','group','having','order','into',
+            'update','delete','merge','as','and','or','not','case','when','then','else',
+            'distinct','top','with','nolock','commit','rollback','transaction','begin','try','catch','exists'
+        }
+        builtin_functions = {
+            'getdate','sysdatetime','xact_state','row_number','count','sum','min','max','avg',
+            'cast','convert','try_convert','coalesce','isnull','iif','len','substring','replace',
+            'upper','lower','ltrim','rtrim','trim','dateadd','datediff','format','hashbytes','md5'
+        }
+        sql_types = {
+            'varchar','nvarchar','char','nchar','text','ntext',
+            'int','bigint','smallint','tinyint','numeric','decimal','money','smallmoney','float','real',
+            'bit','binary','varbinary','image',
+            'datetime','datetime2','smalldatetime','date','time','datetimeoffset',
+            'uniqueidentifier','xml','cursor','table'
+        }
+
+        update_matches = re.findall(update_pattern, cleaned_sql, re.IGNORECASE)
+        delete_matches = re.findall(delete_from_pattern, cleaned_sql, re.IGNORECASE)
+        merge_matches  = re.findall(merge_into_pattern, cleaned_sql, re.IGNORECASE)
         from_matches = re.findall(from_pattern, cleaned_sql, re.IGNORECASE)
         join_matches = re.findall(join_pattern, cleaned_sql, re.IGNORECASE)
         
@@ -2659,19 +2707,9 @@ class SqlParser:
                     insert_targets.add(simplified)
         
         # Process tables, functions, and procedures
-        all_matches = from_matches + join_matches + function_matches + exec_matches + select_matches
+        all_matches = from_matches + join_matches + update_matches + delete_matches + merge_matches + exec_matches
         for match in all_matches:
             table_name = match.strip()
-            
-            sql_keywords = {'into', 'procedure', 'function', 'table', 'view', 'select', 'where', 'order', 'group', 'having'}
-            builtin_functions = {
-                'object_id','row_number','over','in','cast','convert','try_convert','decimal',
-                'getdate','sysdatetime','count','sum','max','min','avg',
-                'datediff','dateadd','format','isnull','coalesce','iif',
-                'len','charindex','left','right','substring','stuff','replace','upper','lower','trim',
-                'error_message','error_number','error_severity','error_state','error_line','suser_sname',
-                'exists','not','and','or','case','when','then','else','end'
-            }
 
             # jeżeli to wzorzec funkcji: "NAME(...)" – pomiń
             if re.search(r'\w+\s*\(', table_name):
@@ -2686,7 +2724,7 @@ class SqlParser:
                 
             # Skip SQL keywords and built-in functions
             
-            if table_name.lower() in sql_keywords or table_name.lower() in builtin_functions:
+            if table_name.lower() in sql_keywords or table_name.lower() in builtin_functions or table_name.lower() in sql_types:
                 continue
                 
             # Remove table alias if present (e.g., "table AS t" -> "table")
