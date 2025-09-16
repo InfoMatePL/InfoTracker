@@ -18,6 +18,7 @@ from .io_utils import get_supported_encodings
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="InfoTracker CLI")
 console = Console()
 
+logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
 def version_callback(value: bool):
     from . import __version__
