@@ -2274,55 +2274,72 @@ class SqlParser:
 
 
     def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> Optional[ObjectInfo]:
-        """Extract materialized output (SELECT INTO, INSERT INTO) from procedure using string parsing."""
-        # Filter out comment lines to avoid false positives
-        lines = sql_content.split('\n')
-        sql_lines = [line for line in lines if not line.strip().startswith('--')]
-        filtered_content = '\n'.join(sql_lines)
-        
-        # Look for SELECT ... INTO patterns (persistent tables only)
-        select_into_pattern = r'(?i)SELECT\s+.*?\s+INTO\s+([^\s,\r\n]+)'
-        select_into_matches = re.findall(select_into_pattern, filtered_content, re.DOTALL)
-        
-        for table_match in select_into_matches:
-            table_name = table_match.strip()
-            # Skip temp tables
-            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-                normalized_name = self._normalize_table_name_for_output(table_name)
-                return ObjectInfo(
-                    name=normalized_name,
-                    object_type="table",
-                    schema=TableSchema(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        name=normalized_name,
-                        columns=[]
-                    ),
-                    lineage=[],
-                    dependencies=set()
-                )
-        
-        # Look for INSERT INTO patterns (persistent tables only)
-        insert_into_pattern = r'(?i)INSERT\s+INTO\s+([^\s,\(\r\n]+)'
-        insert_into_matches = re.findall(insert_into_pattern, filtered_content)
-        
-        for table_match in insert_into_matches:
-            table_name = table_match.strip()
-            # Skip temp tables
-            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-                normalized_name = self._normalize_table_name_for_output(table_name)
-                return ObjectInfo(
-                    name=normalized_name,
-                    object_type="table",
-                    schema=TableSchema(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        name=normalized_name,
-                        columns=[]
-                    ),
-                    lineage=[],
-                    dependencies=set()
-                )
-        
+        """
+        Extract materialized output (SELECT INTO, INSERT INTO) from a procedure body.
+        - Zwraca ObjectInfo typu "table" z pełną nazwą DB.schema.table i poprawnym namespace.
+        - Nie używa _normalize_table_name_for_output (nie gubimy DB).
+        """
+        import re
+        from .models import ObjectInfo, TableSchema  # lokalny import dla pewności
+
+        # 1) Normalizacja i usunięcie komentarzy (żeby regexy nie łapały śmieci)
+        s = self._normalize_tsql(sql_content)
+        s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)  # block comments
+        lines = s.splitlines()
+        s = "\n".join(line for line in lines if not line.lstrip().startswith('--'))
+
+        # Helper: z tokena tabeli zbuduj pełną nazwę i namespace
+        def _to_obj(table_token: str) -> Optional[ObjectInfo]:
+            tok = (table_token or "").strip().rstrip(';')
+            # temp tables out
+            if tok.startswith('#') or tok.lower().startswith('tempdb..#'):
+                return None
+            # 1) znormalizuj identyfikator (zdejmij []/"")
+            norm = self._normalize_table_ident(tok)                  # np. EDW_CORE.dbo.LeadPartner_ref
+            # 2) pełna nazwa z DB (jeśli brak, dołóż current/default)
+            full_name = self._get_full_table_name(norm)              # -> DB.schema.table
+            # 3) namespace z DB
+            try:
+                db, sch, tbl = self._split_fqn(full_name)            # -> (DB, schema, table)
+            except Exception:
+                # awaryjnie: spróbuj rozbić ręcznie
+                parts = full_name.split('.')
+                if len(parts) == 3:
+                    db, sch, tbl = parts
+                elif len(parts) == 2:
+                    db = (self.current_database or self.default_database or "InfoTrackerDW")
+                    sch, tbl = parts
+                    full_name = f"{db}.{sch}.{tbl}"
+                else:
+                    db = (self.current_database or self.default_database or "InfoTrackerDW")
+                    sch = "dbo"
+                    tbl = parts[0]
+                    full_name = f"{db}.{sch}.{tbl}"
+            ns = f"mssql://localhost/{db or (self.current_database or self.default_database or 'InfoTrackerDW')}"
+
+            return ObjectInfo(
+                name=full_name,
+                object_type="table",
+                schema=TableSchema(namespace=ns, name=full_name, columns=[]),
+                lineage=[],
+                dependencies=set()
+            )
+
+        # 2) SELECT ... INTO <table>
+        #    (łapiemy pierwszy „persistent” match)
+        for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
+            obj = _to_obj(m.group(1))
+            if obj:
+                return obj
+
+        # 3) INSERT INTO <table> [ (cols...) ] SELECT ...
+        for m in re.finditer(r'(?is)\bINSERT\s+INTO\s+([^\s,()\r\n;]+)', s):
+            obj = _to_obj(m.group(1))
+            if obj:
+                return obj
+
         return None
+
     
     def _extract_function_name(self, sql_content: str) -> Optional[str]:
         """Extract function name from CREATE FUNCTION statement."""
