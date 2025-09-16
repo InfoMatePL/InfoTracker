@@ -164,7 +164,7 @@ class OpenLineageGenerator:
         }
 
 
-def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_outputs=False) -> dict:
+def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_metrics: bool = False, virtual_proc_outputs: bool = False) -> dict:
     """Emit OpenLineage JSON directly from ObjectInfo without re-parsing."""
     ns = obj.schema.namespace if obj.schema else "mssql://localhost/InfoTrackerDW"
     name = obj.schema.name if obj.schema else obj.name
@@ -242,7 +242,7 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
         "run": {"runId": "00000000-0000-0000-0000-000000000000"},
         "job": {
         "namespace": "infotracker/examples",
-        "name": getattr(obj, "job_name", f"warehouse/sql/{obj.name}.sql")
+        "name": job_name or getattr(obj, "job_name", f"warehouse/sql/{obj.name}.sql")
         },
         "inputs": inputs,
         "outputs": [{
