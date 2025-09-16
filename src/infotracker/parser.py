@@ -1558,10 +1558,18 @@ class SqlParser:
             # Determine transformation type
             if isinstance(inner, (exp.Cast, exp.Convert)):
                 ttype = TransformationType.CAST
+            elif isinstance(inner, exp.Case):
+                ttype = TransformationType.CASE
             elif isinstance(inner, exp.Column):
                 ttype = TransformationType.IDENTITY
             else:
-                ttype = TransformationType.EXPRESSION
+                # IIF(...) bywa mapowane przez sqlglot do CASE; na wszelki wypadek:
+                s = str(inner).upper()
+                if s.startswith("CASE ") or s.startswith("CASEWHEN ") or s.startswith("IIF("):
+                    ttype = TransformationType.CASE
+                else:
+                    ttype = TransformationType.EXPRESSION
+
 
             # Create lineage and schema entries
             lineage.append(ColumnLineage(
