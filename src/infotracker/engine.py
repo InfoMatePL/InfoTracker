@@ -148,7 +148,7 @@ class Engine:
         sql_file_map: Dict[str, Path] = {}  # object_name -> file_path
 
         ignore_patterns: List[str] = list(getattr(self.config, "ignore", []) or [])
-
+        
         # Phase 1: Parse all SQL files and collect objects
         for sql_path in sql_files:
             try:

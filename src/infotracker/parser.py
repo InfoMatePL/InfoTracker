@@ -778,8 +778,13 @@ class SqlParser:
             
             # Sanitize all input names
             all_inputs = {sanitize_name(dep) for dep in all_inputs if dep}
-            
-            # Determine the main object
+            def _strip_db(name: str) -> str:
+                parts = (name or "").split(".")
+                return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
+
+            out_key = _strip_db(sanitize_name(last_persistent_output.schema.name or last_persistent_output.name))
+            all_inputs = {d for d in all_inputs if _strip_db(sanitize_name(d)) != out_key}
+                # Determine the main object
             if last_persistent_output:
                 # Use the last persistent output as the main object
                 main_object = last_persistent_output
@@ -2199,45 +2204,64 @@ class SqlParser:
         sql_content = self._normalize_tsql(sql_content)
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
         namespace = "mssql://localhost/InfoTrackerDW"
-        
-        # First, check if this procedure has materialized outputs (SELECT INTO, INSERT INTO)
-        # If so, return the materialized table instead of the procedure
+
+        # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
-        # BACKFILL: spróbuj schematu z rejestru
-        ns = materialized_output.schema.namespace
-        tbl = materialized_output.schema.name
-        known = None
         if materialized_output:
+            # 1a) Wyciągnij zależności ze SELECT-a po INSERT (żeby inputs nie były puste)
+            #     Najpierw spróbuj mocniej (parsuj SELECT po INSERT), potem fallback prosty.
+            try:
+                lineage_sel, _, deps_sel = self._extract_procedure_lineage_string(sql_content, procedure_name)
+                if deps_sel:
+                    materialized_output.dependencies = set(deps_sel)
+            except Exception:
+                basic_deps = self._extract_basic_dependencies(sql_content)
+                if basic_deps:
+                    materialized_output.dependencies = set(basic_deps)
+
+            # 1b) BACKFILL schematu z rejestru (obsłuż warianty nazw z/bez prefiksu DB)
+            ns = materialized_output.schema.namespace
+            name_key = materialized_output.schema.name  # np. "dbo.LeadPartner_ref" albo "InfoTrackerDW.dbo.LeadPartner_ref"
+            known = None
             if hasattr(self.schema_registry, "get"):
-                known = self.schema_registry.get(ns, tbl)
+                # spróbuj 1: jak jest
+                known = self.schema_registry.get(ns, name_key)
+                # spróbuj 2: dołóż prefiks DB jeśli brakuje
+                if not known:
+                    db = (self.current_database or self.default_database or "InfoTrackerDW")
+                    parts = name_key.split(".")
+                    if len(parts) == 2:  # schema.table -> spróbuj DB.schema.table
+                        name_with_db = f"{db}.{name_key}"
+                        known = self.schema_registry.get(ns, name_with_db)
             else:
-                known = self.schema_registry.get((ns, tbl))
+                known = self.schema_registry.get((ns, name_key))
+
             if known and getattr(known, "columns", None):
                 materialized_output.schema = known
             else:
-                # Fallback: wyciągnij listę kolumn z INSERT INTO (...), jeśli jest
+                # 1c) Fallback: kolumny z listy INSERT INTO (…)
                 cols = self._extract_insert_into_columns(sql_content)
                 if cols:
                     materialized_output.schema = TableSchema(
                         namespace=ns,
-                        name=tbl,
+                        name=name_key,
                         columns=[ColumnSchema(name=c, data_type="unknown", nullable=True, ordinal=i)
                                 for i, c in enumerate(cols)]
                     )
+
             return materialized_output
-        
-        # Fall back to regular procedure parsing if no materialized outputs
+
+        # 2) Jeśli nie materializuje — standard: ostatni SELECT jako „wirtualny” dataset procedury
         lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
-        
+
         schema = TableSchema(
             namespace=namespace,
             name=procedure_name,
             columns=output_columns
         )
-        
-        # Register schema for future reference
+
         self.schema_registry.register(schema)
-        
+
         obj = ObjectInfo(
             name=procedure_name,
             object_type="procedure",
@@ -2247,6 +2271,7 @@ class SqlParser:
         )
         obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
         return obj
+
 
     def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> Optional[ObjectInfo]:
         """Extract materialized output (SELECT INTO, INSERT INTO) from procedure using string parsing."""
@@ -2348,7 +2373,20 @@ class SqlParser:
         lineage = []
         output_columns = []
         dependencies = set()
-        
+        m = re.search(r'(?is)INSERT\s+INTO\s+[^\s(]+(?:\s*\([^)]*\))?\s+SELECT\b(.*)$', sql_content)
+        if m:
+            select_sql = "SELECT " + m.group(1)
+            try:
+                parsed = sqlglot.parse(select_sql, read=self.dialect)
+                if parsed and isinstance(parsed[0], exp.Select):
+                    lineage, output_columns = self._extract_column_lineage(parsed[0], procedure_name)
+                    deps = self._extract_dependencies(parsed[0])
+                    dependencies.update(deps)
+            except Exception:
+                # Fallback: chociaż dependencies ze string-parsera
+                dependencies.update(self._extract_basic_dependencies(select_sql))
+
+
         # For procedures, extract dependencies from all SQL statements in the procedure body
         # First try to find the last SELECT statement for lineage
         last_select_sql = self._find_last_select_string(sql_content)

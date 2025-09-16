@@ -67,18 +67,18 @@ class OpenLineageGenerator:
     def _build_inputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
         """Build inputs array from object dependencies."""
         inputs = []
-        
         for dep_name in sorted(obj_info.dependencies):
-            # Use consistent temp table namespace
-            if dep_name.startswith('tempdb..#'):
-                namespace = "mssql://localhost/tempdb"
-            else:
-                namespace = self.namespace
-                
-            inputs.append({
-                "namespace": namespace,
-                "name": dep_name
-            })
+             # tempdb: stały namespace
+             if dep_name.startswith('tempdb..#'):
+                 namespace = "mssql://localhost/tempdb"
+             else:
+                 parts = dep_name.split('.')
+                 db = parts[0] if len(parts) >= 3 else None
+                 namespace = f"mssql://localhost/{db}" if db else self.namespace
+             # w name trzymaj schema.table (bez prefiksu DB)
+             name = ".".join(dep_name.split(".")[-2:]) if "." in dep_name else dep_name
+             inputs.append({"namespace": namespace, "name": name})
+
         
         return inputs
     
@@ -240,7 +240,10 @@ def emit_ol_from_object(obj: ObjectInfo, quality_metrics=False, virtual_proc_out
         "eventType": "COMPLETE", 
         "eventTime": datetime.now().isoformat()[:19] + "Z",
         "run": {"runId": "00000000-0000-0000-0000-000000000000"},
-        "job": {"namespace": "infotracker/examples", "name": f"warehouse/sql/{obj.name}.sql"},
+        "job": {
+        "namespace": "infotracker/examples",
+        "name": getattr(obj, "job_name", f"warehouse/sql/{obj.name}.sql")
+        },
         "inputs": inputs,
         "outputs": [{
             "namespace": ns,
