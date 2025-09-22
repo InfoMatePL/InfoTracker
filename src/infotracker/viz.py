@@ -11,49 +11,101 @@ def _load_edges(graph_path: Path):
     return data.get("edges", [])
 
 def _build_elements(edges):
-    nodes = {}
+    """
+    Zwraca (nodes, cy_edges) w układzie compound:
+    - node kind="table"  (parent)
+    - node kind="column" (child, parent=<table_id>)
+    - edges: kolumna -> kolumna
+    """
+    tables = {}   # table_id -> {'data':{...}, 'cols':set()}
+    cols   = {}   # col_id   -> node
+
+    def parse_triplet(uri: str):
+        ns_tbl, col = uri.rsplit(".", 1)
+        ns, tbl = ns_tbl.rsplit(".", 1)
+        return ns, tbl, col
+
+    def table_id(ns, tbl):
+        return f"{ns}.{tbl}".lower()
+
+    def col_id(ns, tbl, col):
+        return f"{ns}.{tbl}.{col}".lower()
+
     cy_edges = []
 
     for e in edges:
-        f_ns, f_tbl, f_col = e["from"].rsplit(".", 2)
-        t_ns, t_tbl, t_col = e["to"].rsplit(".", 2)
+        f_ns, f_tbl, f_col = parse_triplet(e["from"])
+        t_ns, t_tbl, t_col = parse_triplet(e["to"])
 
-        f_id = _make_id(f_ns, f_tbl, f_col)
-        t_id = _make_id(t_ns, t_tbl, t_col)
+        f_tid = table_id(f_ns, f_tbl)
+        t_tid = table_id(t_ns, t_tbl)
+        f_cid = col_id(f_ns, f_tbl, f_col)
+        t_cid = col_id(t_ns, t_tbl, t_col)
 
-        # węzły
-        if f_id not in nodes:
-            nodes[f_id] = {
+        # Tabele (parent nodes)
+        if f_tid not in tables:
+            tables[f_tid] = {
                 "data": {
-                    "id": f_id,
+                    "id": f_tid,
+                    "label": f_tbl,
+                    "full": f"{f_ns}.{f_tbl}",
+                    "kind": "table",
+                    "ncols": 0
+                }
+            }
+        if t_tid not in tables:
+            tables[t_tid] = {
+                "data": {
+                    "id": t_tid,
+                    "label": t_tbl,
+                    "full": f"{t_ns}.{t_tbl}",
+                    "kind": "table",
+                    "ncols": 0
+                }
+            }
+
+        # Kolumny (child nodes)
+        if f_cid not in cols:
+            cols[f_cid] = {
+                "data": {
+                    "id": f_cid,
                     "label": f_col,
+                    "full": f"{f_ns}.{f_tbl}.{f_col}",
                     "table": f_tbl,
                     "ns": f_ns,
-                    "full": f"{f_ns}.{f_tbl}.{f_col}"
+                    "kind": "column",
+                    "parent": f_tid
                 }
             }
-        if t_id not in nodes:
-            nodes[t_id] = {
+            tables[f_tid]["data"]["ncols"] += 1
+
+        if t_cid not in cols:
+            cols[t_cid] = {
                 "data": {
-                    "id": t_id,
+                    "id": t_cid,
                     "label": t_col,
+                    "full": f"{t_ns}.{t_tbl}.{t_col}",
                     "table": t_tbl,
                     "ns": t_ns,
-                    "full": f"{t_ns}.{t_tbl}.{t_col}"
+                    "kind": "column",
+                    "parent": t_tid
                 }
             }
+            tables[t_tid]["data"]["ncols"] += 1
 
-        # krawędź kierunkowa
+        # Krawędź (kolumna -> kolumna)
         cy_edges.append({
             "data": {
-                "source": f_id,
-                "target": t_id,
+                "source": f_cid,
+                "target": t_cid,
                 "type": e.get("transformation", "IDENTITY"),
                 "desc": e.get("description", "")
             }
         })
 
-    return list(nodes.values()), cy_edges
+    nodes = list(tables.values()) + list(cols.values())
+    return nodes, cy_edges
+
 
 HTML_TMPL = """<!doctype html>
 <html lang="en">
@@ -90,35 +142,45 @@ const NODES = __NODES__;
 const EDGES = __EDGES__;
 const data  = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 
-function applyLayout(cy, roots) {
-  cy.layout({
-    name: 'fcose',
-    animate: false,
-    gravity: 1.0,
-    idealEdgeLength: 80,
-    nodeSeparation: 60
-  }).run();
-  if (roots && roots.length) { cy.fit( cy.collection(roots), 60 ); }
-  else { cy.fit( cy.elements(), 40 ); }
-}
-
 const cy = cytoscape({
   container: document.getElementById('cy'),
   elements: NODES.concat(EDGES),
   style: [
-    { selector: 'node', style: {
+    // TABELA (parent)
+    { selector: 'node[kind = "table"]', style: {
         'content': 'data(label)',
-        'font-size': 10,
-        'text-wrap': 'wrap',
-        'text-max-width': 120,
-        'background-color': '#9ecae1',
+        'font-size': 12,
+        'text-valign': 'top',
+        'text-halign': 'center',
+        'text-margin-y': 6,
+        'background-color': '#cce3ba',
         'border-width': 1,
-        'border-color': '#6baed6'
+        'border-color': '#7aa35a',
+        'shape': 'round-rectangle',
+        'padding': '8px',
+        'z-compound-depth': 'bottom'  // tło pod dziećmi
     }},
+    // KOLUMNA (child)
+    { selector: 'node[kind = "column"]', style: {
+        'content': 'data(label)',
+        'font-size': 11,
+        'shape': 'rectangle',
+        'background-color': '#fff',
+        'border-width': 1,
+        'border-color': '#ddd',
+        'text-valign': 'center',
+        'text-halign': 'left',
+        'text-margin-x': 8,
+        'width': 180,   /* nadpisywane w layoutTables */
+        'height': 18    /* j.w. */
+    }},
+    // KRAWĘDZIE
     { selector: 'edge', style: {
         'target-arrow-shape': 'triangle',
         'curve-style': 'bezier',
-        'width': 1
+        'width': 1.2,
+        'line-color': '#9ca3af',
+        'target-arrow-color': '#9ca3af'
     }},
     { selector: 'edge[type = "IDENTITY"]',   style: { 'line-style':'solid' } },
     { selector: 'edge[type = "CAST"]',       style: { 'line-style':'dashed' } },
@@ -128,17 +190,66 @@ const cy = cytoscape({
   ]
 });
 
+// --- Layout: tabele układa fcose, kolumny układamy ręcznie w środku rodzica ---
+function layoutTables() {
+  const ROW_H = 22;         // wysokość wiersza
+  const HEADER = 24;        // nagłówek tabeli
+  const WIDTH = 200;        // szerokość tabeli
+  const PAD = 8;
+
+  cy.batch(() => {
+    cy.nodes('[kind = "table"]').forEach(t => {
+      const cols = t.children('[kind = "column"]');
+      const n = cols.length;
+      const H = Math.max(HEADER + n * ROW_H + PAD, 48);
+
+      t.style('width', WIDTH);
+      t.style('height', H);
+
+      const tp = t.position();
+      // top Y wewnątrz tabeli
+      let y = tp.y - H/2 + HEADER + ROW_H/2;
+
+      cols.forEach((c, i) => {
+        c.style('width', WIDTH - 16);
+        c.style('height', ROW_H - 6);
+        c.position({ x: tp.x, y: y + i * ROW_H });
+      });
+    });
+  });
+}
+
+function applyLayout(rootNodes) {
+  cy.layout({
+    name: 'fcose',
+    animate: false,
+    gravity: 1.0,
+    idealEdgeLength: 100,
+    nodeSeparation: 80
+  }).run();
+  layoutTables();
+  if (rootNodes && rootNodes.length) cy.fit(cy.collection(rootNodes), 60);
+  else cy.fit(cy.elements(), 60);
+}
+
+// --- BFS, z obsługą kliknięcia w tabelę (rozszerzamy na jej kolumny) ---
+function asFrontier(node) {
+  return node.isParent() ? node.children('[kind = "column"]') : cy.collection(node);
+}
+
 function bfsFilter(rootId, depth, direction) {
   cy.elements().removeClass('faded hidden');
-  if (!rootId) { applyLayout(cy); return; }
+  if (!rootId) { applyLayout(); return; }
 
-  const root = cy.$id(rootId);
-  if (root.empty()) { return; }
+  const rootRaw = cy.$id(rootId);
+  if (rootRaw.empty()) return;
 
+  const rootCols = asFrontier(rootRaw); // jeśli tabela, startujemy od kolumn
   const dir = (direction || 'both').toLowerCase();
-  let frontier = [root];
-  let visited = new Set([root.id()]);
-  let keep = new Set([root.id()]);
+
+  let frontier = rootCols.toArray();
+  const keep = new Set([rootRaw.id(), ...rootCols.map(n => n.id())]);
+  const visited = new Set([...keep]);
 
   for (let d=0; d<depth; d++) {
     const next = [];
@@ -159,24 +270,19 @@ function bfsFilter(rootId, depth, direction) {
     frontier = next;
   }
 
+  // pokaż też „rodziców” wszystkich zachowanych kolumn (żeby ramki tabel były widoczne)
+  [...keep].forEach(id => {
+    const n = cy.getElementById(id);
+    if (n.nonempty() && n.parent().nonempty()) keep.add(n.parent().id());
+  });
+
   cy.elements().forEach(e => { if (!keep.has(e.id())) e.addClass('faded'); });
-  applyLayout(cy, [root]);
+
+  // fokus na tabelę (jeśli kliknięto w kolumnę, też zadziała)
+  applyLayout([rootRaw]);
 }
 
-function searchFilter(q) {
-  cy.elements().removeClass('hidden faded');
-  q = (q || '').toLowerCase();
-  if (!q) { applyLayout(cy); return; }
-  cy.nodes().forEach(n => {
-    const ok = (n.data('full') + ' ' + n.data('table')).toLowerCase().includes(q);
-    if (!ok) n.addClass('hidden');
-  });
-  cy.edges().forEach(e => {
-    if (e.source().hasClass('hidden') || e.target().hasClass('hidden')) e.addClass('hidden');
-  });
-  applyLayout(cy);
-}
-
+// --- search/depth/direction: zostawiamy jak było ---
 document.querySelectorAll('.pill').forEach(p => {
   p.addEventListener('click', () => {
     document.querySelectorAll('.pill').forEach(x => x.classList.remove('active'));
@@ -190,8 +296,22 @@ cy.on('tap', 'node', (evt) => {
   n.select();
   const dir = document.querySelector('.pill.active').dataset.dir;
   bfsFilter(n.id(), parseInt(document.getElementById('depth').value || 2), dir);
-  document.getElementById('search').value = n.data('full');
+  document.getElementById('search').value = n.data('full') || n.data('label');
 });
+
+function searchFilter(q) {
+  cy.elements().removeClass('hidden faded');
+  q = (q || '').toLowerCase();
+  if (!q) { applyLayout(); return; }
+  cy.nodes().forEach(n => {
+    const hay = ((n.data('full') || n.data('label')) + ' ' + (n.data('table') || '')).toLowerCase();
+    if (!hay.includes(q)) n.addClass('hidden');
+  });
+  cy.edges().forEach(e => {
+    if (e.source().hasClass('hidden') || e.target().hasClass('hidden')) e.addClass('hidden');
+  });
+  applyLayout();
+}
 
 document.getElementById('search').addEventListener('input', (e) => { searchFilter(e.target.value); });
 document.getElementById('depth').addEventListener('change', (e) => {
@@ -200,11 +320,12 @@ document.getElementById('depth').addEventListener('change', (e) => {
   if (selected) bfsFilter(selected, parseInt(e.target.value || 2), dir);
 });
 
-applyLayout(cy);
+// start
+applyLayout();
 
-// Auto-focus, jeśli podano
+// auto-focus (jak wcześniej)
 if (__FOCUS__) {
-  const hit = cy.nodes().filter(n => n.data('full').toLowerCase().includes(__FOCUS__)).first();
+  const hit = cy.nodes().filter(n => ((n.data('full')||'') + ' ' + (n.data('label')||'')).toLowerCase().includes(__FOCUS__)).first();
   if (hit) {
     hit.select();
     const dir = (__DIRECTION__ || 'both');
@@ -212,6 +333,7 @@ if (__FOCUS__) {
   }
 }
 </script>
+
 </body>
 </html>
 """
