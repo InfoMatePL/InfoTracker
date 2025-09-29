@@ -83,6 +83,48 @@ class SqlParser:
         if len(parts) == 2: 
             return (self.current_database or self.default_database), parts[0], parts[1]
         return (self.current_database or self.default_database), "dbo", (parts[0] if parts else None)
+
+    def _ns_and_name(self, table_name: str) -> tuple[str, str]:
+        """Return (namespace, schema.table) regardless of input format.
+
+        - Namespace is derived from the DB part of FQN if present; otherwise from
+          current_database or default_database.
+        - Table name is always normalized to the last two segments (schema.table)
+          when possible, to avoid repeating DB in the table part.
+        - Temp tables keep temp namespace; name is passed through as-is to preserve
+          existing matching semantics (e.g. "tempdb..#name").
+        - Ignore pseudo-catalogs like "View", "Function", "Procedure" if present
+          as the first segment produced by the parser.
+        """
+        # Temp tables
+        if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name):
+            return "mssql://localhost/tempdb", table_name
+
+        # Split and normalize parts
+        raw_parts = (table_name or "").split('.')
+        parts = [p for p in raw_parts if p != ""]
+
+        # Handle pseudo catalogs that shouldn't be treated as DB
+        pseudo = {"view", "function", "procedure"}
+        if len(parts) >= 3 and parts[0].lower() in pseudo:
+            parts = parts[1:]
+
+        # Determine namespace DB from FQN if present, otherwise from context
+        if len(parts) >= 3:
+            db = parts[0]
+        else:
+            db = self.current_database or self.default_database
+        ns = f"mssql://localhost/{db}" if db else "mssql://localhost"
+
+        # Compute schema.table from last two real segments
+        if len(parts) >= 2:
+            nm = ".".join(parts[-2:])
+        elif len(parts) == 1 and parts[0]:
+            nm = f"dbo.{parts[0]}"
+        else:
+            nm = table_name
+
+        return ns, nm
     
     def _qualify_table(self, tbl: exp.Table) -> str:
         """Get fully qualified table name from Table expression."""
@@ -433,7 +475,8 @@ class SqlParser:
                 # Remove database prefix for output tables
                 parts = table_name.split('.')
                 table_name = f"{parts[1]}.{parts[2]}"
-            namespace = "mssql://localhost/InfoTrackerDW"
+            db = self.current_database or self.default_database or "InfoTrackerDW"
+            namespace = f"mssql://localhost/{db}"
             object_type = "table"
             
             # Parse column list from INSERT INTO
@@ -466,7 +509,8 @@ class SqlParser:
             else:
                 # Regular table - use full qualified name with database context
                 table_name = self._get_full_table_name(table_name)
-                namespace = "mssql://localhost/InfoTrackerDW"
+                db = self.current_database or self.default_database or "InfoTrackerDW"
+                namespace = f"mssql://localhost/{db}"
                 object_type = "table"
             
             # Get full procedure name for dependencies and lineage
@@ -480,7 +524,8 @@ class SqlParser:
             # No INSERT pattern found - create a generic script object
             if all_dependencies:
                 table_name = sanitize_name(object_hint or "script_output")
-                namespace = "mssql://localhost/InfoTrackerDW"
+                db = self.current_database or self.default_database or "InfoTrackerDW"
+                namespace = f"mssql://localhost/{db}"
                 object_type = "script"
             else:
                 # No dependencies found at all
@@ -517,12 +562,13 @@ class SqlParser:
                         ))
                     else:
                         # IDENTITY mapping from procedure output
+                        ns, nm = self._ns_and_name(proc_full_name)
                         lineage.append(ColumnLineage(
                             output_column=col.name,
                             input_fields=[
                                 ColumnReference(
-                                    namespace="mssql://localhost/InfoTrackerDW",
-                                    table_name=proc_full_name,
+                                    namespace=ns,
+                                    table_name=nm,
                                     column_name=col.name
                                 )
                             ],
@@ -543,12 +589,13 @@ class SqlParser:
             proc_full_name = self._get_full_table_name(self._clean_proc_name(exec_match.group(2)))
             proc_full_name = sanitize_name(proc_full_name)
             for col in placeholder_columns:
+                ns, nm = self._ns_and_name(proc_full_name)
                 lineage.append(ColumnLineage(
                     output_column=col.name,
                     input_fields=[
                         ColumnReference(
-                            namespace="mssql://localhost/InfoTrackerDW",
-                            table_name=proc_full_name,
+                            namespace=ns,
+                            table_name=nm,
                             column_name="*"
                         )
                     ],
@@ -796,11 +843,12 @@ class SqlParser:
                 main_object.dependencies = all_inputs
             elif all_inputs:
                 # Create a file-level object with aggregated inputs (for demo scripts)
+                db = self.current_database or self.default_database or "InfoTrackerDW"
                 main_object = ObjectInfo(
                     name=sanitize_name(object_hint or "loose_statements"),
                     object_type="script",
                     schema=TableSchema(
-                        namespace="mssql://localhost/InfoTrackerDW",
+                        namespace=f"mssql://localhost/{db}",
                         name=sanitize_name(object_hint or "loose_statements"),
                         columns=[]
                     ),
@@ -861,11 +909,15 @@ class SqlParser:
             raise ValueError("SELECT INTO requires INTO clause")
         
         table_name = self._get_table_name(into_expr, object_hint)
-        namespace = "mssql://localhost/InfoTrackerDW"
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        namespace = f"mssql://localhost/{db}"
         
         # Normalize temp table names
-        if table_name.startswith('#'):
+        if table_name.startswith('#') or 'tempdb' in str(table_name).lower():
             namespace = "mssql://localhost/tempdb"
+        else:
+            # Normalize output name to schema.table (drop DB)
+            table_name = self._normalize_table_name_for_output(table_name)
         
         # Extract dependencies (tables referenced in FROM/JOIN)
         dependencies = self._extract_dependencies(statement)
@@ -899,11 +951,14 @@ class SqlParser:
         """Parse INSERT INTO ... EXEC statement."""
         # Get target table name from INSERT INTO clause
         table_name = self._get_table_name(statement.this, object_hint)
-        namespace = "mssql://localhost/InfoTrackerDW"
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        namespace = f"mssql://localhost/{db}"
         
         # Normalize temp table names
-        if table_name.startswith('#'):
+        if table_name.startswith('#') or 'tempdb' in str(table_name).lower():
             namespace = "mssql://localhost/tempdb"
+        else:
+            table_name = self._normalize_table_name_for_output(table_name)
         
         # Extract the EXEC command
         expression = statement.expression
@@ -946,16 +1001,17 @@ class SqlParser:
             # Create placeholder lineage pointing to the procedure
             lineage = []
             if procedure_name:
+                ns, nm = self._ns_and_name(procedure_name)
                 for i, col in enumerate(output_columns):
                     lineage.append(ColumnLineage(
                         output_column=col.name,
                         input_fields=[ColumnReference(
-                            namespace="mssql://localhost/InfoTrackerDW",
-                            table_name=procedure_name,
+                            namespace=ns,
+                            table_name=nm,
                             column_name="*"  # Wildcard since we don't know the procedure output
                         )],
                         transformation_type=TransformationType.EXEC,
-                        transformation_description=f"INSERT INTO {table_name} EXEC {procedure_name}"
+                        transformation_description=f"INSERT INTO {table_name} EXEC {nm}"
                     ))
             
             schema = TableSchema(
@@ -984,11 +1040,14 @@ class SqlParser:
         
         # Get target table name from INSERT INTO clause
         table_name = self._get_table_name(statement.this, object_hint)
-        namespace = "mssql://localhost/InfoTrackerDW"
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        namespace = f"mssql://localhost/{db}"
         
         # Normalize temp table names
         if table_name.startswith('#') or 'tempdb' in table_name:
             namespace = "mssql://localhost/tempdb"
+        else:
+            table_name = self._normalize_table_name_for_output(table_name)
         
         # Extract the SELECT part
         select_expr = statement.expression
@@ -1335,11 +1394,12 @@ class SqlParser:
             if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
                 # Normalize table name - remove database prefix for output
                 normalized_name = self._normalize_table_name_for_output(table_name)
+                db = self.current_database or self.default_database or "InfoTrackerDW"
                 outputs.append(ObjectInfo(
                     name=normalized_name,
                     object_type="table",
                     schema=TableSchema(
-                        namespace="mssql://localhost/InfoTrackerDW",
+                        namespace=f"mssql://localhost/{db}",
                         name=normalized_name,
                         columns=[]
                     ),
@@ -1358,11 +1418,12 @@ class SqlParser:
                 normalized_name = self._normalize_table_name_for_output(table_name)
                 # Check if we already have this table from SELECT INTO
                 if not any(output.name == normalized_name for output in outputs):
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
                     outputs.append(ObjectInfo(
                         name=normalized_name,
                         object_type="table",
                         schema=TableSchema(
-                            namespace="mssql://localhost/InfoTrackerDW",
+                            namespace=f"mssql://localhost/{db}",
                             name=normalized_name,
                             columns=[]
                         ),
@@ -1631,9 +1692,10 @@ class SqlParser:
             # Resolve table name from alias
             table_name = self._resolve_table_from_alias(table_alias, context)
             
+            ns, nm = self._ns_and_name(table_name)
             input_fields.append(ColumnReference(
-                namespace="mssql://localhost/InfoTrackerDW",
-                table_name=table_name,
+                namespace=ns,
+                table_name=nm,
                 column_name=column_name
             ))
             
@@ -1670,9 +1732,10 @@ class SqlParser:
                     column_name = str(column_ref.this)
                     table_name = self._resolve_table_from_alias(table_alias, context)
                     
+                    ns, nm = self._ns_and_name(table_name)
                     input_fields.append(ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=table_name,
+                        namespace=ns,
+                        table_name=nm,
                         column_name=column_name
                     ))
                 
@@ -1692,9 +1755,10 @@ class SqlParser:
                 column_name = str(inner_expr.this)
                 table_name = self._resolve_table_from_alias(table_alias, context)
                 
+                ns, nm = self._ns_and_name(table_name)
                 input_fields.append(ColumnReference(
-                    namespace="mssql://localhost/InfoTrackerDW",
-                    table_name=table_name,
+                    namespace=ns,
+                    table_name=nm,
                     column_name=column_name
                 ))
                 description = f"CAST({column_name} AS {target_type})"
@@ -1709,9 +1773,10 @@ class SqlParser:
                 column_name = str(column_ref.this)
                 table_name = self._resolve_table_from_alias(table_alias, context)
                 
+                ns, nm = self._ns_and_name(table_name)
                 input_fields.append(ColumnReference(
-                    namespace="mssql://localhost/InfoTrackerDW",
-                    table_name=table_name,
+                    namespace=ns,
+                    table_name=nm,
                     column_name=column_name
                 ))
             
@@ -1729,9 +1794,10 @@ class SqlParser:
                 column_name = str(column_ref.this)
                 table_name = self._resolve_table_from_alias(table_alias, context)
                 
+                ns, nm = self._ns_and_name(table_name)
                 input_fields.append(ColumnReference(
-                    namespace="mssql://localhost/InfoTrackerDW",
-                    table_name=table_name,
+                    namespace=ns,
+                    table_name=nm,
                     column_name=column_name
                 ))
             
@@ -1752,9 +1818,10 @@ class SqlParser:
                     column_name = str(column_ref.this)
                     table_name = self._resolve_table_from_alias(table_alias, context)
                     
+                    ns, nm = self._ns_and_name(table_name)
                     input_fields.append(ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=table_name,
+                        namespace=ns,
+                        table_name=nm,
                         column_name=column_name
                     ))
             
@@ -1766,9 +1833,10 @@ class SqlParser:
                         column_name = str(column_ref.this)
                         table_name = self._resolve_table_from_alias(table_alias, context)
                         
+                        ns, nm = self._ns_and_name(table_name)
                         input_fields.append(ColumnReference(
-                            namespace="mssql://localhost/InfoTrackerDW",
-                            table_name=table_name,
+                            namespace=ns,
+                            table_name=nm,
                             column_name=column_name
                         ))
             
@@ -1780,9 +1848,10 @@ class SqlParser:
                         column_name = str(column_ref.this)
                         table_name = self._resolve_table_from_alias(table_alias, context)
                         
+                        ns, nm = self._ns_and_name(table_name)
                         input_fields.append(ColumnReference(
-                            namespace="mssql://localhost/InfoTrackerDW",
-                            table_name=table_name,
+                            namespace=ns,
+                            table_name=nm,
                             column_name=column_name
                         ))
             
@@ -1819,9 +1888,10 @@ class SqlParser:
                 column_key = (table_name, column_name)
                 if column_key not in seen_columns:
                     seen_columns.add(column_key)
+                    ns, nm = self._ns_and_name(table_name)
                     input_fields.append(ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=table_name,
+                        namespace=ns,
+                        table_name=nm,
                         column_name=column_name
                     ))
             
@@ -1852,9 +1922,10 @@ class SqlParser:
                 column_key = (table_name, column_name)
                 if column_key not in seen_columns:
                     seen_columns.add(column_key)
+                    ns, nm = self._ns_and_name(table_name)
                     input_fields.append(ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
-                        table_name=table_name,
+                        namespace=ns,
+                        table_name=nm,
                         column_name=column_name
                     ))
             
@@ -1881,9 +1952,10 @@ class SqlParser:
                 column_name = str(column_ref.this)
                 table_name = self._resolve_table_from_alias(table_alias, context)
                 
+                ns, nm = self._ns_and_name(table_name)
                 input_fields.append(ColumnReference(
-                    namespace="mssql://localhost/InfoTrackerDW",
-                    table_name=table_name,
+                    namespace=ns,
+                    table_name=nm,
                     column_name=column_name
                 ))
             
@@ -2011,11 +2083,12 @@ class SqlParser:
                                 ))
                                 ordinal += 1
                                 
+                                ns, nm = self._ns_and_name(table_name)
                                 lineage.append(ColumnLineage(
                                     output_column=column_name,
                                     input_fields=[ColumnReference(
-                                        namespace=self._get_namespace_for_table(table_name),
-                                        table_name=table_name,
+                                        namespace=ns,
+                                        table_name=nm,
                                         column_name=column_name
                                     )],
                                     transformation_type=TransformationType.IDENTITY,
@@ -2044,11 +2117,12 @@ class SqlParser:
                                 ))
                                 ordinal += 1
                                 
+                                ns, nm = self._ns_and_name(table_name)
                                 lineage.append(ColumnLineage(
                                     output_column=column_name,
                                     input_fields=[ColumnReference(
-                                        namespace=self._get_namespace_for_table(table_name),
-                                        table_name=table_name,
+                                        namespace=ns,
+                                        table_name=nm,
                                         column_name=column_name
                                     )],
                                     transformation_type=TransformationType.IDENTITY,
@@ -2073,11 +2147,12 @@ class SqlParser:
                                 ))
                                 ordinal += 1
                                 
+                                ns, nm = self._ns_and_name(table_name)
                                 lineage.append(ColumnLineage(
                                     output_column=column_name,
                                     input_fields=[ColumnReference(
-                                        namespace=self._get_namespace_for_table(table_name),
-                                        table_name=table_name,
+                                        namespace=ns,
+                                        table_name=nm,
                                         column_name=column_name
                                     )],
                                     transformation_type=TransformationType.IDENTITY,
@@ -2098,8 +2173,9 @@ class SqlParser:
                 input_refs = self._extract_column_references(select_expr, select_stmt)
                 if not input_refs:
                     # If no specific references found, treat as expression
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
                     input_refs = [ColumnReference(
-                        namespace="mssql://localhost/InfoTrackerDW",
+                        namespace=f"mssql://localhost/{db}",
                         table_name="LITERAL",
                         column_name=str(select_expr)
                     )]
@@ -2190,15 +2266,15 @@ class SqlParser:
     
     def _get_namespace_for_table(self, table_name: str) -> str:
         """Get appropriate namespace for a table based on its name."""
-        if table_name.startswith('tempdb..#'):
+        if table_name.startswith('#') or table_name.startswith('tempdb..#'):
             return "mssql://localhost/tempdb"
-        else:
-            return "mssql://localhost/InfoTrackerDW"
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        return f"mssql://localhost/{db}"
 
     def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION using string-based approach."""
         function_name = self._extract_function_name(sql_content) or object_hint or "unknown_function"
-        namespace = "mssql://localhost/InfoTrackerDW"
+        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
         
         # Check if this is a table-valued function
         if not self._is_table_valued_function_string(sql_content):
@@ -2240,7 +2316,7 @@ class SqlParser:
         # Znormalizuj nagłówki SET/GO, COLLATE itd.
         sql_content = self._normalize_tsql(sql_content)
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
-        namespace = "mssql://localhost/InfoTrackerDW"
+        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
 
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
@@ -3145,9 +3221,10 @@ class SqlParser:
                     table_name = tables[0]
             
             if table_name != "unknown":
+                ns, nm = self._ns_and_name(table_name)
                 refs.append(ColumnReference(
-                    namespace="mssql://localhost/InfoTrackerDW",
-                    table_name=table_name,
+                    namespace=ns,
+                    table_name=nm,
                     column_name=column_name
                 ))
         
