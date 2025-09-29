@@ -468,15 +468,9 @@ class SqlParser:
             raw_columns = table_match.group(2)
             
             table_name = self._normalize_table_ident(raw_table)
-            # For output tables, use simple schema.table format without database prefix
-            if '.' not in table_name:
-                table_name = f"dbo.{table_name}"
-            elif len(table_name.split('.')) == 3:
-                # Remove database prefix for output tables
-                parts = table_name.split('.')
-                table_name = f"{parts[1]}.{parts[2]}"
-            db = self.current_database or self.default_database or "InfoTrackerDW"
-            namespace = f"mssql://localhost/{db}"
+            ns, nm = self._ns_and_name(table_name)
+            namespace = ns
+            table_name = nm
             object_type = "table"
             
             # Parse column list from INSERT INTO
@@ -507,10 +501,11 @@ class SqlParser:
                 namespace = "mssql://localhost/tempdb"
                 object_type = "temp_table"
             else:
-                # Regular table - use full qualified name with database context
+                # Regular table - qualify and derive ns/name from FQN
                 table_name = self._get_full_table_name(table_name)
-                db = self.current_database or self.default_database or "InfoTrackerDW"
-                namespace = f"mssql://localhost/{db}"
+                ns, nm = self._ns_and_name(table_name)
+                namespace = ns
+                table_name = nm
                 object_type = "table"
             
             # Get full procedure name for dependencies and lineage
@@ -874,11 +869,12 @@ class SqlParser:
             
             logger.warning("parse failed: %s", e)
             # Return an object with error information
+            db = self.current_database or self.default_database or "InfoTrackerDW"
             return ObjectInfo(
                 name=sanitize_name(object_hint or "unknown"),
                 object_type="unknown",
                 schema=TableSchema(
-                    namespace="mssql://localhost/InfoTrackerDW",
+                    namespace=f"mssql://localhost/{db}",
                     name=sanitize_name(object_hint or "unknown"),
                     columns=[]
                 ),
@@ -908,16 +904,11 @@ class SqlParser:
         if not into_expr:
             raise ValueError("SELECT INTO requires INTO clause")
         
-        table_name = self._get_table_name(into_expr, object_hint)
-        db = self.current_database or self.default_database or "InfoTrackerDW"
-        namespace = f"mssql://localhost/{db}"
-        
-        # Normalize temp table names
-        if table_name.startswith('#') or 'tempdb' in str(table_name).lower():
-            namespace = "mssql://localhost/tempdb"
-        else:
-            # Normalize output name to schema.table (drop DB)
-            table_name = self._normalize_table_name_for_output(table_name)
+        # Use FQN of target to derive ns + name
+        raw_target = self._get_table_name(into_expr, object_hint)
+        ns, nm = self._ns_and_name(raw_target)
+        namespace = ns
+        table_name = nm
         
         # Extract dependencies (tables referenced in FROM/JOIN)
         dependencies = self._extract_dependencies(statement)
@@ -950,15 +941,13 @@ class SqlParser:
     def _parse_insert_exec(self, statement: exp.Insert, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse INSERT INTO ... EXEC statement."""
         # Get target table name from INSERT INTO clause
-        table_name = self._get_table_name(statement.this, object_hint)
-        db = self.current_database or self.default_database or "InfoTrackerDW"
-        namespace = f"mssql://localhost/{db}"
+        raw_target = self._get_table_name(statement.this, object_hint)
+        ns, nm = self._ns_and_name(raw_target)
+        namespace = ns
+        table_name = nm
         
         # Normalize temp table names
-        if table_name.startswith('#') or 'tempdb' in str(table_name).lower():
-            namespace = "mssql://localhost/tempdb"
-        else:
-            table_name = self._normalize_table_name_for_output(table_name)
+        # temp detection left to _ns_and_name (returns tempdb ns), table_name already normalized
         
         # Extract the EXEC command
         expression = statement.expression
@@ -1039,15 +1028,13 @@ class SqlParser:
         from .openlineage_utils import sanitize_name
         
         # Get target table name from INSERT INTO clause
-        table_name = self._get_table_name(statement.this, object_hint)
-        db = self.current_database or self.default_database or "InfoTrackerDW"
-        namespace = f"mssql://localhost/{db}"
+        raw_target = self._get_table_name(statement.this, object_hint)
+        ns, nm = self._ns_and_name(raw_target)
+        namespace = ns
+        table_name = nm
         
         # Normalize temp table names
-        if table_name.startswith('#') or 'tempdb' in table_name:
-            namespace = "mssql://localhost/tempdb"
-        else:
-            table_name = self._normalize_table_name_for_output(table_name)
+        # temp namespace handled by _ns_and_name
         
         # Extract the SELECT part
         select_expr = statement.expression
@@ -1103,12 +1090,10 @@ class SqlParser:
         """Parse CREATE TABLE statement."""
         # Extract table name and schema from statement.this (which is a Schema object)
         schema_expr = statement.this
-        table_name = self._get_table_name(schema_expr.this, object_hint)
-        # namespace = aktualna baza (USE -> default -> InfoTrackerDW)
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
-        # trzymaj tylko schema.table (DB siedzi w namespace)
-        if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-            table_name = self._normalize_table_name_for_output(table_name)
+        raw_name = self._get_table_name(schema_expr.this, object_hint)
+        ns, nm = self._ns_and_name(raw_name)
+        namespace = ns
+        table_name = nm
         
         # Extract columns from the schema expressions
         columns = []
@@ -1147,11 +1132,9 @@ class SqlParser:
         # 1) Wyciągnij nazwę tabeli
         m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
         table_name = self._get_full_table_name(self._normalize_table_ident(m.group(1))) if m else (object_hint or "dbo.unknown_table")
-        # namespace = aktualna baza (USE -> default -> InfoTrackerDW)
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
-        # trzymaj tylko schema.table (DB siedzi w namespace)
-        if not str(table_name).startswith('#') and 'tempdb' not in str(table_name).lower():
-            table_name = self._normalize_table_name_for_output(table_name)
+        ns, nm = self._ns_and_name(str(table_name))
+        namespace = ns
+        table_name = nm
 
         # 2) Wyciągnij definicję kolumn (balansowane nawiasy od pierwszego '(' po nazwie)
         s = self._normalize_tsql(sql)
@@ -1224,11 +1207,10 @@ class SqlParser:
 
     def _parse_create_view(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE VIEW statement."""
-        view_name = self._get_table_name(statement.this, object_hint)
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
-        if not view_name.startswith('#') and 'tempdb' not in view_name.lower():
-            # trzymaj tylko schema.table
-            view_name = self._normalize_table_name_for_output(view_name)
+        raw_view = self._get_table_name(statement.this, object_hint)
+        ns, nm = self._ns_and_name(raw_view)
+        namespace = ns
+        view_name = nm
         
         # Get the expression (could be SELECT or UNION)
         view_expr = statement.expression
@@ -1279,12 +1261,10 @@ class SqlParser:
     
     def _parse_create_function(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION statement (table-valued functions only)."""
-        function_name = self._get_table_name(statement.this, object_hint)
-        # namespace = aktualna baza (USE -> default -> InfoTrackerDW)
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
-        # trzymaj tylko schema.table (DB siedzi w namespace)
-        if not function_name.startswith('#') and 'tempdb' not in function_name.lower():
-            function_name = self._normalize_table_name_for_output(function_name)
+        raw_func = self._get_table_name(statement.this, object_hint)
+        ns, nm = self._ns_and_name(raw_func)
+        namespace = ns
+        function_name = nm
 
         
         # Check if this is a table-valued function
@@ -1324,12 +1304,10 @@ class SqlParser:
     
     def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE PROCEDURE statement."""
-        procedure_name = self._get_table_name(statement.this, object_hint)
-        # namespace = aktualna baza (USE -> default -> InfoTrackerDW)
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
-        # trzymaj tylko schema.table (DB siedzi w namespace)
-        if not procedure_name.startswith('#') and 'tempdb' not in procedure_name.lower():
-            procedure_name = self._normalize_table_name_for_output(procedure_name)
+        raw_proc = self._get_table_name(statement.this, object_hint)
+        ns, nm = self._ns_and_name(raw_proc)
+        namespace = ns
+        procedure_name = nm
 
         
         # Extract the procedure body and find materialized outputs (SELECT INTO, INSERT INTO)
