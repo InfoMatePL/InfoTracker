@@ -113,8 +113,8 @@ class SqlParser:
         if len(parts) >= 3:
             db = parts[0]
         else:
-            db = self.current_database or self.default_database
-        ns = f"mssql://localhost/{db}" if db else "mssql://localhost"
+            db = self.current_database or self.default_database or "InfoTrackerDW"
+        ns = f"mssql://localhost/{db}"
 
         # Compute schema.table from last two real segments
         if len(parts) >= 2:
@@ -125,6 +125,89 @@ class SqlParser:
             nm = table_name
 
         return ns, nm
+
+    # -- Utils: strip comments to avoid false positives in regex-based inference
+    def _strip_sql_comments(self, sql: str) -> str:
+        if not sql:
+            return sql
+        sql = re.sub(r'--.*?$', '', sql, flags=re.MULTILINE)
+        sql = re.sub(r'/\*.*?\*/', '', sql, flags=re.DOTALL)
+        return sql
+
+    def _infer_db_candidates_from_ast(self, node):
+        from collections import Counter
+        c = Counter()
+        if not node:
+            return c
+        # Table references
+        for t in node.find_all(exp.Table):
+            cat = (str(t.catalog) if t.catalog else "").strip('[]').strip()
+            if not cat:
+                continue
+            cl = cat.lower()
+            if cl in {"view", "function", "procedure", "tempdb"}:
+                continue
+            c[cat] += 1
+        # DML targets (INSERT INTO)
+        for ins in node.find_all(exp.Insert):
+            tbl = ins.this
+            if isinstance(tbl, exp.Table) and tbl.catalog:
+                cat = str(tbl.catalog).strip('[]')
+                if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
+                    c[cat] += 3
+        return c
+
+    def _infer_db_candidates_from_sql(self, sql_text: str):
+        from collections import Counter
+        c = Counter()
+        if not sql_text:
+            return c
+        sql = self._strip_sql_comments(sql_text)
+        # Find DB.schema.table
+        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)', sql):
+            db = m.group(1).strip('[]')
+            if db.lower() in {"view", "function", "procedure", "tempdb"}:
+                continue
+            c[db] += 1
+        # INSERT INTO DB.schema.table
+        for m in re.finditer(r'(?i)\bINSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)', sql):
+            db = m.group(1).strip('[]')
+            if db.lower() in {"view", "function", "procedure", "tempdb"}:
+                continue
+            c[db] += 3
+        # SELECT ... INTO DB.schema.table
+        for m in re.finditer(r'(?is)\bSELECT\b.*?\bINTO\s+([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)', sql):
+            db = m.group(1).strip('[]')
+            if db.lower() in {"view", "function", "procedure", "tempdb"}:
+                continue
+            c[db] += 3
+        return c
+
+    def _choose_db(self, counter) -> Optional[str]:
+        if not counter:
+            return None
+        mc = counter.most_common()
+        if len(mc) == 1 or (len(mc) > 1 and mc[0][1] > mc[1][1]):
+            return mc[0][0]
+        return None
+
+    def _infer_database_for_object(self, statement=None, sql_text: Optional[str] = None) -> Optional[str]:
+        """Infer DB for an object created without explicit DB in its name."""
+        from collections import Counter
+        c = Counter()
+        try:
+            if statement is not None:
+                c += self._infer_db_candidates_from_ast(statement)
+        except Exception:
+            pass
+        try:
+            c += self._infer_db_candidates_from_sql(sql_text or "")
+        except Exception:
+            pass
+        db = self._choose_db(c)
+        if db:
+            return db
+        return self.current_database or self.default_database or None
     
     def _qualify_table(self, tbl: exp.Table) -> str:
         """Get fully qualified table name from Table expression."""
@@ -673,6 +756,8 @@ class SqlParser:
         
         # Reset current database to default for each file
         self.current_database = self.default_database
+        # Keep the raw SQL for DB inference when object name lacks explicit DB
+        self._current_raw_sql = sql_content
         
         # Reset registries for each file to avoid contamination
         self.cte_registry.clear()
@@ -1094,6 +1179,20 @@ class SqlParser:
         ns, nm = self._ns_and_name(raw_name)
         namespace = ns
         table_name = nm
+        # If no explicit DB in object name, try inferring from body
+        explicit_db = False
+        try:
+            raw_tbl = schema_expr.this
+            if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
+                cat = str(raw_tbl.catalog).strip('[]')
+                if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
+                    explicit_db = True
+        except Exception:
+            pass
+        if not explicit_db:
+            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+            if inferred_db:
+                namespace = f"mssql://localhost/{inferred_db}"
         
         # Extract columns from the schema expressions
         columns = []
@@ -1131,10 +1230,17 @@ class SqlParser:
     def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None) -> ObjectInfo:
         # 1) Wyciągnij nazwę tabeli
         m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
-        table_name = self._get_full_table_name(self._normalize_table_ident(m.group(1))) if m else (object_hint or "dbo.unknown_table")
+        raw_ident = self._normalize_table_ident(m.group(1)) if m else None
+        table_name = self._get_full_table_name(raw_ident) if raw_ident else (object_hint or "dbo.unknown_table")
         ns, nm = self._ns_and_name(str(table_name))
         namespace = ns
         table_name = nm
+        # Infer DB for string variant if object name lacks explicit DB
+        has_db = bool(raw_ident and raw_ident.count('.') >= 2)
+        if not has_db:
+            inferred_db = self._infer_database_for_object(statement=None, sql_text=sql)
+            if inferred_db:
+                namespace = f"mssql://localhost/{inferred_db}"
 
         # 2) Wyciągnij definicję kolumn (balansowane nawiasy od pierwszego '(' po nazwie)
         s = self._normalize_tsql(sql)
@@ -1211,6 +1317,20 @@ class SqlParser:
         ns, nm = self._ns_and_name(raw_view)
         namespace = ns
         view_name = nm
+        # If no explicit DB in object name, try inferring from body
+        explicit_db = False
+        try:
+            raw_tbl = getattr(statement.this, 'this', statement.this)
+            if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
+                cat = str(raw_tbl.catalog).strip('[]')
+                if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
+                    explicit_db = True
+        except Exception:
+            pass
+        if not explicit_db:
+            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+            if inferred_db:
+                namespace = f"mssql://localhost/{inferred_db}"
         
         # Get the expression (could be SELECT or UNION)
         view_expr = statement.expression
@@ -1265,6 +1385,20 @@ class SqlParser:
         ns, nm = self._ns_and_name(raw_func)
         namespace = ns
         function_name = nm
+        # If no explicit DB in object name, try inferring from body
+        explicit_db = False
+        try:
+            raw_tbl = getattr(statement.this, 'this', statement.this)
+            if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
+                cat = str(raw_tbl.catalog).strip('[]')
+                if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
+                    explicit_db = True
+        except Exception:
+            pass
+        if not explicit_db:
+            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+            if inferred_db:
+                namespace = f"mssql://localhost/{inferred_db}"
 
         
         # Check if this is a table-valued function
@@ -1308,6 +1442,20 @@ class SqlParser:
         ns, nm = self._ns_and_name(raw_proc)
         namespace = ns
         procedure_name = nm
+        # If no explicit DB in object name, try inferring from body
+        explicit_db = False
+        try:
+            raw_tbl = getattr(statement.this, 'this', statement.this)
+            if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
+                cat = str(raw_tbl.catalog).strip('[]')
+                if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
+                    explicit_db = True
+        except Exception:
+            pass
+        if not explicit_db:
+            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+            if inferred_db:
+                namespace = f"mssql://localhost/{inferred_db}"
 
         
         # Extract the procedure body and find materialized outputs (SELECT INTO, INSERT INTO)
@@ -2252,7 +2400,8 @@ class SqlParser:
     def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION using string-based approach."""
         function_name = self._extract_function_name(sql_content) or object_hint or "unknown_function"
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
+        inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content)
+        namespace = f"mssql://localhost/{inferred_db or self.default_database or 'InfoTrackerDW'}"
         
         # Check if this is a table-valued function
         if not self._is_table_valued_function_string(sql_content):
@@ -2294,7 +2443,8 @@ class SqlParser:
         # Znormalizuj nagłówki SET/GO, COLLATE itd.
         sql_content = self._normalize_tsql(sql_content)
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
-        namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
+        inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content)
+        namespace = f"mssql://localhost/{inferred_db or self.default_database or 'InfoTrackerDW'}"
 
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
