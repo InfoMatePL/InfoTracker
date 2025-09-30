@@ -166,6 +166,10 @@ HTML_TMPL = """<!doctype html>
   .port.right{ margin-left:8px }
   .port.left{ margin-right:8px }
   .table-node.target{ background:var(--card-target) }
+  /* Search hits: visible regardless of dim; subtle but clear */
+  .table-node.hit{ box-shadow: 0 0 0 2px rgba(99,102,241,.35), 0 6px 18px rgba(0,0,0,.12) }
+  .table-node li.hit{ outline:2px dashed var(--sel-outline); background: var(--fx); position: relative }
+  .table-node.hit, .table-node li.hit{ opacity: 1 !important; }
   svg .wire{fill:none; stroke:var(--wire-strong); stroke-width:2.4; stroke-linecap:round; stroke-linejoin:round}
   svg .wire.strong{stroke-width:3.2}
   svg defs marker#arrow{ overflow:visible }
@@ -206,6 +210,8 @@ let COL_IN = null;  // Map colKey -> Array<edge>
 let ROW_BY_COL = new Map(); // colKey -> <li>
 let PATH_BY_EDGE = new Map(); // edgeKey -> <path>
 let SELECTED_COL = null;
+// Search hit globals
+let URI_BY_COL = null; // Map colKey -> example URI (from edges)
 
 // Distinct, accessible palette (WCAG-friendly-ish) for edge coloring
 const PALETTE = [
@@ -350,7 +356,11 @@ function layoutTables(){
   const cardById = new Map();
   TABLES.forEach(t=>{
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
-    const h = document.createElement('header'); h.textContent = t.label; art.appendChild(h);
+    // Attach searchable metadata
+    art.setAttribute('data-id', (t.id||'').toLowerCase());
+    art.setAttribute('data-full', (t.full||'').toLowerCase());
+    art.setAttribute('data-label', (t.label||'').toLowerCase());
+    const h = document.createElement('header'); h.textContent = t.label; h.title = t.full || t.label; art.appendChild(h);
     const ul = document.createElement('ul');
     t.columns.forEach((c, i)=>{
       const li = document.createElement('li'); if(i%2) li.classList.add('alt');
@@ -615,23 +625,61 @@ function clearTargets(){
 function findAndFocus(q){
   if (!q) return;
   const stage = document.getElementById('stage');
-  const ql = q.toLowerCase();
-  // try table header
+  // Normalize query: trim, lower, strip quotes, plus, and URI prefix
+  function cleanQuery(s){
+    let x = (s||'').trim().toLowerCase();
+    x = x.replace(/^\+|\+$/g,''); // trim + on both ends
+    x = x.replace(/^"|"$/g,''); // strip surrounding quotes
+    x = x.replace(/^mssql:\/\/[^/]+\//,''); // drop scheme+host
+    return x;
+  }
+  const ql = cleanQuery(q);
+
+  // Try exact column match by fully-qualified key (data-key)
+  let li = stage.querySelector(`.table-node li.col-row[data-key="${ql}"]`);
+  // Try endsWith match for partial keys like schema.table.column or table.column
+  if (!li && ql.includes('.')){
+    const needle = '.' + ql;
+    li = Array.from(stage.querySelectorAll('.table-node li.col-row')).find(el=>{
+      const k = (el.getAttribute('data-key')||'').toLowerCase();
+      return k.endsWith(needle);
+    });
+  }
+  // Try column-name contains
+  if (!li){
+    li = Array.from(stage.querySelectorAll('.table-node li span.name')).find(span=> (span.textContent||'').toLowerCase().includes(ql))?.closest('li');
+  }
+  if (li){
+    const key = li.getAttribute('data-key');
+    if (key){ selectColumnKey(key); }
+    const card = li.closest('.table-node');
+    if (card){
+      clearTargets(); card.classList.add('target');
+      const viewport = document.getElementById('viewport');
+      const rectV = viewport.getBoundingClientRect();
+      const rectC = card.getBoundingClientRect();
+      const dx = (rectC.left - rectV.left) + rectC.width/2;
+      const dy = (rectC.top - rectV.top) + rectC.height/2;
+      viewport.scrollLeft += dx - rectV.width/2;
+      viewport.scrollTop  += dy - rectV.height/2;
+      drawEdges();
+      return;
+    }
+  }
+
+  // Table search: match header text, data-full, or data-id
   let card = Array.from(stage.querySelectorAll('.table-node')).find(art=>{
     const h = art.querySelector('header');
-    return h && h.textContent.toLowerCase().includes(ql);
+    const label = (h && h.textContent ? h.textContent.toLowerCase() : '');
+    const full = (art.getAttribute('data-full')||'');
+    const idv  = (art.getAttribute('data-id')||'');
+    return label.includes(ql) || full.includes(ql) || idv.includes(ql);
   });
-  // fallback to columns
-  if (!card){
-    const li = Array.from(stage.querySelectorAll('.table-node li span:nth-child(2)')).find(span=> span.textContent.toLowerCase().includes(ql));
-    if (li) card = li.closest('.table-node');
-  }
   if (!card) return;
   clearTargets(); card.classList.add('target');
   const viewport = document.getElementById('viewport');
   const rectV = viewport.getBoundingClientRect();
   const rectC = card.getBoundingClientRect();
-  // compute desired scroll to center the card
   const dx = (rectC.left - rectV.left) + rectC.width/2;
   const dy = (rectC.top - rectV.top) + rectC.height/2;
   viewport.scrollLeft += dx - rectV.width/2;
@@ -643,7 +691,10 @@ document.getElementById('btnZoomIn').addEventListener('click', ()=> zoomBy(1.1))
 document.getElementById('btnZoomOut').addEventListener('click', ()=> zoomBy(0.9));
 document.getElementById('btnFit').addEventListener('click', ()=> fitToContent());
 document.getElementById('search').addEventListener('keydown', (e)=>{
-  if (e.key === 'Enter') findAndFocus(e.currentTarget.value||'');
+  if (e.key === 'Enter'){
+    const q = (e.currentTarget.value||'');
+    highlightSearch(q);
+  }
 });
 
 // ---- Crossing minimization (barycentric) ----
@@ -746,11 +797,23 @@ function buildColGraph(){
   COL_OUT = new Map();
   COL_IN = new Map();
   ROW_BY_COL = new Map();
+  URI_BY_COL = new Map();
   // map li rows by column key
   document.querySelectorAll('.table-node li').forEach(li=>{
     const left = li.querySelector('.port.left');
     const key = left && left.getAttribute('data-key');
-    if (key){ li.classList.add('col-row'); li.setAttribute('data-key', key); li.setAttribute('tabindex','0'); ROW_BY_COL.set(key, li); }
+    if (key){
+      li.classList.add('col-row');
+      li.setAttribute('data-key', key);
+      li.setAttribute('tabindex','0');
+      // also store column name and full for search
+      const nameSpan = li.querySelector('.name');
+      const colName = nameSpan ? (nameSpan.textContent||'') : '';
+      li.setAttribute('data-name', colName.toLowerCase());
+      // full: ns.tbl + '.' + col (same as key)
+      li.setAttribute('data-full', key.toLowerCase());
+      ROW_BY_COL.set(key, li);
+    }
   });
   EDGES.forEach(e=>{
     const s = parseUri(e.from), t = parseUri(e.to);
@@ -760,6 +823,14 @@ function buildColGraph(){
     if (!COL_IN.has(tKey)) COL_IN.set(tKey, []);
     COL_OUT.get(sKey).push(e);
     COL_IN.get(tKey).push(e);
+    // Example URIs for search
+    if (e.from) URI_BY_COL.set(sKey, (e.from||'').toLowerCase());
+    if (e.to) URI_BY_COL.set(tKey, (e.to||'').toLowerCase());
+  });
+  // attach data-uri onto rows if known
+  ROW_BY_COL.forEach((li, key)=>{
+    const uri = URI_BY_COL.get(key);
+    if (uri) li.setAttribute('data-uri', uri);
   });
 }
 
@@ -865,6 +936,56 @@ function applyHighlight(srcKey, colSet, edgeSet){
   // Mark selected row distinctly
   const sel = ROW_BY_COL.get(srcKey);
   if (sel){ sel.classList.add('selected'); }
+}
+
+function clearSearchHits(){
+  document.querySelectorAll('.table-node.hit, .table-node li.hit').forEach(el=>el.classList.remove('hit'));
+}
+
+function highlightSearch(q){
+  clearSearchHits();
+  if (!q){ drawEdges(); return; }
+  // Normalize similarly to findAndFocus
+  function cleanQuery(s){
+    let x = (s||'').trim().toLowerCase();
+    x = x.replace(/^\+|\+$/g,'');
+    x = x.replace(/^"|"$/g,'');
+    x = x.replace(/^mssql:\/\/[^\/]+\//,'');
+    return x;
+  }
+  const ql = cleanQuery(q);
+  const stage = document.getElementById('stage');
+  // match tables by label/full/id
+  const cards = Array.from(stage.querySelectorAll('.table-node')).filter(art=>{
+    const label = art.getAttribute('data-label')||'';
+    const full = art.getAttribute('data-full')||'';
+    const id = art.getAttribute('data-id')||'';
+    return label.includes(ql) || full.includes(ql) || id.includes(ql);
+  });
+  cards.forEach(c=> c.classList.add('hit'));
+  // match rows by name/full/uri
+  const rows = Array.from(stage.querySelectorAll('.table-node li.col-row')).filter(li=>{
+    const name = li.getAttribute('data-name')||'';
+    const full = li.getAttribute('data-full')||'';
+    const uri = li.getAttribute('data-uri')||'';
+    // Support suffix match on fully qualified key
+    if (full.endsWith('.'+ql)) return true;
+    return name.includes(ql) || full.includes(ql) || uri.includes(ql);
+  });
+  rows.forEach(li=>{ li.classList.add('hit'); const card = li.closest('.table-node'); if (card) card.classList.add('hit'); });
+  // Scroll to first hit
+  const first = cards[0] || (rows[0] && rows[0].closest('.table-node'));
+  if (first){
+    clearTargets(); first.classList.add('target');
+    const viewport = document.getElementById('viewport');
+    const rectV = viewport.getBoundingClientRect();
+    const rectC = first.getBoundingClientRect();
+    const dx = (rectC.left - rectV.left) + rectC.width/2;
+    const dy = (rectC.top - rectV.top) + rectC.height/2;
+    viewport.scrollLeft += dx - rectV.width/2;
+    viewport.scrollTop  += dy - rectV.height/2;
+  }
+  drawEdges();
 }
 </script>
 </body>
