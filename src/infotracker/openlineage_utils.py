@@ -66,7 +66,15 @@ class OLMapper:
             
         output = outputs[0]  # Take first output
         name = output.get("name", "unknown")
-        namespace = output.get("namespace", "mssql://localhost/InfoTrackerDW")
+        namespace = output.get("namespace")
+        if not namespace:
+            parts = name.split(".")
+            if len(parts) == 3:
+                # Interpret as DB.schema.table
+                namespace = f"mssql://localhost/{parts[0]}"
+                name = ".".join(parts[1:])
+            else:
+                namespace = "mssql://localhost/InfoTrackerDW"
         
         facets = output.get("facets", {})
         

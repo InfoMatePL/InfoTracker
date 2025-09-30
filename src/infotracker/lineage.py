@@ -209,17 +209,16 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
         for ln in obj.lineage:
             lineage_fields[ln.output_column] = {
                 "inputFields": [
-                    {"namespace": f.namespace, "name": f.table_name, "field": f.column_name} 
+                    {"namespace": f.namespace, "name": f.table_name, "field": f.column_name}
                     for f in ln.input_fields
                 ],
                 "transformationType": ln.transformation_type.value,
-                "transformationDescription": ln.transformation_description
+                "transformationDescription": ln.transformation_description,
             }
-        
         facets["columnLineage"] = {
             "_producer": "https://github.com/OpenLineage/OpenLineage",
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",
-            "fields": lineage_fields
+            "fields": lineage_fields,
         }
     
     # Add quality metrics if requested
@@ -245,11 +244,13 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
         "name": job_name or getattr(obj, "job_name", f"warehouse/sql/{obj.name}.sql")
         },
         "inputs": inputs,
-        "outputs": [{
-            "namespace": ns,
-            "name": name,
-            "facets": facets
-        }]
+        "outputs": [
+            {
+                "namespace": ns,
+                "name": name,
+                "facets": facets,
+            }
+        ],
     }
     
     return event

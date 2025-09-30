@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 import yaml
 
 from .adapters import get_adapter
+from .object_db_registry import ObjectDbRegistry
 from .io_utils import read_text_safely
 from .lineage import emit_ol_from_object
 from .models import (
@@ -82,6 +83,14 @@ class Engine:
         adapter = get_adapter(req.adapter, self.config)
         parser = adapter.parser
 
+        # Load global object→DB registry and inject into parser (shared across files)
+        try:
+            db_map_path = getattr(self.config, "object_db_map_path", "build/object_db_map.json")
+        except Exception:
+            db_map_path = "build/object_db_map.json"
+        registry = ObjectDbRegistry.load(db_map_path)
+        parser.registry = registry
+
         warnings = 0
 
         # 1) Catalog (opcjonalny)
@@ -145,7 +154,7 @@ class Engine:
 
         outputs: List[List[str]] = []
         parsed_objects: List[ObjectInfo] = []
-        sql_file_map: Dict[str, Path] = {}  # object_name -> file_path
+        sql_file_map: Dict[str, List[Path]] = {}  # object_name -> [file_path,...]
 
         ignore_patterns: List[str] = list(getattr(self.config, "ignore", []) or [])
         
@@ -158,7 +167,8 @@ class Engine:
                 # Store mapping for later processing
                 obj_name = getattr(getattr(obj_info, "schema", None), "name", None) or getattr(obj_info, "name", None)
                 if obj_name:
-                    sql_file_map[obj_name] = sql_path
+                    # Allow multiple files to produce the same logical object (e.g., MERGE in SP outputs a table)
+                    sql_file_map.setdefault(obj_name, []).append(sql_path)
                     
                     # Skip ignored objects
                     if ignore_patterns and any(fnmatch(obj_name, pat) for pat in ignore_patterns):
@@ -170,6 +180,20 @@ class Engine:
                 warnings += 1
                 logger.warning("failed to parse %s: %s", sql_path, e)
 
+        # Promote soft→hard mappings before dependency resolution, allowing soft to override weak defaults
+        try:
+            #logger.info("DB-learn: promoting soft→hard (allowing soft to override 'infotrackerdb'/'InfoTrackerDW')")
+            added = registry.promote_soft(
+                min_votes=2,
+                min_margin=1,
+                override_weak_hard=True,
+                weak_defaults=("infotrackerdb", "InfoTrackerDW"),
+            )
+            #logger.info(f"DB-learn: promoted/overrode {added} mappings")
+            registry.save(db_map_path)
+        except Exception:
+            pass
+
         # Phase 2: Build dependency graph and resolve schemas in topological order
         dependency_graph = self._build_dependency_graph(parsed_objects)
         processing_order = self._topological_sort(dependency_graph)
@@ -179,57 +203,60 @@ class Engine:
         for obj_name in processing_order:
             if obj_name not in sql_file_map:
                 continue
-                
-            sql_path = sql_file_map[obj_name]
-            try:
-                sql_text = read_text_safely(sql_path, encoding=req.encoding)
-                
-                # Parse with updated schema registry (now has dependencies resolved)
-                obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
-                resolved_objects.append(obj_info)
-                
-                # Register this object's schema for future dependencies
-                if obj_info.schema:
-                    parser.schema_registry.register(obj_info.schema)
-                    # Also register in adapter's parser for lineage generation
-                    adapter.parser.schema_registry.register(obj_info.schema)
+            # Process every file that contributes to this object name
+            for sql_path in sql_file_map[obj_name]:
+                try:
+                    sql_text = read_text_safely(sql_path, encoding=req.encoding)
 
-                # Generate OpenLineage directly from resolved ObjectInfo
-                ol_payload = emit_ol_from_object(
-                    obj_info,
-                    quality_metrics=True,
-                    virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
-                )
+                    # Parse with updated schema registry (now has dependencies resolved)
+                    obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                    resolved_objects.append(obj_info)
 
-                # Save to file
-                target = out_dir / f"{sql_path.stem}.json"
-                target.write_text(json.dumps(ol_payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+                    # Register this object's schema for future dependencies
+                    if obj_info.schema:
+                        parser.schema_registry.register(obj_info.schema)
+                        # Also register in adapter's parser for lineage generation
+                        adapter.parser.schema_registry.register(obj_info.schema)
 
-                outputs.append([str(sql_path), str(target)])
+                    # Generate OpenLineage directly from resolved ObjectInfo
+                    ol_payload = emit_ol_from_object(
+                        obj_info,
+                        quality_metrics=True,
+                        virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
+                    )
 
-                # Check for warnings with enhanced diagnostics
-                out0 = (ol_payload.get("outputs") or [])
-                out0 = out0[0] if out0 else {}
-                facets = out0.get("facets", {})
-                has_schema_fields = bool(facets.get("schema", {}).get("fields"))
-                has_col_lineage = bool(facets.get("columnLineage", {}).get("fields"))
+                    # Save to file
+                    target = out_dir / f"{sql_path.stem}.json"
+                    target.write_text(
+                        json.dumps(ol_payload, indent=2, ensure_ascii=False, sort_keys=True),
+                        encoding="utf-8",
+                    )
 
-                # Enhanced warning classification
-                warning_reason = None
-                if getattr(obj_info, "object_type", "unknown") == "unknown":
-                    warning_reason = "UNKNOWN_OBJECT_TYPE"
-                elif hasattr(obj_info, 'no_output_reason') and obj_info.no_output_reason:
-                    warning_reason = obj_info.no_output_reason
-                elif not (has_schema_fields or has_col_lineage):
-                    warning_reason = "NO_SCHEMA_OR_LINEAGE"
+                    outputs.append([str(sql_path), str(target)])
 
-                if warning_reason:
+                    # Check for warnings with enhanced diagnostics
+                    out0 = (ol_payload.get("outputs") or [])
+                    out0 = out0[0] if out0 else {}
+                    facets = out0.get("facets", {})
+                    has_schema_fields = bool(facets.get("schema", {}).get("fields"))
+                    has_col_lineage = bool(facets.get("columnLineage", {}).get("fields"))
+
+                    # Enhanced warning classification
+                    warning_reason = None
+                    if getattr(obj_info, "object_type", "unknown") == "unknown":
+                        warning_reason = "UNKNOWN_OBJECT_TYPE"
+                    elif hasattr(obj_info, 'no_output_reason') and obj_info.no_output_reason:
+                        warning_reason = obj_info.no_output_reason
+                    elif not (has_schema_fields or has_col_lineage):
+                        warning_reason = "NO_SCHEMA_OR_LINEAGE"
+
+                    if warning_reason:
+                        warnings += 1
+                        logger.warning("Object %s: %s", obj_info.name, warning_reason)
+
+                except Exception as e:
                     warnings += 1
-                    logger.warning("Object %s: %s", obj_info.name, warning_reason)
-
-            except Exception as e:
-                warnings += 1
-                logger.warning("failed to process %s: %s", sql_path, e)
+                    logger.warning("failed to process %s: %s", sql_path, e)
 
         # 4) Build column graph from resolved objects (second pass)
         if resolved_objects:
@@ -257,6 +284,11 @@ class Engine:
                             "description": key[3],
                         })
                 graph_path.write_text(json.dumps({"edges": edges_dump}, indent=2, ensure_ascii=False), encoding="utf-8")
+                # Persist learned object→DB mapping for future runs
+                try:
+                    registry.save(db_map_path)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("failed to build column graph: %s", e)
 
@@ -330,9 +362,16 @@ class Engine:
                 if graph_path.exists():
                     data = json.loads(graph_path.read_text(encoding="utf-8"))
                     graph = ColumnGraph()
+                    import re as _re
+                    pat = _re.compile(r'^(mssql://localhost/[^.]+)\.(.+)\.([^.]+)$')
                     for edge in data.get("edges", []):
-                        from_ns, from_tbl, from_col = edge["from"].rsplit(".", 2)
-                        to_ns, to_tbl, to_col = edge["to"].rsplit(".", 2)
+                        mf = pat.match(edge.get("from", ""))
+                        mt = pat.match(edge.get("to", ""))
+                        if not (mf and mt):
+                            # Skip malformed entries gracefully
+                            continue
+                        from_ns, from_tbl, from_col = mf.group(1), mf.group(2), mf.group(3)
+                        to_ns, to_tbl, to_col = mt.group(1), mt.group(2), mt.group(3)
                         graph.add_edge(ColumnEdge(
                             from_column=ColumnNode(from_ns, from_tbl, from_col),
                             to_column=ColumnNode(to_ns, to_tbl, to_col),
@@ -388,20 +427,15 @@ class Engine:
             # Column wildcard pattern - leave as is, will be handled specially
             sel = f"mssql://localhost/InfoTrackerDW{sel}"
         elif sel.endswith('.*'):
-            # Table wildcard pattern
+            # Table wildcard pattern: keep as provided and let ColumnGraph handle suffix matching
             base_sel = sel[:-2]  # Remove .*
-            parts = [p for p in base_sel.split(".") if p]
-            if len(parts) == 2:
-                # schema.table.* -> namespace/schema.table.*
-                sel = f"mssql://localhost/InfoTrackerDW.{base_sel}.*"
-            elif len(parts) == 3:
-                # database.schema.table.* -> namespace/database.schema.table.*
-                sel = f"mssql://localhost/InfoTrackerDW.{base_sel}.*"
-            else:
+            parts = [p for p in base_sel.split('.') if p]
+            if len(parts) not in (2, 3) and '://' not in base_sel:
                 return {
                     "columns": ["message"],
                     "rows": [[f"Unsupported wildcard selector format: '{req.selector}'. Use 'schema.table.*' or 'database.schema.table.*'."]],
                 }
+            # leave sel unchanged for find_columns_wildcard
         else:
             parts = [p for p in sel.split(".") if p]
             if len(parts) == 2:
@@ -569,4 +603,3 @@ class Engine:
                 "rows": [["Error running diff: " + str(e)]], 
                 "exit_code": 1
             }
-
