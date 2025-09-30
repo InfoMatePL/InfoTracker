@@ -326,6 +326,14 @@ class ColumnGraph:
         for obj in objects:
             output_namespace = obj.schema.namespace
             output_table = obj.schema.name
+
+            # Normalize: strip leading '<DB>.' from table name if it matches namespace DB
+            try:
+                ns_db = output_namespace.rsplit('/', 1)[1]
+            except Exception:
+                ns_db = None
+            if ns_db and output_table and output_table.startswith(f"{ns_db}."):
+                output_table = output_table[len(ns_db) + 1:]
             
             for lineage in obj.lineage:
                 # Create output column node
@@ -337,9 +345,19 @@ class ColumnGraph:
                 
                 # Create edges for each input field
                 for input_field in lineage.input_fields:
+                    in_ns = input_field.namespace
+                    in_tbl = input_field.table_name
+                    # Normalize inputs similarly
+                    try:
+                        in_db = in_ns.rsplit('/', 1)[1] if in_ns else None
+                    except Exception:
+                        in_db = None
+                    if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
+                        in_tbl = in_tbl[len(in_db) + 1:]
+
                     input_column = ColumnNode(
-                        namespace=input_field.namespace,
-                        table_name=input_field.table_name,
+                        namespace=in_ns,
+                        table_name=in_tbl,
                         column_name=input_field.column_name
                     )
                     
