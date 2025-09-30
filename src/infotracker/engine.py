@@ -362,9 +362,16 @@ class Engine:
                 if graph_path.exists():
                     data = json.loads(graph_path.read_text(encoding="utf-8"))
                     graph = ColumnGraph()
+                    import re as _re
+                    pat = _re.compile(r'^(mssql://localhost/[^.]+)\.(.+)\.([^.]+)$')
                     for edge in data.get("edges", []):
-                        from_ns, from_tbl, from_col = edge["from"].rsplit(".", 2)
-                        to_ns, to_tbl, to_col = edge["to"].rsplit(".", 2)
+                        mf = pat.match(edge.get("from", ""))
+                        mt = pat.match(edge.get("to", ""))
+                        if not (mf and mt):
+                            # Skip malformed entries gracefully
+                            continue
+                        from_ns, from_tbl, from_col = mf.group(1), mf.group(2), mf.group(3)
+                        to_ns, to_tbl, to_col = mt.group(1), mt.group(2), mt.group(3)
                         graph.add_edge(ColumnEdge(
                             from_column=ColumnNode(from_ns, from_tbl, from_col),
                             to_column=ColumnNode(to_ns, to_tbl, to_col),
@@ -420,20 +427,15 @@ class Engine:
             # Column wildcard pattern - leave as is, will be handled specially
             sel = f"mssql://localhost/InfoTrackerDW{sel}"
         elif sel.endswith('.*'):
-            # Table wildcard pattern
+            # Table wildcard pattern: keep as provided and let ColumnGraph handle suffix matching
             base_sel = sel[:-2]  # Remove .*
-            parts = [p for p in base_sel.split(".") if p]
-            if len(parts) == 2:
-                # schema.table.* -> namespace/schema.table.*
-                sel = f"mssql://localhost/InfoTrackerDW.{base_sel}.*"
-            elif len(parts) == 3:
-                # database.schema.table.* -> namespace/database.schema.table.*
-                sel = f"mssql://localhost/InfoTrackerDW.{base_sel}.*"
-            else:
+            parts = [p for p in base_sel.split('.') if p]
+            if len(parts) not in (2, 3) and '://' not in base_sel:
                 return {
                     "columns": ["message"],
                     "rows": [[f"Unsupported wildcard selector format: '{req.selector}'. Use 'schema.table.*' or 'database.schema.table.*'."]],
                 }
+            # leave sel unchanged for find_columns_wildcard
         else:
             parts = [p for p in sel.split(".") if p]
             if len(parts) == 2:
