@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 import yaml
 
 from .adapters import get_adapter
+from .object_db_registry import ObjectDbRegistry
 from .io_utils import read_text_safely
 from .lineage import emit_ol_from_object
 from .models import (
@@ -81,6 +82,14 @@ class Engine:
         """
         adapter = get_adapter(req.adapter, self.config)
         parser = adapter.parser
+
+        # Load global object→DB registry and inject into parser (shared across files)
+        try:
+            db_map_path = getattr(self.config, "object_db_map_path", "build/object_db_map.json")
+        except Exception:
+            db_map_path = "build/object_db_map.json"
+        registry = ObjectDbRegistry.load(db_map_path)
+        parser.registry = registry
 
         warnings = 0
 
@@ -170,6 +179,20 @@ class Engine:
                 warnings += 1
                 logger.warning("failed to parse %s: %s", sql_path, e)
 
+        # Promote soft→hard mappings before dependency resolution, allowing soft to override weak defaults
+        try:
+            #logger.info("DB-learn: promoting soft→hard (allowing soft to override 'infotrackerdb'/'InfoTrackerDW')")
+            added = registry.promote_soft(
+                min_votes=2,
+                min_margin=1,
+                override_weak_hard=True,
+                weak_defaults=("infotrackerdb", "InfoTrackerDW"),
+            )
+            #logger.info(f"DB-learn: promoted/overrode {added} mappings")
+            registry.save(db_map_path)
+        except Exception:
+            pass
+
         # Phase 2: Build dependency graph and resolve schemas in topological order
         dependency_graph = self._build_dependency_graph(parsed_objects)
         processing_order = self._topological_sort(dependency_graph)
@@ -257,6 +280,11 @@ class Engine:
                             "description": key[3],
                         })
                 graph_path.write_text(json.dumps({"edges": edges_dump}, indent=2, ensure_ascii=False), encoding="utf-8")
+                # Persist learned object→DB mapping for future runs
+                try:
+                    registry.save(db_map_path)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("failed to build column graph: %s", e)
 
@@ -569,4 +597,3 @@ class Engine:
                 "rows": [["Error running diff: " + str(e)]], 
                 "exit_code": 1
             }
-

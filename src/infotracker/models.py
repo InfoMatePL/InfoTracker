@@ -40,6 +40,17 @@ class ColumnReference:
     table_name: str
     column_name: str
     
+    def __post_init__(self) -> None:
+        # Ensure table_name is always schema.table (strip database if present).
+        # Leave temp tables as-is (e.g., "tempdb..#tmp").
+        if self.table_name:
+            # Skip tempdb pattern
+            if self.table_name.startswith('tempdb..#') or self.table_name.startswith('#'):
+                return
+            parts = self.table_name.split('.')
+            if len(parts) >= 3:
+                self.table_name = '.'.join(parts[-2:])
+    
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
 

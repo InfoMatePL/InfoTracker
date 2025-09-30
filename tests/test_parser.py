@@ -22,7 +22,7 @@ class TestSqlParser:
         sql = sql_content["01_customers"]
         obj_info = self.parser.parse_sql_file(sql, "01_customers")
         
-        assert obj_info.name == "STG.dbo.Customers"
+        assert obj_info.name == "dbo.Customers"
         assert obj_info.object_type == "table"
         assert len(obj_info.schema.columns) == 4
         assert len(obj_info.lineage) == 0  # Tables don't have lineage
@@ -57,7 +57,7 @@ class TestSqlParser:
         sql = sql_content["10_stg_orders"]
         obj_info = self.parser.parse_sql_file(sql, "10_stg_orders")
         
-        assert obj_info.name == "STG.dbo.stg_orders"
+        assert obj_info.name == "dbo.stg_orders"
         assert obj_info.object_type == "view"
         assert len(obj_info.schema.columns) == 4
         assert len(obj_info.lineage) == 4
@@ -71,7 +71,7 @@ class TestSqlParser:
         orderid_lineage = lineage_by_column["OrderID"]
         assert orderid_lineage.transformation_type == TransformationType.IDENTITY
         assert len(orderid_lineage.input_fields) == 1
-        assert orderid_lineage.input_fields[0].table_name == "STG.dbo.Orders"
+        assert orderid_lineage.input_fields[0].table_name == "dbo.Orders"
         assert orderid_lineage.input_fields[0].column_name == "OrderID"
         
         # CustomerID - Identity transformation
