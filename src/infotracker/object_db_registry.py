@@ -84,3 +84,35 @@ class ObjectDbRegistry:
                 return top[0][0]
         return fallback or "InfoTrackerDW"
 
+    def promote_soft(
+        self,
+        min_votes: int = 2,
+        min_margin: int = 1,
+        override_weak_hard: bool = True,
+        weak_defaults: tuple[str, ...] = ("infotrackerdb",),
+    ) -> int:
+        """
+        Promote soft votes to hard mappings when a clear majority exists.
+        If override_weak_hard is True, allow overriding existing hard entries when
+        the current hard DB is in weak_defaults (treated as weak/default DB).
+
+        Returns the count of added/overridden mappings.
+        """
+        added = 0
+        weak_set = {w.lower() for w in weak_defaults}
+        for key, counter in list(self.soft.items()):
+            mc = counter.most_common(2)
+            if not mc:
+                continue
+            (top_db, top_cnt) = mc[0]
+            sec_cnt = mc[1][1] if len(mc) > 1 else 0
+            if top_cnt >= min_votes and (top_cnt - sec_cnt) >= min_margin:
+                if key in self.hard:
+                    hard_db = str(self.hard[key]).lower()
+                    if override_weak_hard and hard_db in weak_set:
+                        self.hard[key] = top_db
+                        added += 1
+                else:
+                    self.hard[key] = top_db
+                    added += 1
+        return added

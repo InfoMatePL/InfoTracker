@@ -1232,11 +1232,12 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
-        # Learn from CREATE
+        # Learn from CREATE only if raw name had explicit DB
         try:
-            if self.registry:
-                db_used = namespace.rsplit('/', 1)[-1]
-                self.registry.learn_from_create("table", table_name, db_used)
+            raw_ident = schema_expr.this.sql(dialect=self.dialect) if hasattr(schema_expr, 'this') and hasattr(schema_expr.this, 'sql') else str(schema_expr.this)
+            db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+            if self.registry and db_raw:
+                self.registry.learn_from_create("table", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
         
@@ -1377,11 +1378,12 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
-        # Learn from CREATE
+        # Learn from CREATE only if raw name had explicit DB
         try:
-            if self.registry:
-                db_used = namespace.rsplit('/', 1)[-1]
-                self.registry.learn_from_create("view", view_name, db_used)
+            raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
+            db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+            if self.registry and db_raw:
+                self.registry.learn_from_create("view", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
         
@@ -1452,11 +1454,12 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
-        # Learn from CREATE
+        # Learn from CREATE only if raw name had explicit DB
         try:
-            if self.registry:
-                db_used = namespace.rsplit('/', 1)[-1]
-                self.registry.learn_from_create("function", function_name, db_used)
+            raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
+            db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+            if self.registry and db_raw:
+                self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
 
@@ -1516,11 +1519,12 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
-        # Learn from CREATE
+        # Learn from CREATE only if raw name had explicit DB
         try:
-            if self.registry:
-                db_used = namespace.rsplit('/', 1)[-1]
-                self.registry.learn_from_create("procedure", procedure_name, db_used)
+            raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
+            db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+            if self.registry and db_raw:
+                self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
 
@@ -2495,9 +2499,12 @@ class SqlParser:
                 dependencies=set()
             )
             try:
-                if self.registry:
-                    db_used = namespace.rsplit('/', 1)[-1]
-                    self.registry.learn_from_create("function", function_name, db_used)
+                # Learn only when string CREATE had explicit DB
+                m = re.search(r'(?is)\bCREATE\s+FUNCTION\s+([^\s(]+)', sql_content)
+                raw_ident = m.group(1) if m else ""
+                db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+                if self.registry and db_raw:
+                    self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
             except Exception:
                 pass
             return obj
@@ -2522,9 +2529,12 @@ class SqlParser:
             dependencies=dependencies
         )
         try:
-            if self.registry:
-                db_used = namespace.rsplit('/', 1)[-1]
-                self.registry.learn_from_create("function", function_name, db_used)
+            # Learn only when string CREATE had explicit DB
+            m = re.search(r'(?is)\bCREATE\s+FUNCTION\s+([^\s(]+)', sql_content)
+            raw_ident = m.group(1) if m else ""
+            db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+            if self.registry and db_raw:
+                self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
         return obj
@@ -2581,11 +2591,13 @@ class SqlParser:
                                 for i, c in enumerate(cols)]
                     )
 
-            # Learn from procedure CREATE
+            # Learn from procedure CREATE only if raw name had explicit DB
             try:
-                if self.registry:
-                    db_used = namespace.rsplit('/', 1)[-1]
-                    self.registry.learn_from_create("procedure", procedure_name, db_used)
+                m = re.search(r'(?is)\bCREATE\s+(?:PROC|PROCEDURE)\s+([^\s(]+)', sql_content)
+                raw_ident = m.group(1) if m else ""
+                db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+                if self.registry and db_raw:
+                    self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
             except Exception:
                 pass
             return materialized_output
@@ -2608,11 +2620,13 @@ class SqlParser:
             lineage=lineage,
             dependencies=dependencies
         )
-        # Learn from procedure CREATE
+        # Learn from procedure CREATE only if raw name had explicit DB
         try:
-            if self.registry:
-                db_used = namespace.rsplit('/', 1)[-1]
-                self.registry.learn_from_create("procedure", procedure_name, db_used)
+            m = re.search(r'(?is)\bCREATE\s+(?:PROC|PROCEDURE)\s+([^\s(]+)', sql_content)
+            raw_ident = m.group(1) if m else ""
+            db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+            if self.registry and db_raw:
+                self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
         obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"

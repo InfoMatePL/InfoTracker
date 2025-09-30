@@ -179,6 +179,20 @@ class Engine:
                 warnings += 1
                 logger.warning("failed to parse %s: %s", sql_path, e)
 
+        # Promote soft→hard mappings before dependency resolution, allowing soft to override weak defaults
+        try:
+            #logger.info("DB-learn: promoting soft→hard (allowing soft to override 'infotrackerdb'/'InfoTrackerDW')")
+            added = registry.promote_soft(
+                min_votes=2,
+                min_margin=1,
+                override_weak_hard=True,
+                weak_defaults=("infotrackerdb", "InfoTrackerDW"),
+            )
+            #logger.info(f"DB-learn: promoted/overrode {added} mappings")
+            registry.save(db_map_path)
+        except Exception:
+            pass
+
         # Phase 2: Build dependency graph and resolve schemas in topological order
         dependency_graph = self._build_dependency_graph(parsed_objects)
         processing_order = self._topological_sort(dependency_graph)
