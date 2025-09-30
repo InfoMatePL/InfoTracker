@@ -1214,8 +1214,13 @@ class SqlParser:
         """Parse CREATE TABLE statement."""
         # Extract table name and schema from statement.this (which is a Schema object)
         schema_expr = statement.this
-        raw_name = self._get_table_name(schema_expr.this, object_hint)
-        ns, nm = self._ns_and_name(raw_name, obj_type_hint="table")
+        # IMPORTANT: do NOT prefix default DB here; let registry resolve DB if possible
+        try:
+            raw_ident = schema_expr.this.sql(dialect=self.dialect) if hasattr(schema_expr, 'this') and hasattr(schema_expr.this, 'sql') else str(schema_expr.this)
+        except Exception:
+            raw_ident = str(schema_expr.this)
+        raw_ident = self._normalize_table_ident(raw_ident)
+        ns, nm = self._ns_and_name(raw_ident, obj_type_hint="table")
         namespace = ns
         table_name = nm
         # If no explicit DB in object name, try inferring from body
@@ -1234,7 +1239,7 @@ class SqlParser:
                 namespace = f"mssql://localhost/{inferred_db}"
         # Learn from CREATE only if raw name had explicit DB
         try:
-            raw_ident = schema_expr.this.sql(dialect=self.dialect) if hasattr(schema_expr, 'this') and hasattr(schema_expr.this, 'sql') else str(schema_expr.this)
+            # Learn from CREATE only if raw name had explicit DB
             db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
             if self.registry and db_raw:
                 self.registry.learn_from_create("table", f"{sch_raw}.{tbl_raw}", db_raw)
@@ -1278,8 +1283,9 @@ class SqlParser:
         # 1) Wyciągnij nazwę tabeli
         m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
         raw_ident = self._normalize_table_ident(m.group(1)) if m else None
-        table_name = self._get_full_table_name(raw_ident) if raw_ident else (object_hint or "dbo.unknown_table")
-        ns, nm = self._ns_and_name(str(table_name), obj_type_hint="table")
+        # Do not add default DB yet; let registry mapping decide the DB first
+        name_for_ns = raw_ident or (object_hint or "dbo.unknown_table")
+        ns, nm = self._ns_and_name(name_for_ns, obj_type_hint="table")
         namespace = ns
         table_name = nm
         # Infer DB for string variant if object name lacks explicit DB
@@ -1532,7 +1538,26 @@ class SqlParser:
         # Extract the procedure body and find materialized outputs (SELECT INTO, INSERT INTO)
         materialized_outputs = self._extract_procedure_outputs(statement)
         
-        # If we have materialized outputs, return the last one instead of the procedure
+        # Try MERGE lineage as a materialized output if no SELECT INTO/INSERT INTO was found
+        if not materialized_outputs:
+            try:
+                m_lineage, m_cols, m_deps, m_target = self._extract_merge_lineage_string(str(statement), procedure_name)
+            except Exception:
+                m_lineage, m_cols, m_deps, m_target = ([], [], set(), None)
+            if m_target:
+                # Build ObjectInfo for the MERGE target as table output
+                ns_tgt, nm_tgt = self._ns_and_name(m_target, obj_type_hint="table")
+                schema = TableSchema(namespace=namespace or ns_tgt, name=nm_tgt, columns=m_cols)
+                out_obj = ObjectInfo(
+                    name=nm_tgt,
+                    object_type="table",
+                    schema=schema,
+                    lineage=m_lineage,
+                    dependencies=m_deps,
+                )
+                return out_obj
+
+        # If we have materialized outputs (SELECT INTO/INSERT INTO), return the last one instead of the procedure
         if materialized_outputs:
             last_output = materialized_outputs[-1]
             # Extract lineage for the materialized output
@@ -1629,6 +1654,101 @@ class SqlParser:
                     ))
         
         return outputs
+
+    def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str], Optional[str]]:
+        """Parse MERGE INTO ... USING ... and try to build lineage.
+
+        Returns (lineage, output_columns, dependencies, target_table) where target_table is schema.table.
+        """
+        lineage: List[ColumnLineage] = []
+        output_columns: List[ColumnSchema] = []
+        dependencies: Set[str] = set()
+        target_table: Optional[str] = None
+
+        cleaned = self._strip_sql_comments(sql_content)
+        # Find MERGE INTO <target>
+        m_target = re.search(r'(?is)MERGE\s+INTO\s+([^\s\(,;]+)', cleaned)
+        if not m_target:
+            return lineage, output_columns, dependencies, None
+        target_raw = self._normalize_table_ident(m_target.group(1))
+        # Normalize to schema.table for output naming
+        target_parts = target_raw.split('.')
+        if len(target_parts) >= 3:
+            target_table = f"{target_parts[-2]}.{target_parts[-1]}"
+        elif len(target_parts) == 2:
+            target_table = target_raw
+        else:
+            target_table = f"dbo.{target_raw}"
+
+        # Find USING source (table or subquery or temp)
+        m_using = re.search(r'(?is)USING\s+([^\s\(,;#]+|#\w+)(?:\s+AS\s+\w+|\s+\w+)?', cleaned)
+        source_name: Optional[str] = None
+        if m_using:
+            src = m_using.group(1).strip()
+            source_name = self._normalize_table_ident(src)
+
+        # If USING #temp, try to resolve temp -> base table via preceding SELECT ... INTO #temp FROM base
+        temp_to_base: dict[str, str] = {}
+        for m in re.finditer(r'(?is)SELECT\s+.*?\s+INTO\s+(#\w+)\s+FROM\s+([^\s\(,;]+(?:\.[^\s\(,;]+)*)', cleaned):
+            temp_to_base[self._normalize_table_ident(m.group(1))] = self._normalize_table_ident(m.group(2))
+        if source_name and (source_name.startswith('#') or source_name.lower().startswith('tempdb..#')):
+            base = temp_to_base.get(source_name) or temp_to_base.get(source_name.split('.')[-1])
+            if base:
+                source_name = base
+
+        # Map UPDATE SET tgt.col = src.col
+        # We'll collect assignments from the WHEN MATCHED THEN UPDATE SET block
+        update_block = re.search(r'(?is)WHEN\s+MATCHED.*?THEN\s+UPDATE\s+SET\s+(.*?)(?:WHEN\s+|;|$)', cleaned)
+        assign_pairs: list[tuple[str, str]] = []
+        if update_block:
+            assigns_raw = update_block.group(1)
+            for a in re.split(r',\s*', assigns_raw):
+                ma = re.search(r'(?i)\b(?:tgt\.|target\.|\w+\.)?(\w+)\s*=\s*(?:src\.|source\.|\w+\.)?(\w+)', a.strip())
+                if ma:
+                    assign_pairs.append((ma.group(1), ma.group(2)))
+
+        # Map INSERT (cols...) VALUES (src.cols...)
+        insert_block = re.search(r'(?is)WHEN\s+NOT\s+MATCHED\s+BY\s+TARGET\s+THEN\s+INSERT\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)', cleaned)
+        if insert_block:
+            cols = [c.strip() for c in insert_block.group(1).split(',') if c.strip()]
+            vals = [v.strip() for v in insert_block.group(2).split(',') if v.strip()]
+            for c, v in zip(cols, vals):
+                mc = re.search(r'(\w+)$', c)
+                mv = re.search(r'(\w+)$', v)
+                if mc and mv:
+                    assign_pairs.append((mc.group(1), mv.group(1)))
+
+        # Build output columns (union of left sides we have mapping for), keep order stable
+        seen = set()
+        for i, (t_col, s_col) in enumerate(assign_pairs):
+            if t_col not in seen:
+                output_columns.append(ColumnSchema(name=t_col, data_type=None, nullable=True, ordinal=i))
+                seen.add(t_col)
+
+        # Dependencies: add source_name if present
+        if source_name:
+            # Resolve temp source to base if it's temp
+            simple_src = source_name.split('.')[-1]
+            if simple_src in self.temp_registry:
+                # Try to find the SELECT INTO that created it and extract base deps from body
+                # Fallback: take dependencies from procedure body
+                deps_basic = self._extract_basic_dependencies(cleaned)
+                dependencies.update(d for d in deps_basic if not d.endswith(f".{target_table.split('.')[-1]}"))
+            else:
+                dependencies.add(source_name)
+
+        # Lineage edges: from source_name.s_col to target_table.t_col
+        if source_name and target_table:
+            ns_src, nm_src = self._ns_and_name(source_name)
+            for (t_col, s_col) in assign_pairs:
+                lineage.append(ColumnLineage(
+                    output_column=t_col,
+                    input_fields=[ColumnReference(namespace=ns_src, table_name=nm_src, column_name=s_col)],
+                    transformation_type=TransformationType.IDENTITY,
+                    transformation_description=f"MERGE USING {nm_src}: {t_col} = {s_col}"
+                ))
+
+        return lineage, output_columns, dependencies, target_table
     
     def _normalize_table_name_for_output(self, table_name: str) -> str:
         """Normalize table name for output - remove database prefix, keep schema.table format."""
@@ -2602,7 +2722,34 @@ class SqlParser:
                 pass
             return materialized_output
 
-        # 2) Jeśli nie materializuje — standard: ostatni SELECT jako „wirtualny” dataset procedury
+        # 2) Spróbuj MERGE INTO ... USING ... jako materializację celu
+        try:
+            m_lineage, m_cols, m_deps, m_target = self._extract_merge_lineage_string(sql_content, procedure_name)
+        except Exception:
+            m_lineage, m_cols, m_deps, m_target = ([], [], set(), None)
+        if m_target:
+            # Zwróć obiekt tabeli jako output procedury (jak dla SELECT INTO / INSERT INTO)
+            ns_tgt, nm_tgt = self._ns_and_name(m_target, obj_type_hint="table")
+            schema = TableSchema(namespace=ns_tgt, name=nm_tgt, columns=m_cols)
+            out_obj = ObjectInfo(
+                name=nm_tgt,
+                object_type="table",
+                schema=schema,
+                lineage=m_lineage,
+                dependencies=m_deps,
+            )
+            # Learn from procedure CREATE only if raw name had explicit DB
+            try:
+                m = re.search(r'(?is)\bCREATE\s+(?:PROC|PROCEDURE)\s+([^\s(]+)', sql_content)
+                raw_ident = m.group(1) if m else ""
+                db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
+                if self.registry and db_raw:
+                    self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
+            except Exception:
+                pass
+            return out_obj
+
+        # 3) Jeśli nie materializuje — standard: ostatni SELECT jako „wirtualny” dataset procedury
         lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
 
         schema = TableSchema(
@@ -3079,7 +3226,7 @@ class SqlParser:
 
         sql_keywords = {
             'select','from','join','on','where','group','having','order','into',
-            'update','delete','merge','as','and','or','not','case','when','then','else',
+            'update','delete','merge','as','and','or','not','case','when','then','else','set',
             'distinct','top','with','nolock','commit','rollback','transaction','begin','try','catch','exists'
         }
         builtin_functions = {

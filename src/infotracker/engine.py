@@ -154,7 +154,7 @@ class Engine:
 
         outputs: List[List[str]] = []
         parsed_objects: List[ObjectInfo] = []
-        sql_file_map: Dict[str, Path] = {}  # object_name -> file_path
+        sql_file_map: Dict[str, List[Path]] = {}  # object_name -> [file_path,...]
 
         ignore_patterns: List[str] = list(getattr(self.config, "ignore", []) or [])
         
@@ -167,7 +167,8 @@ class Engine:
                 # Store mapping for later processing
                 obj_name = getattr(getattr(obj_info, "schema", None), "name", None) or getattr(obj_info, "name", None)
                 if obj_name:
-                    sql_file_map[obj_name] = sql_path
+                    # Allow multiple files to produce the same logical object (e.g., MERGE in SP outputs a table)
+                    sql_file_map.setdefault(obj_name, []).append(sql_path)
                     
                     # Skip ignored objects
                     if ignore_patterns and any(fnmatch(obj_name, pat) for pat in ignore_patterns):
@@ -202,57 +203,60 @@ class Engine:
         for obj_name in processing_order:
             if obj_name not in sql_file_map:
                 continue
-                
-            sql_path = sql_file_map[obj_name]
-            try:
-                sql_text = read_text_safely(sql_path, encoding=req.encoding)
-                
-                # Parse with updated schema registry (now has dependencies resolved)
-                obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
-                resolved_objects.append(obj_info)
-                
-                # Register this object's schema for future dependencies
-                if obj_info.schema:
-                    parser.schema_registry.register(obj_info.schema)
-                    # Also register in adapter's parser for lineage generation
-                    adapter.parser.schema_registry.register(obj_info.schema)
+            # Process every file that contributes to this object name
+            for sql_path in sql_file_map[obj_name]:
+                try:
+                    sql_text = read_text_safely(sql_path, encoding=req.encoding)
 
-                # Generate OpenLineage directly from resolved ObjectInfo
-                ol_payload = emit_ol_from_object(
-                    obj_info,
-                    quality_metrics=True,
-                    virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
-                )
+                    # Parse with updated schema registry (now has dependencies resolved)
+                    obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                    resolved_objects.append(obj_info)
 
-                # Save to file
-                target = out_dir / f"{sql_path.stem}.json"
-                target.write_text(json.dumps(ol_payload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+                    # Register this object's schema for future dependencies
+                    if obj_info.schema:
+                        parser.schema_registry.register(obj_info.schema)
+                        # Also register in adapter's parser for lineage generation
+                        adapter.parser.schema_registry.register(obj_info.schema)
 
-                outputs.append([str(sql_path), str(target)])
+                    # Generate OpenLineage directly from resolved ObjectInfo
+                    ol_payload = emit_ol_from_object(
+                        obj_info,
+                        quality_metrics=True,
+                        virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
+                    )
 
-                # Check for warnings with enhanced diagnostics
-                out0 = (ol_payload.get("outputs") or [])
-                out0 = out0[0] if out0 else {}
-                facets = out0.get("facets", {})
-                has_schema_fields = bool(facets.get("schema", {}).get("fields"))
-                has_col_lineage = bool(facets.get("columnLineage", {}).get("fields"))
+                    # Save to file
+                    target = out_dir / f"{sql_path.stem}.json"
+                    target.write_text(
+                        json.dumps(ol_payload, indent=2, ensure_ascii=False, sort_keys=True),
+                        encoding="utf-8",
+                    )
 
-                # Enhanced warning classification
-                warning_reason = None
-                if getattr(obj_info, "object_type", "unknown") == "unknown":
-                    warning_reason = "UNKNOWN_OBJECT_TYPE"
-                elif hasattr(obj_info, 'no_output_reason') and obj_info.no_output_reason:
-                    warning_reason = obj_info.no_output_reason
-                elif not (has_schema_fields or has_col_lineage):
-                    warning_reason = "NO_SCHEMA_OR_LINEAGE"
+                    outputs.append([str(sql_path), str(target)])
 
-                if warning_reason:
+                    # Check for warnings with enhanced diagnostics
+                    out0 = (ol_payload.get("outputs") or [])
+                    out0 = out0[0] if out0 else {}
+                    facets = out0.get("facets", {})
+                    has_schema_fields = bool(facets.get("schema", {}).get("fields"))
+                    has_col_lineage = bool(facets.get("columnLineage", {}).get("fields"))
+
+                    # Enhanced warning classification
+                    warning_reason = None
+                    if getattr(obj_info, "object_type", "unknown") == "unknown":
+                        warning_reason = "UNKNOWN_OBJECT_TYPE"
+                    elif hasattr(obj_info, 'no_output_reason') and obj_info.no_output_reason:
+                        warning_reason = obj_info.no_output_reason
+                    elif not (has_schema_fields or has_col_lineage):
+                        warning_reason = "NO_SCHEMA_OR_LINEAGE"
+
+                    if warning_reason:
+                        warnings += 1
+                        logger.warning("Object %s: %s", obj_info.name, warning_reason)
+
+                except Exception as e:
                     warnings += 1
-                    logger.warning("Object %s: %s", obj_info.name, warning_reason)
-
-            except Exception as e:
-                warnings += 1
-                logger.warning("failed to process %s: %s", sql_path, e)
+                    logger.warning("failed to process %s: %s", sql_path, e)
 
         # 4) Build column graph from resolved objects (second pass)
         if resolved_objects:

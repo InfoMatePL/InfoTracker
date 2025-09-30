@@ -71,17 +71,49 @@ class ObjectDbRegistry:
         return self.hard.get(k1) or self.hard.get(k2)
 
     def resolve(self, obj_type: str, schema_table: str, fallback: Optional[str] = None) -> str:
+        """Resolve DB for given object type and schema.table.
+
+        Resolution precedence (stable, deterministic):
+        1) If a specific hard mapping exists and it's not a weak default, return it.
+        2) Otherwise, if a wildcard hard mapping exists, prefer it when it differs from a weak default.
+        3) Otherwise, if soft votes exist (specific or wildcard) with a clear leader, return the leader.
+        4) Fallback to provided default or "InfoTrackerDW".
+
+        Rationale: Avoid fragmenting namespaces when an early hard mapping points to a generic
+        default DB like "InfoTrackerDW". Prefer later-learned wildcard/soft signals that
+        consistently map an object to a real DB (e.g., STG, EDW_CORE).
+        """
+        weak_defaults = {"infotrackerdb", "infotrackerdw"}
+
         k1 = _key(obj_type, schema_table)
-        if k1 in self.hard:
-            return self.hard[k1]
         k2 = _wild(schema_table)
-        if k2 in self.hard:
-            return self.hard[k2]
+
+        specific_hard = self.hard.get(k1)
+        wildcard_hard = self.hard.get(k2)
+
+        # 1) Strong specific hard mapping
+        if specific_hard and str(specific_hard).lower() not in weak_defaults:
+            return specific_hard
+
+        # 2) Prefer wildcard hard over weak specific default
+        if wildcard_hard:
+            # If specific is weak or absent, or differs from wildcard, choose wildcard
+            if (not specific_hard) or (str(specific_hard).lower() in weak_defaults) or (wildcard_hard != specific_hard):
+                return wildcard_hard
+
+        # 3) Soft votes (specific first, then wildcard)
         c = self.soft.get(k1) or self.soft.get(k2)
         if c:
             top = c.most_common(2)
             if len(top) == 1 or (len(top) > 1 and top[0][1] > top[1][1]):
-                return top[0][0]
+                candidate = top[0][0]
+                # If specific is weak default or absent, allow soft leader
+                if (not specific_hard) or (str(specific_hard).lower() in weak_defaults):
+                    return candidate
+
+        # 4) Fallbacks
+        if specific_hard:
+            return specific_hard
         return fallback or "InfoTrackerDW"
 
     def promote_soft(
