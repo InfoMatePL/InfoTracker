@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .viz import build_viz_html 
 import logging
 import json
 import sys
@@ -128,6 +129,35 @@ def diff(
     _emit(result, format)
     raise typer.Exit(code=result.get("exit_code", 0))
 
+
+@app.command()
+def viz(
+    ctx: typer.Context,
+    graph_dir: Path = typer.Option(..., "--graph-dir", exists=True, file_okay=False,
+                                   help="Folder z column_graph.json"),
+    out: Optional[Path] = typer.Option(None, "--out", help="Ścieżka do wyjściowego HTML; domyślnie <graph_dir>/lineage_viz.html"),
+    focus: Optional[str] = typer.Option(None, "-f", "--focus", help="Punkt startowy (ns.table.column lub wzorzec)"),
+    depth: int = typer.Option(2, "--depth", help="Zasięg sąsiadów (poziomy)"),
+    direction: str = typer.Option("both", "--direction", help="up|down|both", show_choices=True),
+    open_browser: bool = typer.Option(True, "--open", help="Otwórz w przeglądarce po wygenerowaniu"),
+):
+    cfg: RuntimeConfig = ctx.obj["cfg"]
+
+    graph_path = graph_dir / "column_graph.json"
+    if not graph_path.exists():
+        console.print(f"[red]Brak pliku: {graph_path}[/red]")
+        raise typer.Exit(1)
+
+    out_file = out or (graph_dir / "lineage_viz.html")
+    out_file.write_text(
+        build_viz_html(graph_path, focus=focus, depth=depth, direction=direction),
+        encoding="utf-8"
+    )
+
+    console.print(f"[green]Wygenerowano: {out_file}[/green]")
+    if open_browser:
+        import webbrowser
+        webbrowser.open(out_file.resolve().as_uri())
 
 def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
     from rich.table import Table
