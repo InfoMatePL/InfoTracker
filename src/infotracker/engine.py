@@ -11,6 +11,7 @@ from fnmatch import fnmatch
 import yaml
 
 from .adapters import get_adapter
+from .object_db_registry import ObjectDbRegistry
 from .io_utils import read_text_safely
 from .lineage import emit_ol_from_object
 from .models import (
@@ -81,6 +82,14 @@ class Engine:
         """
         adapter = get_adapter(req.adapter, self.config)
         parser = adapter.parser
+
+        # Load global object→DB registry and inject into parser (shared across files)
+        try:
+            db_map_path = getattr(self.config, "object_db_map_path", "build/object_db_map.json")
+        except Exception:
+            db_map_path = "build/object_db_map.json"
+        registry = ObjectDbRegistry.load(db_map_path)
+        parser.registry = registry
 
         warnings = 0
 
@@ -257,6 +266,11 @@ class Engine:
                             "description": key[3],
                         })
                 graph_path.write_text(json.dumps({"edges": edges_dump}, indent=2, ensure_ascii=False), encoding="utf-8")
+                # Persist learned object→DB mapping for future runs
+                try:
+                    registry.save(db_map_path)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("failed to build column graph: %s", e)
 
@@ -569,4 +583,3 @@ class Engine:
                 "rows": [["Error running diff: " + str(e)]], 
                 "exit_code": 1
             }
-

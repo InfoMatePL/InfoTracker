@@ -21,13 +21,15 @@ logger = logging.getLogger(__name__)
 class SqlParser:
     """Parser for SQL statements using SQLGlot."""
     
-    def __init__(self, dialect: str = "tsql"):
+    def __init__(self, dialect: str = "tsql", registry=None):
         self.dialect = dialect
         self.schema_registry = SchemaRegistry()
         self.cte_registry: Dict[str, List[str]] = {}  # CTE name -> column list
         self.temp_registry: Dict[str, List[str]] = {}  # Temp table name -> column list
         self.default_database: Optional[str] = None  # Will be set from config
         self.current_database: Optional[str] = None  # Track current database context
+        # cross-file object→DB registry (optional)
+        self.registry = registry
     
     def _clean_proc_name(self, s: str) -> str:
         """Clean procedure name by removing semicolons and parameters."""
@@ -84,7 +86,7 @@ class SqlParser:
             return (self.current_database or self.default_database), parts[0], parts[1]
         return (self.current_database or self.default_database), "dbo", (parts[0] if parts else None)
 
-    def _ns_and_name(self, table_name: str) -> tuple[str, str]:
+    def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
         """Return (namespace, schema.table) regardless of input format.
 
         - Namespace is derived from the DB part of FQN if present; otherwise from
@@ -109,11 +111,24 @@ class SqlParser:
         if len(parts) >= 3 and parts[0].lower() in pseudo:
             parts = parts[1:]
 
-        # Determine namespace DB from FQN if present, otherwise from context
+        # Determine namespace DB from FQN if present; otherwise consult registry, then context
+        db: Optional[str]
         if len(parts) >= 3:
             db = parts[0]
         else:
-            db = self.current_database or self.default_database or "InfoTrackerDW"
+            # no explicit DB — try registry for stable mapping
+            db = None
+            schema_table = None
+            if len(parts) >= 2:
+                schema_table = ".".join(parts[-2:])
+            elif len(parts) == 1 and parts[0]:
+                schema_table = f"dbo.{parts[0]}"
+            if self.registry and schema_table:
+                # try hard+wild/soft resolution
+                fallback = self.current_database or self.default_database or "InfoTrackerDW"
+                db = self.registry.resolve(obj_type_hint or "table", schema_table, fallback=fallback)
+            if not db:
+                db = self.current_database or self.default_database or "InfoTrackerDW"
         ns = f"mssql://localhost/{db}"
 
         # Compute schema.table from last two real segments
@@ -991,7 +1006,15 @@ class SqlParser:
         
         # Use FQN of target to derive ns + name
         raw_target = self._get_table_name(into_expr, object_hint)
-        ns, nm = self._ns_and_name(raw_target)
+        # Learn target DB if explicit
+        try:
+            parts = (raw_target or "").split('.')
+            if len(parts) >= 3 and self.registry:
+                db, sch, tbl = parts[0], parts[1], ".".join(parts[2:])
+                self.registry.learn_from_targets(f"{sch}.{tbl}", db)
+        except Exception:
+            pass
+        ns, nm = self._ns_and_name(raw_target, obj_type_hint="table")
         namespace = ns
         table_name = nm
         
@@ -1027,7 +1050,15 @@ class SqlParser:
         """Parse INSERT INTO ... EXEC statement."""
         # Get target table name from INSERT INTO clause
         raw_target = self._get_table_name(statement.this, object_hint)
-        ns, nm = self._ns_and_name(raw_target)
+        # Learn target DB if explicit
+        try:
+            parts = (raw_target or "").split('.')
+            if len(parts) >= 3 and self.registry:
+                db, sch, tbl = parts[0], parts[1], ".".join(parts[2:])
+                self.registry.learn_from_targets(f"{sch}.{tbl}", db)
+        except Exception:
+            pass
+        ns, nm = self._ns_and_name(raw_target, obj_type_hint="table")
         namespace = ns
         table_name = nm
         
@@ -1114,7 +1145,15 @@ class SqlParser:
         
         # Get target table name from INSERT INTO clause
         raw_target = self._get_table_name(statement.this, object_hint)
-        ns, nm = self._ns_and_name(raw_target)
+        # Learn target DB if explicit
+        try:
+            parts = (raw_target or "").split('.')
+            if len(parts) >= 3 and self.registry:
+                db, sch, tbl = parts[0], parts[1], ".".join(parts[2:])
+                self.registry.learn_from_targets(f"{sch}.{tbl}", db)
+        except Exception:
+            pass
+        ns, nm = self._ns_and_name(raw_target, obj_type_hint="table")
         namespace = ns
         table_name = nm
         
@@ -1176,7 +1215,7 @@ class SqlParser:
         # Extract table name and schema from statement.this (which is a Schema object)
         schema_expr = statement.this
         raw_name = self._get_table_name(schema_expr.this, object_hint)
-        ns, nm = self._ns_and_name(raw_name)
+        ns, nm = self._ns_and_name(raw_name, obj_type_hint="table")
         namespace = ns
         table_name = nm
         # If no explicit DB in object name, try inferring from body
@@ -1193,6 +1232,13 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
+        # Learn from CREATE
+        try:
+            if self.registry:
+                db_used = namespace.rsplit('/', 1)[-1]
+                self.registry.learn_from_create("table", table_name, db_used)
+        except Exception:
+            pass
         
         # Extract columns from the schema expressions
         columns = []
@@ -1232,7 +1278,7 @@ class SqlParser:
         m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
         raw_ident = self._normalize_table_ident(m.group(1)) if m else None
         table_name = self._get_full_table_name(raw_ident) if raw_ident else (object_hint or "dbo.unknown_table")
-        ns, nm = self._ns_and_name(str(table_name))
+        ns, nm = self._ns_and_name(str(table_name), obj_type_hint="table")
         namespace = ns
         table_name = nm
         # Infer DB for string variant if object name lacks explicit DB
@@ -1314,7 +1360,7 @@ class SqlParser:
     def _parse_create_view(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE VIEW statement."""
         raw_view = self._get_table_name(statement.this, object_hint)
-        ns, nm = self._ns_and_name(raw_view)
+        ns, nm = self._ns_and_name(raw_view, obj_type_hint="view")
         namespace = ns
         view_name = nm
         # If no explicit DB in object name, try inferring from body
@@ -1331,6 +1377,13 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
+        # Learn from CREATE
+        try:
+            if self.registry:
+                db_used = namespace.rsplit('/', 1)[-1]
+                self.registry.learn_from_create("view", view_name, db_used)
+        except Exception:
+            pass
         
         # Get the expression (could be SELECT or UNION)
         view_expr = statement.expression
@@ -1382,7 +1435,7 @@ class SqlParser:
     def _parse_create_function(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION statement (table-valued functions only)."""
         raw_func = self._get_table_name(statement.this, object_hint)
-        ns, nm = self._ns_and_name(raw_func)
+        ns, nm = self._ns_and_name(raw_func, obj_type_hint="function")
         namespace = ns
         function_name = nm
         # If no explicit DB in object name, try inferring from body
@@ -1399,6 +1452,13 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
+        # Learn from CREATE
+        try:
+            if self.registry:
+                db_used = namespace.rsplit('/', 1)[-1]
+                self.registry.learn_from_create("function", function_name, db_used)
+        except Exception:
+            pass
 
         
         # Check if this is a table-valued function
@@ -1439,7 +1499,7 @@ class SqlParser:
     def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE PROCEDURE statement."""
         raw_proc = self._get_table_name(statement.this, object_hint)
-        ns, nm = self._ns_and_name(raw_proc)
+        ns, nm = self._ns_and_name(raw_proc, obj_type_hint="procedure")
         namespace = ns
         procedure_name = nm
         # If no explicit DB in object name, try inferring from body
@@ -1456,6 +1516,13 @@ class SqlParser:
             inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
             if inferred_db:
                 namespace = f"mssql://localhost/{inferred_db}"
+        # Learn from CREATE
+        try:
+            if self.registry:
+                db_used = namespace.rsplit('/', 1)[-1]
+                self.registry.learn_from_create("procedure", procedure_name, db_used)
+        except Exception:
+            pass
 
         
         # Extract the procedure body and find materialized outputs (SELECT INTO, INSERT INTO)
@@ -1685,6 +1752,16 @@ class SqlParser:
         for table in select_stmt.find_all(exp.Table):
             table_name = self._get_table_name(table)
             if table_name != "unknown":
+                # Learn references with explicit DB if available
+                try:
+                    if getattr(table, 'catalog', None):
+                        cat = str(table.catalog).strip('[]')
+                        if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"} and self.registry:
+                            sch = str(table.db) if getattr(table, 'db', None) else 'dbo'
+                            nm = f"{sch}.{table.name}"
+                            self.registry.learn_from_references(nm, cat)
+                except Exception:
+                    pass
                 # Check if this is a CTE - if so, get its base dependencies instead
                 simple_name = table_name.split('.')[-1]
                 if simple_name in self.cte_registry:
@@ -2406,7 +2483,7 @@ class SqlParser:
         # Check if this is a table-valued function
         if not self._is_table_valued_function_string(sql_content):
             # For scalar functions, create a simple object without lineage
-            return ObjectInfo(
+            obj = ObjectInfo(
                 name=function_name,
                 object_type="function",
                 schema=TableSchema(
@@ -2417,6 +2494,13 @@ class SqlParser:
                 lineage=[],
                 dependencies=set()
             )
+            try:
+                if self.registry:
+                    db_used = namespace.rsplit('/', 1)[-1]
+                    self.registry.learn_from_create("function", function_name, db_used)
+            except Exception:
+                pass
+            return obj
         
         # Handle table-valued functions
         lineage, output_columns, dependencies = self._extract_tvf_lineage_string(sql_content, function_name)
@@ -2430,13 +2514,20 @@ class SqlParser:
         # Register schema for future reference
         self.schema_registry.register(schema)
         
-        return ObjectInfo(
+        obj = ObjectInfo(
             name=function_name,
             object_type="function",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
         )
+        try:
+            if self.registry:
+                db_used = namespace.rsplit('/', 1)[-1]
+                self.registry.learn_from_create("function", function_name, db_used)
+        except Exception:
+            pass
+        return obj
     
     def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE PROCEDURE using string-based approach."""
@@ -2490,6 +2581,13 @@ class SqlParser:
                                 for i, c in enumerate(cols)]
                     )
 
+            # Learn from procedure CREATE
+            try:
+                if self.registry:
+                    db_used = namespace.rsplit('/', 1)[-1]
+                    self.registry.learn_from_create("procedure", procedure_name, db_used)
+            except Exception:
+                pass
             return materialized_output
 
         # 2) Jeśli nie materializuje — standard: ostatni SELECT jako „wirtualny” dataset procedury
@@ -2510,6 +2608,13 @@ class SqlParser:
             lineage=lineage,
             dependencies=dependencies
         )
+        # Learn from procedure CREATE
+        try:
+            if self.registry:
+                db_used = namespace.rsplit('/', 1)[-1]
+                self.registry.learn_from_create("procedure", procedure_name, db_used)
+        except Exception:
+            pass
         obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
         return obj
 
