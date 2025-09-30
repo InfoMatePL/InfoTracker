@@ -82,10 +82,69 @@ HTML_TMPL = """<!doctype html>
     --wire:#97a58a; --wire-strong:#6a7a5b;
   }
   html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial}
+  /* Modern toolbar styling */
+  #toolbar{
+    position:sticky; top:0; z-index:50;
+    display:flex; align-items:center; gap:8px;
+    padding:10px 12px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.70), rgba(255,255,255,0.55)) padding-box;
+    -webkit-backdrop-filter: blur(8px) saturate(140%);
+    backdrop-filter: blur(8px) saturate(140%);
+    border-bottom:1px solid #e5e7eb;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+  }
+  #toolbar button{
+    appearance:none; -webkit-appearance:none;
+    padding:6px 12px; height:32px; line-height:20px;
+    border:1px solid #cbd5e1; border-radius:8px; cursor:pointer;
+    background: linear-gradient(180deg, #f8fafc, #eef2f7);
+    color:#0f172a; font-weight:600; letter-spacing: .01em;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.8) inset, 0 1px 2px rgba(0,0,0,0.04);
+    transition: background .15s ease, transform .05s ease, border-color .15s ease, box-shadow .15s ease;
+  }
+  #toolbar button:hover{ background: linear-gradient(180deg, #ffffff, #f1f5f9); }
+  #toolbar button:active{ transform: translateY(0.5px); }
+  #toolbar button:focus-visible{ outline:2px solid #60a5fa; outline-offset:2px; }
+  /* make buttons feel like a group */
+  #toolbar button + button{ margin-left:-1px; }
+  #toolbar button:first-of-type{ border-top-right-radius:0; border-bottom-right-radius:0; }
+  #toolbar button:nth-of-type(2){ border-radius:0; }
+  #toolbar button:nth-of-type(3){ border-top-left-radius:0; border-bottom-left-radius:0; }
+  /* search field with magnifier */
+  #toolbar input{
+    flex:1 1 360px; min-width:160px; height:34px;
+    padding:6px 12px 6px 34px; border:1px solid #cbd5e1; border-radius:999px;
+    background:
+      url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="%236b7280" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>') 10px center / 16px 16px no-repeat,
+      linear-gradient(180deg, #ffffff, #f8fafc);
+    color:#111827;
+    box-shadow: 0 1px 0 rgba(255,255,255,0.8) inset;
+    transition: border-color .15s ease, box-shadow .15s ease;
+  }
+  #toolbar input::placeholder{ color:#94a3b8 }
+  #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,0.25); outline: none }
+  
+  /* Dark mode adjustments */
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; }
+    #toolbar{ background: linear-gradient(180deg, rgba(11,16,32,0.65), rgba(11,16,32,0.55)); border-bottom-color:#1e293b; box-shadow: 0 2px 10px rgba(0,0,0,0.35); }
+    #toolbar button{ background: linear-gradient(180deg, #0f172a, #0b1220); border-color:#243044; color:#e5eef5; box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 1px 2px rgba(0,0,0,0.3); }
+    #toolbar button:hover{ background: linear-gradient(180deg, #121a30, #0e1527); }
+    #toolbar input{
+      border-color:#243044; color:#e5eef5;
+      background:
+        url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="%2399a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>') 10px center / 16px 16px no-repeat,
+        linear-gradient(180deg, #101826, #0b1220);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset;
+    }
+    #toolbar input::placeholder{ color:#94a3b8 }
+    #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(59,130,246,0.25); }
+  }
   #viewport{position:relative; height:100%; overflow:auto}
   #stage{position:relative; min-width:100%; min-height:100%; transform-origin: 0 0;}
   svg.wires{position:absolute; inset:0; pointer-events:none; width:100%; height:100%; z-index:20}
   .empty{position:absolute; left:20px; top:20px; color:#6b7280; font-size:14px}
+  .empty{ top:80px }
   .table-node{position:absolute; width:240px; background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:0 1px 2px rgba(0,0,0,.06)}
   .table-node{ cursor: grab; user-select: none; }
   .table-node.dragging{ box-shadow:0 6px 24px rgba(0,0,0,.18); cursor: grabbing; }
@@ -93,6 +152,13 @@ HTML_TMPL = """<!doctype html>
   .table-node ul{list-style:none; margin:0; padding:6px 10px 10px}
   .table-node li{display:flex; align-items:center; justify-content:center; gap:8px; margin:4px 0; padding:6px 8px; background:var(--row); border:1px solid var(--row-border); border-radius:8px; white-space:nowrap; font-size:13px}
   .table-node li.alt{ background:var(--row-alt) }
+  .table-node li.col-row{ cursor: pointer; }
+  .table-node li.active{ outline:2px solid #6a7a5b }
+  .table-node li.selected{ outline:2px solid #111827; background:#fef3c7 }
+  .table-node li.col-row:hover{ border-color:#9bb1c9; box-shadow:0 1px 0 rgba(255,255,255,.7) inset, 0 1px 2px rgba(0,0,0,.05) }
+  .table-node li.col-row:focus-visible{ outline:2px solid #60a5fa; outline-offset:2px }
+  .table-node li .name{ user-select:none }
+  .dim{ opacity: .22 }
   .port{display:inline-block; width:8px; height:8px; border-radius:50%; background:#6a7a5b; box-shadow:0 0 0 2px #fff inset}
   .port.right{ margin-left:8px }
   .port.left{ margin-right:8px }
@@ -116,6 +182,7 @@ HTML_TMPL = """<!doctype html>
       <marker id=\"arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"6\" refY=\"3.5\" orient=\"auto\">
         <polygon points=\"0 0, 7 3.5, 0 7\" fill=\"var(--wire-strong)\"/>
       </marker>
+      <!-- colorized arrow markers will be injected below (arrow-0..N) -->
     </defs>
   </svg>
 </div>
@@ -128,6 +195,85 @@ const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
 // Global scale used by pan/zoom and wire projection; must be defined before first draw
 let SCALE = 1;
+let FIRST_FIT_DONE = false;
+
+// Lineage highlight globals (declared early to avoid TDZ on first draw)
+let COL_OUT = null; // Map colKey -> Array<edge>
+let COL_IN = null;  // Map colKey -> Array<edge>
+let ROW_BY_COL = new Map(); // colKey -> <li>
+let PATH_BY_EDGE = new Map(); // edgeKey -> <path>
+let SELECTED_COL = null;
+
+// Distinct, accessible palette (WCAG-friendly-ish) for edge coloring
+const PALETTE = [
+  '#2f855a', // green
+  '#1d4ed8', // blue
+  '#d97706', // amber
+  '#b91c1c', // red
+  '#7c3aed', // purple
+  '#0d9488', // teal
+  '#be123c', // rose
+  '#065f46', // green-dark
+  '#2563eb', // blue-bright
+  '#ea580c'  // orange
+];
+
+// Build color assignment per source (e.from) so multiple outgoing wires differ in color
+let EDGE_COLOR_IDX = null; // Map of edgeKey -> palette index
+let OUT_DEG = null; // Map of source columnKey (tableId.col) -> out degree
+function buildEdgeColors(){
+  const byFromCol = new Map(); // columnKey -> edges[]
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from);
+    const key = (s.tableId + '.' + s.col).toLowerCase();
+    const arr = byFromCol.get(key) || [];
+    arr.push(e); byFromCol.set(key, arr);
+  });
+  const m = new Map();
+  const outdeg = new Map();
+  // deterministic: sort outgoing edges by to+transformation
+  byFromCol.forEach((arr, fromColKey)=>{
+    outdeg.set(fromColKey, arr.length);
+    arr.sort((a,b)=>{
+      const ka = (a.to||'') + '|' + (a.transformation||'');
+      const kb = (b.to||'') + '|' + (b.transformation||'');
+      return ka.localeCompare(kb);
+    });
+    arr.forEach((e, i)=>{
+      const key = edgeKey(e);
+      m.set(key, i % PALETTE.length);
+    });
+  });
+  EDGE_COLOR_IDX = m;
+  OUT_DEG = outdeg;
+  ensureColorMarkers();
+}
+
+function edgeKey(e){
+  return (e.from||'') + '->' + (e.to||'') + ':' + (e.transformation||'');
+}
+
+function ensureColorMarkers(){
+  const defs = document.querySelector('#wires defs');
+  if (!defs) return;
+  // create markers for all palette indices if missing
+  PALETTE.forEach((col, idx)=>{
+    const id = 'arrow-' + idx;
+    if (defs.querySelector('#'+id)) return;
+    const m = document.createElementNS('http://www.w3.org/2000/svg','marker');
+    m.setAttribute('id', id);
+    m.setAttribute('markerWidth','8');
+    m.setAttribute('markerHeight','8');
+    m.setAttribute('refX','6');
+    m.setAttribute('refY','3.5');
+    m.setAttribute('orient','auto');
+    const poly = document.createElementNS('http://www.w3.org/2000/svg','polygon');
+    poly.setAttribute('points','0 0, 7 3.5, 0 7');
+    poly.setAttribute('fill', col);
+    m.appendChild(poly);
+    defs.appendChild(m);
+  });
+}
 
 // Robust rsplit for "ns.tbl.col" (ns may contain dots)
 function parseUri(u){
@@ -189,6 +335,8 @@ function layoutTables(){
     while(svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
     return;
   }
+  // compute edge colors once per layout
+  buildEdgeColors();
   const graph = buildGraph();
   const r = ranksFromGraph(graph);
   const layers = new Map(); r.forEach((rv,id)=>{ if(!layers.has(rv)) layers.set(rv,[]); layers.get(rv).push(id); });
@@ -205,11 +353,18 @@ function layoutTables(){
       const li = document.createElement('li'); if(i%2) li.classList.add('alt');
       // left/right ports for precise anchoring
       const left = document.createElement('span'); left.className='port left';
-      const txt = document.createElement('span'); txt.textContent = c;
+      const txt = document.createElement('span'); txt.className='name'; txt.textContent = c;
       const right = document.createElement('span'); right.className='port right';
       const key = `${t.id}.${c}`.toLowerCase();
       left.setAttribute('data-key', key); left.setAttribute('data-side','L');
       right.setAttribute('data-key', key); right.setAttribute('data-side','R');
+      // make whole row clickable and focusable immediately
+      li.classList.add('col-row');
+      li.setAttribute('data-key', key);
+      li.setAttribute('tabindex','0');
+      li.setAttribute('role','button');
+      li.addEventListener('click', onRowClick);
+      li.addEventListener('keydown', (ev)=>{ if (ev.key==='Enter' || ev.key===' '){ ev.preventDefault(); onRowClick(ev); } });
       li.appendChild(left); li.appendChild(txt); li.appendChild(right);
       ul.appendChild(li);
     });
@@ -219,18 +374,38 @@ function layoutTables(){
     makeDraggable(art);
   });
   if (wires) stage.appendChild(wires);
+  // Rows exist now -> (re)build column graph and mark rows clickable
+  buildColGraph();
   // Sizes
   const maxWidth = Math.max(240, ...[...cardById.values()].map(el=>{
     const w = Math.max(el.querySelector('header').offsetWidth, ...Array.from(el.querySelectorAll('li span:nth-child(2)')).map(s=>s.offsetWidth+60));
     return Math.min(420, w+24);
   }));
 
+  // Precompute approximate content height (tallest column) to support vertical centering
+  const rankHeights = new Map();
+  layers.forEach((ids, rk)=>{
+    const hs = ids.map(id=> cardById.get(id).offsetHeight);
+    const n = hs.length;
+    const sumH = hs.reduce((a,b)=>a+b,0);
+    const colH = n ? sumH + (n-1)*GUTTER_Y : 0;
+    rankHeights.set(rk, colH);
+  });
+  const maxColH = Math.max(0, ...rankHeights.values());
+  const viewportEl = document.getElementById('viewport');
+  const viewW = viewportEl.clientWidth / SCALE;
+  const viewH = viewportEl.clientHeight / SCALE;
+  const columns = Math.max(1, Math.max(...layers.keys()) + 1);
+  const contentW = columns * maxWidth + (columns - 1) * GUTTER_X;
+  const baseLeft = Math.max(LEFT, Math.floor((viewW - contentW) / 2));
+  const baseTop = Math.max(TOP, Math.floor((viewH - maxColH) / 2));
+
   const maxRank = Math.max(...layers.keys());
   let maxRight = 0, maxBottom = 0;
   const centerMap = new Map(); // tableId -> centerY
 
   for(let rk=0; rk<=maxRank; rk++){
-    const x = LEFT + rk*(maxWidth + GUTTER_X);
+    const x = baseLeft + rk*(maxWidth + GUTTER_X);
     const ids = layers.get(rk)||[];
     // build items with preferred center from predecessors
     const items = ids.map(id=>{
@@ -249,7 +424,7 @@ function layoutTables(){
       return aa-bb;
     });
 
-    let currentTop = TOP; // running top, ensures non-overlap
+  let currentTop = baseTop; // running top, ensures non-overlap and vertical centering
     items.forEach(it=>{
       const centerDesired = it.pref!=null ? it.pref : (currentTop + it.h/2);
       const center = Math.max(centerDesired, currentTop + it.h/2);
@@ -280,6 +455,16 @@ function layoutTables(){
 
   drawEdges();
   requestAnimationFrame(drawEdges);
+
+  // setup click handler for lineage highlight (event delegation)
+  stage.onclick = onStageClick;
+  stage.onkeydown = onStageKeyDown;
+
+  // auto-fit on first successful layout so users see content immediately
+  if (!FIRST_FIT_DONE && TABLES && TABLES.length){
+    FIRST_FIT_DONE = true;
+    setTimeout(()=>{ try{ fitToContent(); }catch(_){} }, 0);
+  }
 }
 
 function centerOf(el){
@@ -295,6 +480,7 @@ function drawEdges(){
   // clear old
   while(svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
 
+  PATH_BY_EDGE.clear();
   EDGES.forEach(e=>{
     const s = parseUri(e.from), t = parseUri(e.to);
     const sKey = (s.tableId + '.' + s.col).toLowerCase();
@@ -308,9 +494,26 @@ function drawEdges(){
     const p = document.createElementNS('http://www.w3.org/2000/svg','path');
     p.setAttribute('d', d);
     p.setAttribute('class','wire'+(e.transformation && e.transformation!=='IDENTITY' ? ' strong':'') );
-    p.setAttribute('marker-end','url(#arrow)');
+    const ek = edgeKey(e);
+    p.setAttribute('data-edge-key', ek);
+    // colorize by source column only if that column has multiple outgoing edges
+    const sColKey = (s.tableId + '.' + s.col).toLowerCase();
+    const deg = OUT_DEG && OUT_DEG.get(sColKey);
+    if (deg && deg > 1){
+      const idx = (EDGE_COLOR_IDX && EDGE_COLOR_IDX.get(edgeKey(e))) ?? 0;
+      const col = PALETTE[idx % PALETTE.length];
+      p.setAttribute('stroke', col);
+      p.setAttribute('marker-end', `url(#arrow-${idx % PALETTE.length})`);
+    } else {
+      p.setAttribute('marker-end','url(#arrow)');
+    }
     svg.appendChild(p);
+    PATH_BY_EDGE.set(ek, p);
   });
+  // Reapply highlight if a column is selected (scroll/resize triggers redraw)
+  if (SELECTED_COL){
+    try { highlightLineage(SELECTED_COL); } catch(_) {}
+  }
 }
 
 layoutTables();
@@ -358,6 +561,88 @@ viewport.addEventListener('wheel', (e)=>{
   drawEdges();
 }, { passive: false });
 
+// ---- Toolbar: Fit / Zoom +/- / Search ----
+function zoomBy(factor){
+  const prev = SCALE;
+  SCALE = Math.max(0.4, Math.min(2.5, SCALE * factor));
+  const stage = document.getElementById('stage');
+  stage.style.transform = `scale(${SCALE})`;
+  const viewport = document.getElementById('viewport');
+  const mx = viewport.clientWidth/2, my = viewport.clientHeight/2;
+  const worldX = (viewport.scrollLeft + mx) / prev;
+  const worldY = (viewport.scrollTop + my) / prev;
+  viewport.scrollLeft = worldX * SCALE - mx;
+  viewport.scrollTop = worldY * SCALE - my;
+  drawEdges();
+}
+
+function fitToContent(){
+  const viewport = document.getElementById('viewport');
+  const stage = document.getElementById('stage');
+  const cards = Array.from(stage.querySelectorAll('.table-node'));
+  if (!cards.length) return;
+  // content bounds
+  let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+  cards.forEach(c=>{
+    const x = parseFloat(c.style.left||'0');
+    const y = parseFloat(c.style.top||'0');
+    const w = c.offsetWidth, h=c.offsetHeight;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x+w); maxY = Math.max(maxY, y+h);
+  });
+  const pad = 120;
+  const contentW = (maxX - minX) + pad;
+  const contentH = (maxY - minY) + pad;
+  const scaleX = viewport.clientWidth / contentW;
+  const scaleY = viewport.clientHeight / contentH;
+  SCALE = Math.max(0.4, Math.min(1.0, Math.min(scaleX, scaleY)));
+  stage.style.transform = `scale(${SCALE})`;
+  // center
+  const cx = (minX + maxX)/2 - viewport.clientWidth/(2*SCALE);
+  const cy = (minY + maxY)/2 - viewport.clientHeight/(2*SCALE);
+  viewport.scrollLeft = Math.max(0, cx);
+  viewport.scrollTop = Math.max(0, cy);
+  drawEdges();
+}
+
+function clearTargets(){
+  document.querySelectorAll('.table-node.target').forEach(el=>el.classList.remove('target'));
+}
+
+function findAndFocus(q){
+  if (!q) return;
+  const stage = document.getElementById('stage');
+  const ql = q.toLowerCase();
+  // try table header
+  let card = Array.from(stage.querySelectorAll('.table-node')).find(art=>{
+    const h = art.querySelector('header');
+    return h && h.textContent.toLowerCase().includes(ql);
+  });
+  // fallback to columns
+  if (!card){
+    const li = Array.from(stage.querySelectorAll('.table-node li span:nth-child(2)')).find(span=> span.textContent.toLowerCase().includes(ql));
+    if (li) card = li.closest('.table-node');
+  }
+  if (!card) return;
+  clearTargets(); card.classList.add('target');
+  const viewport = document.getElementById('viewport');
+  const rectV = viewport.getBoundingClientRect();
+  const rectC = card.getBoundingClientRect();
+  // compute desired scroll to center the card
+  const dx = (rectC.left - rectV.left) + rectC.width/2;
+  const dy = (rectC.top - rectV.top) + rectC.height/2;
+  viewport.scrollLeft += dx - rectV.width/2;
+  viewport.scrollTop  += dy - rectV.height/2;
+  drawEdges();
+}
+
+document.getElementById('btnZoomIn').addEventListener('click', ()=> zoomBy(1.1));
+document.getElementById('btnZoomOut').addEventListener('click', ()=> zoomBy(0.9));
+document.getElementById('btnFit').addEventListener('click', ()=> fitToContent());
+document.getElementById('search').addEventListener('keydown', (e)=>{
+  if (e.key === 'Enter') findAndFocus(e.currentTarget.value||'');
+});
+
 // ---- Crossing minimization (barycentric) ----
 function orderLayers(layers, graph){
   const maxRank = Math.max(...layers.keys());
@@ -403,6 +688,8 @@ function bary(neighSet, posMap, fallback){
 let drag = null; // { el, startX, startY, left, top }
 function makeDraggable(card){
   card.addEventListener('mousedown', (e)=>{
+    // Allow clicking on rows without triggering drag
+    if (e.target && e.target.closest('li')) return;
     const target = e.currentTarget;
     drag = {
       el: target,
@@ -449,6 +736,127 @@ window.addEventListener('mouseup', ()=>{
   if (drag){ drag.el.classList.remove('dragging'); }
   drag = null;
 });
+
+// ====== Lineage highlight (per-column) ======
+
+function buildColGraph(){
+  COL_OUT = new Map();
+  COL_IN = new Map();
+  ROW_BY_COL = new Map();
+  // map li rows by column key
+  document.querySelectorAll('.table-node li').forEach(li=>{
+    const left = li.querySelector('.port.left');
+    const key = left && left.getAttribute('data-key');
+    if (key){ li.classList.add('col-row'); li.setAttribute('data-key', key); li.setAttribute('tabindex','0'); ROW_BY_COL.set(key, li); }
+  });
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    const sKey = (s.tableId + '.' + s.col).toLowerCase();
+    const tKey = (t.tableId + '.' + t.col).toLowerCase();
+    if (!COL_OUT.has(sKey)) COL_OUT.set(sKey, []);
+    if (!COL_IN.has(tKey)) COL_IN.set(tKey, []);
+    COL_OUT.get(sKey).push(e);
+    COL_IN.get(tKey).push(e);
+  });
+}
+
+function onStageClick(e){
+  const li = e.target && e.target.closest('li.col-row');
+  if (!li){
+    clearSelection();
+    return;
+  }
+  const key = li.getAttribute('data-key');
+  if (!key) return; selectColumnKey(key);
+}
+
+function onStageKeyDown(e){
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const li = e.target && e.target.closest('li.col-row');
+  if (!li) return;
+  e.preventDefault();
+  const key = li.getAttribute('data-key');
+  if (!key) return; selectColumnKey(key);
+}
+
+function onRowClick(e){
+  e.stopPropagation();
+  const li = e.currentTarget && e.currentTarget.closest('li.col-row');
+  if (!li) return;
+  const key = li.getAttribute('data-key');
+  if (!key) return; selectColumnKey(key);
+}
+
+function selectColumnKey(key){
+  if (SELECTED_COL === key){ clearSelection(); return; }
+  SELECTED_COL = key;
+  highlightLineage(key);
+}
+
+function clearSelection(){
+  SELECTED_COL = null;
+  // remove classes
+  document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
+    el.classList.remove('dim','active','selected');
+  });
+}
+
+function highlightLineage(srcKey){
+  const activeCols = new Set();
+  const activeEdges = new Set();
+  // BFS downstream
+  const q1 = [srcKey]; const seen1 = new Set([srcKey]);
+  while(q1.length){
+    const u = q1.shift(); activeCols.add(u);
+    const outs = COL_OUT.get(u) || [];
+    outs.forEach(e=>{
+      const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
+      activeEdges.add(edgeKey(e));
+      if (!seen1.has(v)){ seen1.add(v); q1.push(v); }
+    });
+  }
+  // BFS upstream
+  const q2 = [srcKey]; const seen2 = new Set([srcKey]);
+  while(q2.length){
+    const u = q2.shift(); activeCols.add(u);
+    const ins = COL_IN.get(u) || [];
+    ins.forEach(e=>{
+      const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
+      activeEdges.add(edgeKey(e));
+      if (!seen2.has(v)){ seen2.add(v); q2.push(v); }
+    });
+  }
+  applyHighlight(srcKey, activeCols, activeEdges);
+}
+
+function applyHighlight(srcKey, colSet, edgeSet){
+  // Default: dim everything
+  document.querySelectorAll('.table-node').forEach(card=>card.classList.add('dim'));
+  document.querySelectorAll('.table-node li').forEach(li=>li.classList.add('dim'));
+  document.querySelectorAll('svg .wire').forEach(p=>p.classList.add('dim'));
+
+  // Activate rows and remember their tables
+  const tablesActive = new Set();
+  colSet.forEach(colKey=>{
+    const li = ROW_BY_COL.get(colKey);
+    if (li){
+      li.classList.remove('dim');
+      li.classList.add('active');
+      const card = li.closest('.table-node');
+      if (card){ card.classList.remove('dim'); tablesActive.add(card.id); }
+    }
+  });
+
+  // Activate edges
+  edgeSet.forEach(ek=>{
+    const p = PATH_BY_EDGE.get(ek);
+    if (p){ p.classList.remove('dim'); p.classList.add('active'); }
+  });
+
+  // Mark selected row distinctly
+  const sel = ROW_BY_COL.get(srcKey);
+  if (sel){ sel.classList.add('selected'); }
+}
 </script>
 </body>
 </html>
