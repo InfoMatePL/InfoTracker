@@ -1722,13 +1722,13 @@ class SqlParser:
         def _transformation_for(expr: str) -> TransformationType:
             e = expr.upper()
             if 'HASHBYTES' in e:
-                return TransformationType.HASH if hasattr(TransformationType, 'HASH') else TransformationType.TRANSFORM
+                return TransformationType.EXPRESSION
             if re.search(r'\bCAST\s*\(', e):
-                return TransformationType.CAST if hasattr(TransformationType, 'CAST') else TransformationType.TRANSFORM
+                return TransformationType.CAST
             if re.search(r'\bCONVERT\s*\(|\bTRY_CAST\s*\(', e):
-                return TransformationType.CAST if hasattr(TransformationType, 'CAST') else TransformationType.TRANSFORM
+                return TransformationType.CAST
             if re.search(r'\bCOALESCE\s*\(', e) or re.search(r'\bISNULL\s*\(', e):
-                return TransformationType.COERCE if hasattr(TransformationType, 'COERCE') else TransformationType.TRANSFORM
+                return TransformationType.EXPRESSION
             return TransformationType.IDENTITY
 
         # Map UPDATE SET tgt.col = <expr>
@@ -2734,16 +2734,25 @@ class SqlParser:
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
         if materialized_output:
-            # 1a) Wyciągnij zależności ze SELECT-a po INSERT (żeby inputs nie były puste)
-            #     Najpierw spróbuj mocniej (parsuj SELECT po INSERT), potem fallback prosty.
+            # 1a) Specjalizowany parser: INSERT INTO ... SELECT -> policz linię kolumnową na podstawie tego SELECT-a
             try:
-                lineage_sel, _, deps_sel = self._extract_procedure_lineage_string(sql_content, procedure_name)
-                if deps_sel:
-                    materialized_output.dependencies = set(deps_sel)
+                ins_lineage, ins_deps = self._extract_insert_select_lineage_string(sql_content, procedure_name)
+                if ins_deps:
+                    materialized_output.dependencies = set(ins_deps)
+                if ins_lineage:
+                    materialized_output.lineage = ins_lineage
             except Exception:
-                basic_deps = self._extract_basic_dependencies(sql_content)
-                if basic_deps:
-                    materialized_output.dependencies = set(basic_deps)
+                # 1b) Fallback: spróbuj ogólnego ekstraktora procedury (może zawierać SELECT po INSERT)
+                try:
+                    lineage_sel, _, deps_sel = self._extract_procedure_lineage_string(sql_content, procedure_name)
+                    if deps_sel:
+                        materialized_output.dependencies = set(deps_sel)
+                    if lineage_sel:
+                        materialized_output.lineage = lineage_sel
+                except Exception:
+                    basic_deps = self._extract_basic_dependencies(sql_content)
+                    if basic_deps:
+                        materialized_output.dependencies = set(basic_deps)
 
             # 1b) BACKFILL schematu z rejestru (obsłuż warianty nazw z/bez prefiksu DB)
             ns = materialized_output.schema.namespace
@@ -2813,6 +2822,40 @@ class SqlParser:
                 pass
             return out_obj
 
+        # 2b) Spróbuj UPDATE ... FROM t JOIN s ...
+        try:
+            u_lineage, u_cols, u_deps, u_target = self._extract_update_from_lineage_string(sql_content)
+        except Exception:
+            u_lineage, u_cols, u_deps, u_target = ([], [], set(), None)
+        if u_target:
+            ns_tgt, nm_tgt = self._ns_and_name(u_target, obj_type_hint="table")
+            schema = TableSchema(namespace=ns_tgt, name=nm_tgt, columns=u_cols)
+            out_obj = ObjectInfo(
+                name=nm_tgt,
+                object_type="table",
+                schema=schema,
+                lineage=u_lineage,
+                dependencies=u_deps,
+            )
+            return out_obj
+
+        # 2c) Spróbuj DML z OUTPUT INTO
+        try:
+            o_lineage, o_cols, o_deps, o_target = self._extract_output_into_lineage_string(sql_content)
+        except Exception:
+            o_lineage, o_cols, o_deps, o_target = ([], [], set(), None)
+        if o_target:
+            ns_out, nm_out = self._ns_and_name(o_target, obj_type_hint="table")
+            schema = TableSchema(namespace=ns_out, name=nm_out, columns=o_cols)
+            out_obj = ObjectInfo(
+                name=nm_out,
+                object_type="table",
+                schema=schema,
+                lineage=o_lineage,
+                dependencies=o_deps,
+            )
+            return out_obj
+
         # 3) Jeśli nie materializuje — standard: ostatni SELECT jako „wirtualny” dataset procedury
         lineage, output_columns, dependencies = self._extract_procedure_lineage_string(sql_content, procedure_name)
 
@@ -2842,6 +2885,40 @@ class SqlParser:
             pass
         obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
         return obj
+
+    def _extract_insert_select_lineage_string(self, sql_content: str, object_name: str) -> tuple[List[ColumnLineage], Set[str]]:
+        """Extract column lineage and dependencies specifically for INSERT INTO ... SELECT statements in a procedure body.
+
+        Returns (lineage, dependencies). Uses only the SELECT that follows INSERT INTO.
+        """
+        lineage: List[ColumnLineage] = []
+        dependencies: Set[str] = set()
+
+        s = self._strip_sql_comments(self._normalize_tsql(sql_content))
+        # Try to capture the SELECT payload for INSERT INTO ... SELECT ... ;
+        m = re.search(r'(?is)INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?);', s)
+        if not m:
+            # Looser fallback: up to next GO/COMMIT/RETURN/END or end of string
+            m = re.search(r'(?is)INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?)(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b|$)', s)
+        if not m:
+            return lineage, dependencies
+
+        select_body = m.group(1)
+        select_sql = "SELECT " + select_body
+
+        try:
+            parsed = sqlglot.parse(select_sql, read=self.dialect)
+            if parsed and isinstance(parsed[0], exp.Select):
+                lineage, _out_cols = self._extract_column_lineage(parsed[0], object_name)
+                deps = self._extract_dependencies(parsed[0])
+                dependencies.update(deps)
+            else:
+                # Fallback to basic dependency extraction
+                dependencies.update(self._extract_basic_dependencies(select_sql))
+        except Exception:
+            dependencies.update(self._extract_basic_dependencies(select_sql))
+
+        return lineage, dependencies
 
 
     def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> Optional[ObjectInfo]:
@@ -2911,6 +2988,280 @@ class SqlParser:
 
         return None
 
+    def _extract_update_from_lineage_string(self, sql_content: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str], Optional[str]]:
+        """Parse UPDATE <target> [AS tgt] SET ... FROM <target> [AS tgt] JOIN <src> [AS src] ...
+        Returns (lineage, output_columns, dependencies, target_table_name)
+        target_table_name is schema.table.
+        """
+        lineage: List[ColumnLineage] = []
+        output_columns: List[ColumnSchema] = []
+        dependencies: Set[str] = set()
+        target_table: Optional[str] = None
+
+        s = self._strip_sql_comments(self._normalize_tsql(sql_content))
+        # Match UPDATE <target> [AS tgt]
+        m_upd = re.search(r'(?is)\bUPDATE\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?\s+SET\s+(.*?)\bFROM\b(.*)$', s)
+        if not m_upd:
+            return lineage, output_columns, dependencies, None
+        target_raw = self._normalize_table_ident(m_upd.group(1))
+        tgt_alias = (m_upd.group(2) or m_upd.group(3) or '').strip() or None
+        set_block = m_upd.group(4) or ''
+        from_tail = m_upd.group(5) or ''
+
+        # Normalize target to schema.table
+        parts = target_raw.split('.')
+        if len(parts) >= 3:
+            target_table = f"{parts[-2]}.{parts[-1]}"
+        elif len(parts) == 2:
+            target_table = target_raw
+        else:
+            target_table = f"dbo.{target_raw}"
+
+        # Collect FROM/JOIN sources and their aliases to resolve refs
+        alias_map: Dict[str, str] = {}
+        # Patterns like: FROM <tbl> [AS a] JOIN <tbl2> [AS b] ...
+        for m in re.finditer(r'(?is)\bFROM\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_tail):
+            tbl = self._normalize_table_ident(m.group(1))
+            al = (m.group(2) or m.group(3) or '').strip()
+            if al:
+                alias_map[al.lower()] = tbl
+            else:
+                # derive alias as last identifier
+                alias_map[tbl.split('.')[-1].lower()] = tbl
+        for m in re.finditer(r'(?is)\bJOIN\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', from_tail):
+            tbl = self._normalize_table_ident(m.group(1))
+            al = (m.group(2) or m.group(3) or '').strip()
+            if al:
+                alias_map[al.lower()] = tbl
+            else:
+                alias_map[tbl.split('.')[-1].lower()] = tbl
+
+        # Resolve default source for bare columns: prefer first non-target source
+        default_src = None
+        for al, tbl in alias_map.items():
+            if not tgt_alias or al != tgt_alias.lower():
+                default_src = tbl
+                break
+
+        # Helper: transformation type
+        def _tt(expr: str) -> TransformationType:
+            e = expr.upper()
+            if 'HASHBYTES' in e:
+                return TransformationType.EXPRESSION
+            if re.search(r'\bCAST\s*\(|\bCONVERT\s*\(|\bTRY_CAST\s*\(', e):
+                return TransformationType.CAST
+            if re.search(r'\bCOALESCE\s*\(|\bISNULL\s*\(', e):
+                return TransformationType.EXPRESSION
+            return TransformationType.IDENTITY
+
+        # Parse assignments: tgt.col = expr, comma-separated
+        assigns: List[tuple[str, str]] = []
+        for a in re.split(r',\s*', set_block):
+            a = a.strip()
+            if not a:
+                continue
+            # left may be tgt alias or table-qualified
+            ma = re.search(r'(?is)(?:' + (re.escape(tgt_alias) + r'\.|' if tgt_alias else '') + r'\w+\.)?(\w+)\s*=\s*(.+)$', a)
+            if not ma:
+                continue
+            assigns.append((ma.group(1), ma.group(2)))
+
+        # Build output columns (dedupe, keep order)
+        seen = set()
+        for i, (t_col, _expr) in enumerate(assigns):
+            if t_col not in seen:
+                output_columns.append(ColumnSchema(name=t_col, data_type=None, nullable=True, ordinal=i))
+                seen.add(t_col)
+
+        # Dependencies from alias map
+        for tbl in set(alias_map.values()):
+            dependencies.add(tbl)
+
+        # Build lineage from expressions, resolving alias.col
+        for (t_col, expr) in assigns:
+            refs: List[ColumnReference] = []
+            for m in re.finditer(r'(?i)\b([A-Za-z_][\w]*)\s*\.\s*([A-Za-z_][\w]*)\b', expr):
+                al = m.group(1).lower()
+                col = m.group(2)
+                if tgt_alias and al == tgt_alias.lower():
+                    # skip self refs
+                    continue
+                base = alias_map.get(al)
+                if base:
+                    ns, nm = self._ns_and_name(base)
+                    refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=col))
+            # fallback: bare column -> default source
+            if not refs and default_src:
+                ns, nm = self._ns_and_name(default_src)
+                mlast = re.search(r'(?i)\b([A-Za-z_][\w]*)\b$', expr)
+                if mlast:
+                    refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=mlast.group(1)))
+            lineage.append(ColumnLineage(
+                output_column=t_col,
+                input_fields=refs,
+                transformation_type=_tt(expr),
+                transformation_description=f"UPDATE expr: {t_col} = {expr.strip()}"
+            ))
+
+        return lineage, output_columns, dependencies, target_table
+
+    def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str], Optional[str]]:
+        """Parse INSERT/UPDATE/DELETE ... OUTPUT <exprs> INTO <target> and build lineage for the OUTPUT target.
+
+        Returns (lineage, output_columns, dependencies, output_target_table_name)
+        where output_target_table_name is schema.table.
+        """
+        lineage: List[ColumnLineage] = []
+        output_columns: List[ColumnSchema] = []
+        dependencies: Set[str] = set()
+        target_output: Optional[str] = None
+
+        s = self._strip_sql_comments(self._normalize_tsql(sql_content))
+
+        # Helper to normalize table -> schema.table
+        def _st(name: str) -> str:
+            name = self._normalize_table_ident(name)
+            parts = name.split('.')
+            if len(parts) >= 3:
+                return f"{parts[-2]}.{parts[-1]}"
+            if len(parts) == 2:
+                return name
+            return f"dbo.{name}"
+
+        # Try UPDATE ... OUTPUT ... INTO
+        m_upd = re.search(r'(?is)\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+        dml_type = None
+        dml_target = None
+        out_exprs = None
+        if m_upd:
+            dml_type = 'UPDATE'
+            dml_target = _st(m_upd.group(1))
+            out_exprs = m_upd.group(2)
+            target_output = _st(m_upd.group(3))
+        else:
+            # Try INSERT ... OUTPUT ... INTO
+            m_ins = re.search(r'(?is)\bINSERT\s+INTO\s+([^\s(,;]+)[^;]*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+            if m_ins:
+                dml_type = 'INSERT'
+                dml_target = _st(m_ins.group(1))
+                out_exprs = m_ins.group(2)
+                target_output = _st(m_ins.group(3))
+            else:
+                # Try DELETE ... OUTPUT ... INTO
+                m_del = re.search(r'(?is)\bDELETE\s+FROM\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+                if m_del:
+                    dml_type = 'DELETE'
+                    dml_target = _st(m_del.group(1))
+                    out_exprs = m_del.group(2)
+                    target_output = _st(m_del.group(3))
+
+        if not dml_type or not out_exprs or not target_output:
+            return lineage, output_columns, dependencies, None
+
+        # Dependencies include DML target by default
+        dependencies.add(dml_target)
+
+        # For UPDATE, also gather FROM/JOIN sources for alias resolution
+        alias_map: Dict[str, str] = {}
+        if dml_type == 'UPDATE':
+            # Capture FROM tail for aliases
+            m_from = re.search(r'(?is)\bFROM\b(.*)$', s)
+            if m_from:
+                from_tail = m_from.group(1)
+                for m in re.finditer(r'(?is)\bFROM\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_tail):
+                    tbl = self._normalize_table_ident(m.group(1))
+                    al = (m.group(2) or m.group(3) or '').strip()
+                    if al:
+                        alias_map[al.lower()] = tbl
+                    else:
+                        alias_map[tbl.split('.')[-1].lower()] = tbl
+                for m in re.finditer(r'(?is)\bJOIN\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', from_tail):
+                    tbl = self._normalize_table_ident(m.group(1))
+                    al = (m.group(2) or m.group(3) or '').strip()
+                    if al:
+                        alias_map[al.lower()] = tbl
+                    else:
+                        alias_map[tbl.split('.')[-1].lower()] = tbl
+                for tbl in set(alias_map.values()):
+                    dependencies.add(tbl)
+
+        # Parse OUTPUT list: split by commas not inside parentheses (simple approach)
+        # Good enough for typical inserted.col, deleted.col, and simple expressions.
+        def _split_expr_list(t: str) -> List[str]:
+            items = []
+            depth = 0
+            buf = []
+            for ch in t:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth = max(0, depth - 1)
+                if ch == ',' and depth == 0:
+                    items.append(''.join(buf).strip())
+                    buf = []
+                else:
+                    buf.append(ch)
+            if buf:
+                items.append(''.join(buf).strip())
+            return items
+
+        exprs = _split_expr_list(out_exprs)
+
+        # Build columns and lineage
+        for idx, e in enumerate(exprs):
+            expr = e
+            # Optional AS alias for output column name
+            m_as = re.search(r'(?is)^(.*?)\s+AS\s+([\w\[\]]+)$', expr)
+            if m_as:
+                expr_core = m_as.group(1).strip()
+                out_name = m_as.group(2).strip('[]')
+            else:
+                expr_core = expr
+                # Try derive from inserted/deleted.col
+                m_ic = re.search(r'(?i)\b(?:inserted|deleted)\s*\.\s*([A-Za-z_][\w]*)', expr_core)
+                out_name = m_ic.group(1) if m_ic else f"output_{idx+1}"
+
+            output_columns.append(ColumnSchema(name=out_name, data_type=None, nullable=True, ordinal=idx))
+
+            refs: List[ColumnReference] = []
+            # inserted/deleted references map to DML target table
+            for m in re.finditer(r'(?i)\b(inserted|deleted)\s*\.\s*([A-Za-z_][\w]*)', expr_core):
+                ns_t, nm_t = self._ns_and_name(dml_target)
+                refs.append(ColumnReference(namespace=ns_t, table_name=nm_t, column_name=m.group(2)))
+
+            # If UPDATE with FROM sources, also map alias.col refs
+            if dml_type == 'UPDATE' and alias_map:
+                for m in re.finditer(r'(?i)\b([A-Za-z_][\w]*)\s*\.\s*([A-Za-z_][\w]*)\b', expr_core):
+                    al = m.group(1).lower()
+                    col = m.group(2)
+                    base = alias_map.get(al)
+                    if base:
+                        ns, nm = self._ns_and_name(base)
+                        refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=col))
+
+            # Fallback: if no refs detected, assume DML target self-ref
+            if not refs:
+                ns_t, nm_t = self._ns_and_name(dml_target)
+                refs.append(ColumnReference(namespace=ns_t, table_name=nm_t, column_name=out_name))
+
+            # Simple transformation typing using earlier helper
+            tt = TransformationType.IDENTITY
+            u = expr_core.upper()
+            if 'HASHBYTES' in u:
+                tt = TransformationType.EXPRESSION
+            elif re.search(r'\bCAST\s*\(|\bCONVERT\s*\(|\bTRY_CAST\s*\(', u):
+                tt = TransformationType.CAST
+            elif re.search(r'\bCOALESCE\s*\(|\bISNULL\s*\(', u):
+                tt = TransformationType.EXPRESSION
+
+            lineage.append(ColumnLineage(
+                output_column=out_name,
+                input_fields=refs,
+                transformation_type=tt,
+                transformation_description=f"OUTPUT expr: {expr_core.strip()}"
+            ))
+
+        return lineage, output_columns, dependencies, target_output
     
     def _extract_function_name(self, sql_content: str) -> Optional[str]:
         """Extract function name from CREATE FUNCTION statement."""
