@@ -1667,10 +1667,11 @@ class SqlParser:
 
         cleaned = self._strip_sql_comments(sql_content)
         # Find MERGE INTO <target>
-        m_target = re.search(r'(?is)MERGE\s+INTO\s+([^\s\(,;]+)', cleaned)
+        m_target = re.search(r'(?is)MERGE\s+INTO\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', cleaned)
         if not m_target:
             return lineage, output_columns, dependencies, None
         target_raw = self._normalize_table_ident(m_target.group(1))
+        tgt_alias = (m_target.group(2) or m_target.group(3) or '').strip() or None
         # Normalize to schema.table for output naming
         target_parts = target_raw.split('.')
         if len(target_parts) >= 3:
@@ -1681,11 +1682,13 @@ class SqlParser:
             target_table = f"dbo.{target_raw}"
 
         # Find USING source (table or subquery or temp)
-        m_using = re.search(r'(?is)USING\s+([^\s\(,;#]+|#\w+)(?:\s+AS\s+\w+|\s+\w+)?', cleaned)
+        m_using = re.search(r'(?is)USING\s+([^\s\(,;#]+|#\w+)(?:\s+AS\s+(\w+)|\s+(\w+))?', cleaned)
         source_name: Optional[str] = None
+        src_alias: Optional[str] = None
         if m_using:
             src = m_using.group(1).strip()
             source_name = self._normalize_table_ident(src)
+            src_alias = (m_using.group(2) or m_using.group(3) or '').strip() or None
 
         # If USING #temp, try to resolve temp -> base table via preceding SELECT ... INTO #temp FROM base
         temp_to_base: dict[str, str] = {}
@@ -1696,16 +1699,49 @@ class SqlParser:
             if base:
                 source_name = base
 
-        # Map UPDATE SET tgt.col = src.col
-        # We'll collect assignments from the WHEN MATCHED THEN UPDATE SET block
+        # Helper: determine if a token refers to source/target alias or fully qualified table
+        def _match_col_ref(token: str) -> Optional[tuple[str, str]]:
+            t = token.strip()
+            # Strip CAST(...), COALESCE(...), HASHBYTES(...), functions and extract innards for first identifiable col
+            # Try explicit qualifier patterns first
+            m = re.search(r'(?i)\b([A-Za-z_][\w]*)\.(?:\[?([A-Za-z_][\w]*)\]?\.)?\[?([A-Za-z_][\w]*)\]?$', t)
+            if m:
+                alias_or_db, maybe_schema, col = m.group(1), m.group(2), m.group(3)
+                return alias_or_db.lower(), col
+            # Try alias.col in general expressions
+            m2 = re.search(r'(?i)\b([A-Za-z_][\w]*)\s*\.\s*([A-Za-z_][\w]*)\b', t)
+            if m2:
+                return m2.group(1).lower(), m2.group(2)
+            # Bare column name as last resort
+            m3 = re.search(r'(?i)\b([A-Za-z_][\w]*)\b$', t)
+            if m3:
+                return None, m3.group(1)
+            return None
+
+        # Detect transformation type hint from expression string
+        def _transformation_for(expr: str) -> TransformationType:
+            e = expr.upper()
+            if 'HASHBYTES' in e:
+                return TransformationType.HASH if hasattr(TransformationType, 'HASH') else TransformationType.TRANSFORM
+            if re.search(r'\bCAST\s*\(', e):
+                return TransformationType.CAST if hasattr(TransformationType, 'CAST') else TransformationType.TRANSFORM
+            if re.search(r'\bCONVERT\s*\(|\bTRY_CAST\s*\(', e):
+                return TransformationType.CAST if hasattr(TransformationType, 'CAST') else TransformationType.TRANSFORM
+            if re.search(r'\bCOALESCE\s*\(', e) or re.search(r'\bISNULL\s*\(', e):
+                return TransformationType.COERCE if hasattr(TransformationType, 'COERCE') else TransformationType.TRANSFORM
+            return TransformationType.IDENTITY
+
+        # Map UPDATE SET tgt.col = <expr>
         update_block = re.search(r'(?is)WHEN\s+MATCHED.*?THEN\s+UPDATE\s+SET\s+(.*?)(?:WHEN\s+|;|$)', cleaned)
-        assign_pairs: list[tuple[str, str]] = []
+        assign_exprs: list[tuple[str, str]] = []  # (target_col, rhs_expr)
         if update_block:
             assigns_raw = update_block.group(1)
             for a in re.split(r',\s*', assigns_raw):
-                ma = re.search(r'(?i)\b(?:tgt\.|target\.|\w+\.)?(\w+)\s*=\s*(?:src\.|source\.|\w+\.)?(\w+)', a.strip())
+                left_alias_part = re.escape(tgt_alias) + r'\.|tgt\.|target\.|\w+\.' if tgt_alias else r'tgt\.|target\.|\w+\.'
+                pat = rf"(?is)\b(?:{left_alias_part})?(\w+)\s*=\s*(.+)$"
+                ma = re.search(pat, a.strip())
                 if ma:
-                    assign_pairs.append((ma.group(1), ma.group(2)))
+                    assign_exprs.append((ma.group(1), ma.group(2)))
 
         # Map INSERT (cols...) VALUES (src.cols...)
         insert_block = re.search(r'(?is)WHEN\s+NOT\s+MATCHED\s+BY\s+TARGET\s+THEN\s+INSERT\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)', cleaned)
@@ -1714,13 +1750,12 @@ class SqlParser:
             vals = [v.strip() for v in insert_block.group(2).split(',') if v.strip()]
             for c, v in zip(cols, vals):
                 mc = re.search(r'(\w+)$', c)
-                mv = re.search(r'(\w+)$', v)
-                if mc and mv:
-                    assign_pairs.append((mc.group(1), mv.group(1)))
+                if mc:
+                    assign_exprs.append((mc.group(1), v))
 
-        # Build output columns (union of left sides we have mapping for), keep order stable
+        # Build output columns (union of left sides), keep order stable
         seen = set()
-        for i, (t_col, s_col) in enumerate(assign_pairs):
+        for i, (t_col, _expr) in enumerate(assign_exprs):
             if t_col not in seen:
                 output_columns.append(ColumnSchema(name=t_col, data_type=None, nullable=True, ordinal=i))
                 seen.add(t_col)
@@ -1737,15 +1772,44 @@ class SqlParser:
             else:
                 dependencies.add(source_name)
 
-        # Lineage edges: from source_name.s_col to target_table.t_col
-        if source_name and target_table:
-            ns_src, nm_src = self._ns_and_name(source_name)
-            for (t_col, s_col) in assign_pairs:
+        # Lineage edges: for each assignment, collect input column refs from expr
+        if target_table:
+            # Resolve default source dataset for alias references
+            ns_src_default, nm_src_default = (None, None)
+            if source_name:
+                ns_src_default, nm_src_default = self._ns_and_name(source_name)
+            for (t_col, expr) in assign_exprs:
+                refs: List[ColumnReference] = []
+                # collect all alias.col occurrences
+                for m in re.finditer(r'(?i)\b([A-Za-z_][\w]*)\s*\.\s*([A-Za-z_][\w]*)\b', expr):
+                    a, c = m.group(1).lower(), m.group(2)
+                    # if alias matches source alias, use default src dataset
+                    if src_alias and a == src_alias.lower():
+                        if ns_src_default and nm_src_default:
+                            refs.append(ColumnReference(namespace=ns_src_default, table_name=nm_src_default, column_name=c))
+                        continue
+                    if tgt_alias and a == tgt_alias.lower():
+                        # self-reference; skip as input
+                        continue
+                    # try treat as fully qualified table alias (fallback to default src)
+                    full_guess = a  # alias might actually be schema or table; best effort
+                    try:
+                        ns2, nm2 = self._ns_and_name(full_guess)
+                        refs.append(ColumnReference(namespace=ns2, table_name=nm2, column_name=c))
+                    except Exception:
+                        if ns_src_default and nm_src_default:
+                            refs.append(ColumnReference(namespace=ns_src_default, table_name=nm_src_default, column_name=c))
+                # If no alias.col found, try bare col name mapped to default source
+                if not refs and ns_src_default and nm_src_default:
+                    mlast = re.search(r'(?i)\b([A-Za-z_][\w]*)\b$', expr)
+                    if mlast:
+                        refs.append(ColumnReference(namespace=ns_src_default, table_name=nm_src_default, column_name=mlast.group(1)))
+                tt = _transformation_for(expr)
                 lineage.append(ColumnLineage(
                     output_column=t_col,
-                    input_fields=[ColumnReference(namespace=ns_src, table_name=nm_src, column_name=s_col)],
-                    transformation_type=TransformationType.IDENTITY,
-                    transformation_description=f"MERGE USING {nm_src}: {t_col} = {s_col}"
+                    input_fields=refs,
+                    transformation_type=tt,
+                    transformation_description=f"MERGE expr: {t_col} = {expr.strip()}"
                 ))
 
         return lineage, output_columns, dependencies, target_table
