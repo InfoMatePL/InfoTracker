@@ -56,8 +56,8 @@ class TestCLIIntegration:
         assert output_data["eventType"] == "COMPLETE"
         job_name = output_data["job"]["name"].replace("\\", "/")
         basename = job_name.split("/")[-1]
-        # akceptujemy starą konwencję (plik: 01_test.sql) i nową (FQN obiektu: STG.dbo.TestTable.sql)
-        assert basename in ("01_test.sql", "STG.dbo.TestTable.sql")
+        # akceptujemy starą konwencję (plik: 01_test.sql) i nową (FQN obiektu: dbo.TestTable.sql)
+        assert basename in ("01_test.sql", "dbo.TestTable.sql")
 
         assert len(output_data["outputs"]) == 1
         assert "schema" in output_data["outputs"][0]["facets"]
