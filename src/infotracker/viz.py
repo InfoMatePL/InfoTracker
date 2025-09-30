@@ -80,6 +80,9 @@ HTML_TMPL = """<!doctype html>
     --header:#7fbf5f; --header-text:#fff; --border:#b8c5a6; --text:#1f2d1f;
     --row:#edf7e9; --row-alt:#e6f4e2; --row-border:#cbe4c0;
     --wire:#97a58a; --wire-strong:#6a7a5b;
+    /* Selection highlight (accessible in light theme) */
+    --sel-bg:#fde68a; /* amber-300 */
+    --sel-outline:#111827; /* slate-900 */
   }
   html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial}
   /* Modern toolbar styling */
@@ -126,7 +129,7 @@ HTML_TMPL = """<!doctype html>
   
   /* Dark mode adjustments */
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; }
+    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; --sel-bg:#374151; /* slate-700 */ --sel-outline:#e5eef5; }
     #toolbar{ background: linear-gradient(180deg, rgba(11,16,32,0.65), rgba(11,16,32,0.55)); border-bottom-color:#1e293b; box-shadow: 0 2px 10px rgba(0,0,0,0.35); }
     #toolbar button{ background: linear-gradient(180deg, #0f172a, #0b1220); border-color:#243044; color:#e5eef5; box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 1px 2px rgba(0,0,0,0.3); }
     #toolbar button:hover{ background: linear-gradient(180deg, #121a30, #0e1527); }
@@ -154,7 +157,7 @@ HTML_TMPL = """<!doctype html>
   .table-node li.alt{ background:var(--row-alt) }
   .table-node li.col-row{ cursor: pointer; }
   .table-node li.active{ outline:2px solid #6a7a5b }
-  .table-node li.selected{ outline:2px solid #111827; background:#fef3c7 }
+  .table-node li.selected{ outline:2px solid var(--sel-outline); background: var(--sel-bg); color: var(--text) }
   .table-node li.col-row:hover{ border-color:#9bb1c9; box-shadow:0 1px 0 rgba(255,255,255,.7) inset, 0 1px 2px rgba(0,0,0,.05) }
   .table-node li.col-row:focus-visible{ outline:2px solid #60a5fa; outline-offset:2px }
   .table-node li .name{ user-select:none }
@@ -788,7 +791,13 @@ function onRowClick(e){
 }
 
 function selectColumnKey(key){
-  if (SELECTED_COL === key){ clearSelection(); return; }
+  // Always clear previous selection before applying a new one.
+  // If the same row is clicked again, toggle off selection.
+  if (SELECTED_COL === key){
+    clearSelection();
+    return;
+  }
+  clearSelection();
   SELECTED_COL = key;
   highlightLineage(key);
 }
