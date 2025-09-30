@@ -39,3 +39,4 @@ docs/_build/
 examples/warehouse/sql2
 
 *.txt
+examples/warehouse/recursion

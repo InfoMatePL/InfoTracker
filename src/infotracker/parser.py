@@ -366,15 +366,38 @@ class SqlParser:
     
     def _extract_view_header_cols(self, create_exp) -> list[str]:
         """Extract column names from CREATE VIEW (col1, col2, ...) AS pattern."""
-        exprs = getattr(create_exp, "expressions", None) or create_exp.args.get("expressions") or []
-        cols = []
-        for e in exprs:
-            n = getattr(e, "name", None)
-            if n: 
-                cols.append(str(n).strip("[]"))
-            else: 
-                cols.append(str(e).strip().strip("[]"))
-        return cols
+        cols: list[str] = []
+
+        def _collect(exprs) -> None:
+            if not exprs:
+                return
+            for e in exprs:
+                n = getattr(e, "name", None)
+                if n:
+                    cols.append(str(n).strip("[]"))
+                else:
+                    cols.append(str(e).strip().strip("[]"))
+
+        # 1) Some dialects attach header list directly on the CREATE node
+        exprs = getattr(create_exp, "expressions", None) or create_exp.args.get("expressions")
+        _collect(exprs)
+
+        # 2) Others attach it to the target (statement.this)
+        try:
+            target = getattr(create_exp, "this", None)
+            texprs = getattr(target, "expressions", None) or (getattr(target, "args", {}).get("expressions") if getattr(target, "args", None) else None)
+            _collect(texprs)
+        except Exception:
+            pass
+
+        # Deduplicate while preserving order
+        seen = set()
+        dedup_cols = []
+        for c in cols:
+            if c and c not in seen:
+                seen.add(c)
+                dedup_cols.append(c)
+        return dedup_cols
     
     def _apply_view_header_names(self, create_exp, select_exp, obj: ObjectInfo):
         """Apply header column names to view schema and lineage by position."""
