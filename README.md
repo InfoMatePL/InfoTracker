@@ -50,6 +50,15 @@ infotracker --help
 # Extract lineage from SQL files
 infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
 ```
+Flags:
+- --sql-dir DIR          Directory with .sql files (required)
+- --out-dir DIR          Output folder for lineage artifacts (default from config or build/lineage)
+- --adapter NAME         SQL dialect adapter (default from config)
+- --catalog FILE         Optional YAML catalog with schemas
+- --fail-on-warn         Exit non-zero if warnings occurred
+- --include PATTERN      Glob include filter
+- --exclude PATTERN      Glob exclude filter
+- --encoding NAME        File encoding for SQL files (default: auto)
 
 ### 2. Run Impact Analysis
 ```bash
@@ -62,18 +71,32 @@ infotracker impact -s "STG.dbo.Orders.OrderID+" --graph-dir build/lineage
 # Both directions
 infotracker impact -s "+dbo.fct_sales.Revenue+" --graph-dir build/lineage
 ```
+Flags:
+- -s, --selector TEXT    Column selector; use + for direction markers (required)
+- --graph-dir DIR        Folder with column_graph.json (required; produced by extract)
+- --max-depth N          Traversal depth; 0 = unlimited (full lineage). Default: 0
+- --out PATH             Write output to file instead of stdout
+- --format text|json     Output format (set globally or per-invocation)
 
 ### 3. Detect Breaking Changes
 ```bash
 # Compare two versions of your schema
 infotracker diff --base build/lineage --head build/lineage_new
 ```
+Flags:
+- --base DIR             Folder with base artifacts (required)
+- --head DIR             Folder with head artifacts (required)
+- --format text|json     Output format
+- --threshold LEVEL      Severity threshold: NON_BREAKING|POTENTIALLY_BREAKING|BREAKING
 
 ### 4. Visualize the Graph
 ```bash
 # Generate an interactive HTML graph (lineage_viz.html) for a built graph
 infotracker viz --graph-dir build/lineage
 ```
+Flags:
+- --graph-dir DIR        Folder with column_graph.json (required)
+- --out PATH             Output HTML path (default: <graph_dir>/lineage_viz.html)
 Open the generated `lineage_viz.html` in your browser. You can click a column to highlight upstream/downstream lineage; press Enter in the search box to highlight all matches.
 ## 📖 Selector Syntax
 
