@@ -83,6 +83,9 @@ HTML_TMPL = """<!doctype html>
     /* Selection highlight (accessible in light theme) */
     --sel-bg:#fde68a; /* amber-300 */
     --sel-outline:#111827; /* slate-900 */
+    /* Sidebar background (light theme) */
+    --sidebar-bg-start:#eef2f7; /* soft slate */
+    --sidebar-bg-end:#e6ebf2;
   }
   html,body{height:100%; margin:0}
   body{display:flex; flex-direction:column; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial}
@@ -127,10 +130,19 @@ HTML_TMPL = """<!doctype html>
   }
   #toolbar input::placeholder{ color:#94a3b8 }
   #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,0.25); outline: none }
+  /* Keep sidebar toggle separated from the 3-button group */
+  #btnToggleSidebar{ margin-left:8px }
+  /* Theme toggle switch */
+  .theme-toggle{ display:flex; align-items:center; gap:8px; margin-left:8px; user-select:none }
+  .theme-toggle input{ position:absolute; opacity:0; width:0; height:0 }
+  .theme-toggle .switch{ width:46px; height:24px; border-radius:999px; background:#e5e7eb; border:1px solid #cbd5e1; position:relative; cursor:pointer; box-shadow: inset 0 1px 0 rgba(255,255,255,0.8) }
+  .theme-toggle .switch::after{ content:""; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%; background:#ffffff; box-shadow: 0 1px 2px rgba(0,0,0,0.15); transition:left .18s ease, background .18s ease }
+  .theme-toggle input:checked + .switch{ background:#111827; border-color:#111827 }
+  .theme-toggle input:checked + .switch::after{ left:24px; background:#0ea5e9 }
   
   /* Dark mode adjustments */
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; --sel-bg:#374151; /* slate-700 */ --sel-outline:#e5eef5; }
+    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; --sel-bg:#374151; /* slate-700 */ --sel-outline:#e5eef5; --sidebar-bg-start:rgba(11,16,32,0.70); --sidebar-bg-end:rgba(11,16,32,0.55); }
     #toolbar{ background: linear-gradient(180deg, rgba(11,16,32,0.65), rgba(11,16,32,0.55)); border-bottom-color:#1e293b; box-shadow: 0 2px 10px rgba(0,0,0,0.35); }
     #toolbar button{ background: linear-gradient(180deg, #0f172a, #0b1220); border-color:#243044; color:#e5eef5; box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 1px 2px rgba(0,0,0,0.3); }
     #toolbar button:hover{ background: linear-gradient(180deg, #121a30, #0e1527); }
@@ -144,26 +156,30 @@ HTML_TMPL = """<!doctype html>
     #toolbar input::placeholder{ color:#94a3b8 }
     #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(59,130,246,0.25); }
     /* Sidebar dark adjustments */
-    #sidebar{ background: linear-gradient(180deg, rgba(11,16,32,0.70), rgba(11,16,32,0.55)); border-right-color:#1e293b }
+  #sidebar{ background: linear-gradient(180deg, var(--sidebar-bg-start), var(--sidebar-bg-end)); border-right-color:#1e293b; box-sizing:border-box }
     #sidebar .side-top{ background: linear-gradient(180deg, rgba(11,16,32,0.65), rgba(11,16,32,0.50)); border-bottom-color:#1e293b; box-shadow: 0 2px 8px rgba(0,0,0,0.35) }
     #sidebar .side-filter{ border-color:#243044; color:#e5eef5; background: linear-gradient(180deg, #101826, #0b1220); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset }
     #sidebar .tbl-item input:checked + span{ color:#e5eef5 }
   }
   /* Main split: left sidebar + right canvas */
   #content{display:flex; flex:1 1 auto; min-height:0}
-  #sidebar{width:280px; max-width:40vw; overflow:auto; border-right:1px solid #e5e7eb; padding:10px; background:linear-gradient(180deg, rgba(255,255,255,0.6), rgba(255,255,255,0.35))}
+  #sidebar{width:280px; max-width:40vw; overflow-y:auto; overflow-x:hidden; border-right:1px solid #e5e7eb; padding:10px; background:linear-gradient(180deg, var(--sidebar-bg-start), var(--sidebar-bg-end)); box-sizing:border-box; transition: width .2s ease, padding .2s ease, border-color .2s ease }
+  #sidebar.collapsed{ width:0; padding:0; border:none; overflow:hidden }
+  #sidebar.collapsed *{ display:none }
+  #sidebar *{ box-sizing: border-box }
   #sidebar .side-top{position:sticky; top:0; z-index:5; padding:6px 2px 10px 2px; margin:-10px -10px 10px -10px; background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)); border-bottom:1px solid #e5e7eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04)}
   #sidebar .side-header{padding:0 12px; font-weight:800; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#64748b; margin:4px 0 8px}
-  #sidebar .side-filter{display:block; width:calc(100% - 24px); margin:0 12px; height:34px; padding:6px 12px 6px 34px; border:1px solid #cbd5e1; border-radius:10px; background:
+  #sidebar .side-filter{display:block; width:calc(100% - 24px); max-width:calc(100% - 24px); margin:0 12px; height:34px; padding:6px 12px 6px 34px; border:1px solid #cbd5e1; border-radius:10px; background:
       url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="%236b7280" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>') 10px center / 16px 16px no-repeat,
       linear-gradient(180deg, #ffffff, #f8fafc);
     color:#0f172a; box-shadow: 0 1px 0 rgba(255,255,255,0.8) inset}
   #sidebar .side-filter::placeholder{ color:#94a3b8 }
   #sidebar .side-filter:focus{ outline:none; border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,0.25) }
-    #sidebar .tbl-item{display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; cursor:pointer; margin:4px 8px}
+  #sidebar .tbl-item{display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; cursor:pointer; margin:4px 8px; width:calc(100% - 16px)}
     #sidebar .tbl-item:hover{background: rgba(148,163,184,0.14)}
     #sidebar input[type="checkbox"]{width:16px; height:16px; accent-color: var(--header)}
-    #sidebar .tbl-item input:checked + span{ font-weight:600; color:#0f172a }
+  #sidebar .tbl-item input:checked + span{ font-weight:600; color:#0f172a }
+  #sidebar .tbl-item .item-label{ flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
     #sidebar::-webkit-scrollbar{ width:10px }
     #sidebar::-webkit-scrollbar-thumb{ background: #cbd5e1; border-radius:10px }
     #sidebar::-webkit-scrollbar-track{ background: transparent }
@@ -208,7 +224,12 @@ HTML_TMPL = """<!doctype html>
   <button id="btnFit" title="Fit to content">Fit</button>
   <button id="btnZoomOut" title="Zoom out">−</button>
   <button id="btnZoomIn" title="Zoom in">+</button>
+  <button id="btnToggleSidebar" title="Hide/show sidebar">Sidebar</button>
   <input id="search" type="text" placeholder="Search table/column… (Enter to jump)" />
+  <label class="theme-toggle" title="Toggle dark mode">
+    <input id="themeToggle" type="checkbox" aria-label="Dark mode" />
+    <span class="switch"></span>
+  </label>
 </div>
 <div id="content">
   <aside id="sidebar" aria-label="Tables">
@@ -231,6 +252,29 @@ HTML_TMPL = """<!doctype html>
   </div>
 </div>
 <script>
+// ---- Theme handling ----
+const THEME_KEY = 'infotracker.theme';
+function systemTheme(){
+  try{ return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }catch(_){ return 'light'; }
+}
+function applyTheme(mode){
+  const root = document.documentElement;
+  root.classList.remove('theme-dark','theme-light');
+  root.classList.add(mode === 'dark' ? 'theme-dark' : 'theme-light');
+}
+function initTheme(){
+  const saved = localStorage.getItem(THEME_KEY);
+  const mode = (saved === 'dark' || saved === 'light') ? saved : systemTheme();
+  applyTheme(mode);
+  const t = document.getElementById('themeToggle');
+  if (t) t.checked = (mode === 'dark');
+}
+function toggleTheme(toDark){
+  const mode = toDark ? 'dark' : 'light';
+  localStorage.setItem(THEME_KEY, mode);
+  applyTheme(mode);
+}
+initTheme();
 const EDGES = __EDGES__;
 const __ALL_TABLES_RAW__ = __NODES__;
 // Fallback: if nodes are missing, derive tables from edges
@@ -254,6 +298,7 @@ function __deriveTablesFromEdges(){
 const ALL_TABLES = (Array.isArray(__ALL_TABLES_RAW__) && __ALL_TABLES_RAW__.length) ? __ALL_TABLES_RAW__ : __deriveTablesFromEdges();
 let TABLES = []; // visible tables: selected + neighbors
 const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
+const SIDEBAR_KEY = 'infotracker.sidebar';
 
 // Helpers
 const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
@@ -677,12 +722,20 @@ function buildSidebar(){
       if (TABLES.length && !FIRST_FIT_DONE){ try{ fitToContent(); }catch(_){} }
       else { drawEdges(); }
     });
-    const name = document.createElement('span'); name.textContent = t.label || t.full || t.id;
+  const name = document.createElement('span'); name.className = 'item-label'; name.textContent = t.label || t.full || t.id;
     name.title = t.full || t.id;
     row.appendChild(cb); row.appendChild(name);
     list.appendChild(row);
   });
 }
+
+// Initialize sidebar collapsed state before first layout
+try{
+  const savedSide = localStorage.getItem(SIDEBAR_KEY);
+  const collapsed = (savedSide === 'collapsed');
+  const sideEl = document.getElementById('sidebar');
+  if (collapsed && sideEl){ sideEl.classList.add('collapsed'); }
+}catch(_){}
 
 buildSidebar();
 computeRenderSets();
@@ -697,6 +750,10 @@ if (sideFilter){
     buildSidebar();
   });
 }
+
+// Theme toggle binding
+const themeToggle = document.getElementById('themeToggle');
+if (themeToggle){ themeToggle.addEventListener('change', (e)=>{ toggleTheme(!!e.currentTarget.checked); }); }
 
 // ----- Pan (drag background) & Zoom (Ctrl/Alt+wheel) -----
 const viewport = document.getElementById('viewport');
@@ -855,6 +912,15 @@ function findAndFocus(q){
 document.getElementById('btnZoomIn').addEventListener('click', ()=> zoomBy(1.1));
 document.getElementById('btnZoomOut').addEventListener('click', ()=> zoomBy(0.9));
 document.getElementById('btnFit').addEventListener('click', ()=> fitToContent());
+document.getElementById('btnToggleSidebar').addEventListener('click', ()=>{
+  const side = document.getElementById('sidebar');
+  if (!side) return;
+  const willCollapse = !side.classList.contains('collapsed');
+  side.classList.toggle('collapsed', willCollapse);
+  try{ localStorage.setItem(SIDEBAR_KEY, willCollapse ? 'collapsed' : 'expanded'); }catch(_){}
+  // reflow wires due to size change
+  setTimeout(()=>{ layoutTables(); }, 100);
+});
 document.getElementById('search').addEventListener('keydown', (e)=>{
   if (e.key === 'Enter'){
     const q = (e.currentTarget.value||'');
