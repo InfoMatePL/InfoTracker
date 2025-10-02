@@ -54,13 +54,13 @@ infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
 ### 2. Run Impact Analysis
 ```bash
 # Find what feeds into a column (upstream)
-infotracker impact -s "+STG.dbo.Orders.OrderID"
+infotracker impact -s "+STG.dbo.Orders.OrderID" --graph-dir build/lineage
 
 # Find what uses a column (downstream)  
-infotracker impact -s "STG.dbo.Orders.OrderID+"
+infotracker impact -s "STG.dbo.Orders.OrderID+" --graph-dir build/lineage
 
 # Both directions
-infotracker impact -s "+dbo.fct_sales.Revenue+"
+infotracker impact -s "+dbo.fct_sales.Revenue+" --graph-dir build/lineage
 ```
 
 ### 3. Detect Breaking Changes
@@ -68,6 +68,13 @@ infotracker impact -s "+dbo.fct_sales.Revenue+"
 # Compare two versions of your schema
 infotracker diff --base build/lineage --head build/lineage_new
 ```
+
+### 4. Visualize the Graph
+```bash
+# Generate an interactive HTML graph (lineage_viz.html) for a built graph
+infotracker viz --graph-dir build/lineage
+```
+Open the generated `lineage_viz.html` in your browser. You can click a column to highlight upstream/downstream lineage; press Enter in the search box to highlight all matches.
 ## 📖 Selector Syntax
 
 InfoTracker supports flexible column selectors for precise impact analysis:
@@ -95,45 +102,45 @@ InfoTracker supports flexible column selectors for precise impact analysis:
 infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
 
 # Basic column lineage
-infotracker impact -s "+dbo.fct_sales.Revenue"        # What feeds this column?
-infotracker impact -s "STG.dbo.Orders.OrderID+"      # What uses this column?
+infotracker impact -s "+dbo.fct_sales.Revenue" --graph-dir build/lineage        # What feeds this column?
+infotracker impact -s "STG.dbo.Orders.OrderID+" --graph-dir build/lineage      # What uses this column?
 ```
 
 ### Wildcard Selectors
 ```bash
 # All columns from a specific table
-infotracker impact -s "dbo.fct_sales.*"
-infotracker impact -s "STG.dbo.Orders.*"
+infotracker impact -s "dbo.fct_sales.*" --graph-dir build/lineage
+infotracker impact -s "STG.dbo.Orders.*" --graph-dir build/lineage
 
 # Find all columns containing "revenue" (case-insensitive)
-infotracker impact -s "..revenue"
+infotracker impact -s "..revenue" --graph-dir build/lineage
 
 # Find all columns starting with "customer" 
-infotracker impact -s "..customer*"
+infotracker impact -s "..customer*" --graph-dir build/lineage
 ```
 
 ### Advanced SQL Objects
 ```bash
 # Table-valued function columns (upstream)
-infotracker impact -s "+dbo.fn_customer_orders_tvf.*"
+infotracker impact -s "+dbo.fn_customer_orders_tvf.*" --graph-dir build/lineage
 
 # Procedure dataset columns (upstream)  
-infotracker impact -s "+dbo.usp_customer_metrics_dataset.*"
+infotracker impact -s "+dbo.usp_customer_metrics_dataset.*" --graph-dir build/lineage
 
 # Temp table lineage from EXEC
-infotracker impact -s "+#temp_table.*"
+infotracker impact -s "+#temp_table.*" --graph-dir build/lineage
 ```
 
 ### Output Formats
 ```bash
 # Text output (default, human-readable)
-infotracker impact -s "+..revenue"
+infotracker impact -s "+..revenue" --graph-dir build/lineage
 
 # JSON output (machine-readable)
-infotracker --format json impact -s "..customer*" > customer_lineage.json
+infotracker --format json impact -s "..customer*" --graph-dir build/lineage > customer_lineage.json
 
 # Control traversal depth
-infotracker impact -s "+dbo.Orders.OrderID" --max-depth 2
+infotracker impact -s "+dbo.Orders.OrderID" --max-depth 2 --graph-dir build/lineage
 ```
 
 ### Breaking Change Detection
@@ -234,6 +241,23 @@ severity_threshold: "POTENTIALLY_BREAKING"
 - **[Advanced Use Cases](docs/advanced_use_cases.md)** - TVFs, stored procedures, and complex scenarios
 - **[Edge Cases](docs/edge_cases.md)** - SELECT *, UNION, temp tables handling
 - **[FAQ](docs/faq.md)** - Common questions and troubleshooting
+
+## 🖼 Visualization (viz)
+
+Generate an interactive HTML to explore column-level lineage:
+
+```bash
+# After extract (column_graph.json present in the folder)
+infotracker viz --graph-dir build/lineage
+
+# Options
+#   --out <path>      Output HTML path (default: <graph_dir>/lineage_viz.html)
+#   --graph-dir       Folder z column_graph.json [required]
+```
+
+Tips:
+- Search supports table names, full IDs (namespace.schema.table), column names, and URIs. Press Enter to highlight all matches.
+- Click a column to switch into lineage mode (upstream/downstream highlight). Clicking another column clears the previous selection.
 
 ## 🧪 Testing
 
