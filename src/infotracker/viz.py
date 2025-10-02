@@ -143,14 +143,30 @@ HTML_TMPL = """<!doctype html>
     }
     #toolbar input::placeholder{ color:#94a3b8 }
     #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(59,130,246,0.25); }
+    /* Sidebar dark adjustments */
+    #sidebar{ background: linear-gradient(180deg, rgba(11,16,32,0.70), rgba(11,16,32,0.55)); border-right-color:#1e293b }
+    #sidebar .side-top{ background: linear-gradient(180deg, rgba(11,16,32,0.65), rgba(11,16,32,0.50)); border-bottom-color:#1e293b; box-shadow: 0 2px 8px rgba(0,0,0,0.35) }
+    #sidebar .side-filter{ border-color:#243044; color:#e5eef5; background: linear-gradient(180deg, #101826, #0b1220); box-shadow: 0 1px 0 rgba(255,255,255,0.02) inset }
+    #sidebar .tbl-item input:checked + span{ color:#e5eef5 }
   }
   /* Main split: left sidebar + right canvas */
   #content{display:flex; flex:1 1 auto; min-height:0}
   #sidebar{width:280px; max-width:40vw; overflow:auto; border-right:1px solid #e5e7eb; padding:10px; background:linear-gradient(180deg, rgba(255,255,255,0.6), rgba(255,255,255,0.35))}
-  #sidebar .side-header{font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:#64748b; margin:4px 0 10px}
-  #sidebar .tbl-item{display:flex; align-items:center; gap:8px; padding:6px 4px; border-radius:6px; cursor:pointer}
-  #sidebar .tbl-item:hover{background: rgba(148,163,184,0.14)}
-  #sidebar input[type="checkbox"]{width:14px; height:14px}
+  #sidebar .side-top{position:sticky; top:0; z-index:5; padding:6px 2px 10px 2px; margin:-10px -10px 10px -10px; background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)); border-bottom:1px solid #e5e7eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04)}
+  #sidebar .side-header{padding:0 12px; font-weight:800; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#64748b; margin:4px 0 8px}
+  #sidebar .side-filter{display:block; width:calc(100% - 24px); margin:0 12px; height:34px; padding:6px 12px 6px 34px; border:1px solid #cbd5e1; border-radius:10px; background:
+      url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="%236b7280" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>') 10px center / 16px 16px no-repeat,
+      linear-gradient(180deg, #ffffff, #f8fafc);
+    color:#0f172a; box-shadow: 0 1px 0 rgba(255,255,255,0.8) inset}
+  #sidebar .side-filter::placeholder{ color:#94a3b8 }
+  #sidebar .side-filter:focus{ outline:none; border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,0.25) }
+    #sidebar .tbl-item{display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:10px; cursor:pointer; margin:4px 8px}
+    #sidebar .tbl-item:hover{background: rgba(148,163,184,0.14)}
+    #sidebar input[type="checkbox"]{width:16px; height:16px; accent-color: var(--header)}
+    #sidebar .tbl-item input:checked + span{ font-weight:600; color:#0f172a }
+    #sidebar::-webkit-scrollbar{ width:10px }
+    #sidebar::-webkit-scrollbar-thumb{ background: #cbd5e1; border-radius:10px }
+    #sidebar::-webkit-scrollbar-track{ background: transparent }
   #viewport{position:relative; flex:1 1 auto; min-height:0; overflow:auto}
   #stage{position:relative; min-width:100%; min-height:100%; transform-origin: 0 0;}
   svg.wires{position:absolute; inset:0; pointer-events:none; width:100%; height:100%; z-index:20}
@@ -180,7 +196,11 @@ HTML_TMPL = """<!doctype html>
   .table-node.hit, .table-node li.hit{ opacity: 1 !important; }
   svg .wire{fill:none; stroke:var(--wire-strong); stroke-width:2.4; stroke-linecap:round; stroke-linejoin:round}
   svg .wire.strong{stroke-width:3.2}
+  svg .wire.neighbor{ stroke-dasharray:6 6; opacity:.9 }
   svg defs marker#arrow{ overflow:visible }
+  /* Neighbor (ghost) tables rendered for context when selecting a table */
+  .table-node.neighbor{ opacity:.75; border-style:dashed; border-color:#94a3b8; background:transparent }
+  .table-node.neighbor header{ background:#9aa6b2; color:#0b1020 }
 </style>
 </head>
 <body>
@@ -192,7 +212,10 @@ HTML_TMPL = """<!doctype html>
 </div>
 <div id="content">
   <aside id="sidebar" aria-label="Tables">
-    <div class="side-header">Objects</div>
+    <div class="side-top">
+      <div class="side-header">Objects</div>
+      <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects…" />
+    </div>
     <div id="tableList"></div>
   </aside>
   <div id="viewport">
@@ -208,9 +231,28 @@ HTML_TMPL = """<!doctype html>
   </div>
 </div>
 <script>
-const ALL_TABLES = __NODES__;
-let TABLES = []; // visible tables only (selected via sidebar)
 const EDGES = __EDGES__;
+const __ALL_TABLES_RAW__ = __NODES__;
+// Fallback: if nodes are missing, derive tables from edges
+function __deriveTablesFromEdges(){
+  const m = new Map(); // id -> {id,label,full,columns:Set}
+  (EDGES||[]).forEach(e=>{
+    [e.from, e.to].forEach(u=>{
+      if (!u) return;
+      const p = parseUri(u);
+      const id = p.tableId;
+      let t = m.get(id);
+      if (!t){
+        t = { id, label: p.tbl, full: p.ns + '.' + p.tbl, columns: new Set() };
+        m.set(id, t);
+      }
+      t.columns.add(p.col);
+    });
+  });
+  return Array.from(m.values()).map(t=>({ id: t.id, label: t.label, full: t.full, columns: Array.from(t.columns).sort() }));
+}
+const ALL_TABLES = (Array.isArray(__ALL_TABLES_RAW__) && __ALL_TABLES_RAW__.length) ? __ALL_TABLES_RAW__ : __deriveTablesFromEdges();
+let TABLES = []; // visible tables: selected + neighbors
 const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 
 // Helpers
@@ -218,7 +260,9 @@ const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
 // Global scale used by pan/zoom and wire projection; must be defined before first draw
 let SCALE = 1;
 let FIRST_FIT_DONE = false;
-let VISIBLE_IDS = new Set();
+let VISIBLE_IDS = new Set(); // explicitly selected via checkboxes
+let NEIGHBOR_IDS = new Set(); // derived: immediate neighbors of selected
+let FILTER_TEXT = '';
 
 // Lineage highlight globals (declared early to avoid TDZ on first draw)
 let COL_OUT = null; // Map colKey -> Array<edge>
@@ -279,8 +323,28 @@ function edgeKey(e){
 }
 
 function ensureColorMarkers(){
-  const defs = document.querySelector('#wires defs');
-  if (!defs) return;
+  const svg = document.getElementById('wires');
+  if (!svg) return;
+  // Ensure <defs> exists with base marker
+  let defs = svg.querySelector('defs');
+  if (!defs){
+    defs = document.createElementNS('http://www.w3.org/2000/svg','defs');
+    svg.insertBefore(defs, svg.firstChild);
+  }
+  if (!defs.querySelector('#arrow')){
+    const m = document.createElementNS('http://www.w3.org/2000/svg','marker');
+    m.setAttribute('id','arrow');
+    m.setAttribute('markerWidth','8');
+    m.setAttribute('markerHeight','8');
+    m.setAttribute('refX','6');
+    m.setAttribute('refY','3.5');
+    m.setAttribute('orient','auto');
+    const poly = document.createElementNS('http://www.w3.org/2000/svg','polygon');
+    poly.setAttribute('points','0 0, 7 3.5, 0 7');
+    poly.setAttribute('fill','var(--wire-strong)');
+    m.appendChild(poly);
+    defs.appendChild(m);
+  }
   // create markers for all palette indices if missing
   PALETTE.forEach((col, idx)=>{
     const id = 'arrow-' + idx;
@@ -350,9 +414,7 @@ function ranksFromGraph(graph){
 
 function layoutTables(){
   const stage = document.getElementById('stage');
-  // Keep a reference to wires before clearing stage contents
-  let wires = document.getElementById('wires');
-  // Clear stage content but re-append wires node afterwards
+  // Clear only stage content (wires SVG stays a sibling under #viewport)
   stage.innerHTML = '';
   
   if (!TABLES || !TABLES.length){
@@ -375,6 +437,7 @@ function layoutTables(){
   const cardById = new Map();
   TABLES.forEach(t=>{
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
+    if (NEIGHBOR_IDS && NEIGHBOR_IDS.has(t.id)) art.classList.add('neighbor');
     // Attach searchable metadata
     art.setAttribute('data-id', (t.id||'').toLowerCase());
     art.setAttribute('data-full', (t.full||'').toLowerCase());
@@ -405,7 +468,7 @@ function layoutTables(){
     cardById.set(t.id, art);
     makeDraggable(art);
   });
-  if (wires) stage.appendChild(wires);
+  // Do not move the wires SVG; it remains a sibling of #stage
   // Rows exist now -> (re)build column graph and mark rows clickable
   try { buildColGraph(); } catch(_) {}
   // Sizes
@@ -514,8 +577,12 @@ function drawEdges(){
   const svg = document.getElementById('wires');
   // clear old
   while(svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
+  // Recreate markers if needed
+  ensureColorMarkers();
 
   PATH_BY_EDGE.clear();
+  const selectedIds = new Set(VISIBLE_IDS);
+  const neighborIds = new Set(NEIGHBOR_IDS);
   const visibleIds = new Set(TABLES.map(t=>t.id));
   EDGES.forEach(e=>{
     const s = parseUri(e.from), t = parseUri(e.to);
@@ -531,6 +598,9 @@ function drawEdges(){
     const p = document.createElementNS('http://www.w3.org/2000/svg','path');
     p.setAttribute('d', d);
     p.setAttribute('class','wire'+(e.transformation && e.transformation!=='IDENTITY' ? ' strong':'') );
+    // Style neighbor edges (connecting any neighbor table) as dashed
+    const isNeighborEdge = (neighborIds.has(s.tableId) || neighborIds.has(t.tableId)) && !(selectedIds.has(s.tableId) && selectedIds.has(t.tableId));
+    if (isNeighborEdge) p.classList.add('neighbor');
     const ek = edgeKey(e);
     p.setAttribute('data-edge-key', ek);
     // colorize by source column only if that column has multiple outgoing edges
@@ -553,6 +623,22 @@ function drawEdges(){
   }
 }
 
+// Compute render sets: selected + immediate neighbors for context
+function computeRenderSets(){
+  const base = new Set(VISIBLE_IDS);
+  const neighbors = new Set();
+  if (base.size){
+    EDGES.forEach(e=>{
+      const s = parseUri(e.from), t = parseUri(e.to);
+      if (base.has(s.tableId) && !base.has(t.tableId)) neighbors.add(t.tableId);
+      if (base.has(t.tableId) && !base.has(s.tableId)) neighbors.add(s.tableId);
+    });
+  }
+  NEIGHBOR_IDS = neighbors;
+  const renderIds = new Set([...base, ...neighbors]);
+  TABLES = ALL_TABLES.filter(x=> renderIds.has(x.id));
+}
+
 // Build sidebar with checkboxes (all unchecked by default)
 function buildSidebar(){
   const list = document.getElementById('tableList');
@@ -563,17 +649,29 @@ function buildSidebar(){
     const lb = (b.label||b.full||'').toLowerCase();
     if (la === lb) return (a.id||'').localeCompare(b.id||'');
     return la.localeCompare(lb);
+  }).filter(t=>{
+    if (!FILTER_TEXT) return true;
+    const q = FILTER_TEXT.toLowerCase();
+    return (t.label||'').toLowerCase().includes(q) || (t.full||'').toLowerCase().includes(q) || (t.id||'').toLowerCase().includes(q);
   });
+  if (!items.length){
+    const empty = document.createElement('div');
+    empty.style.cssText = 'color:#64748b; font-size:12px; padding:8px 12px;';
+    empty.textContent = FILTER_TEXT ? 'No objects match the filter.' : 'No objects available.';
+    list.appendChild(empty);
+    return;
+  }
   items.forEach(t=>{
     const id = 'chk-' + t.id;
     const row = document.createElement('label');
     row.className = 'tbl-item';
     const cb = document.createElement('input'); cb.type='checkbox'; cb.id=id; cb.dataset.tid = t.id;
+    cb.checked = VISIBLE_IDS.has(t.id);
     cb.addEventListener('change', (e)=>{
       const tid = e.currentTarget.dataset.tid;
       if (e.currentTarget.checked){ VISIBLE_IDS.add(tid); }
       else { VISIBLE_IDS.delete(tid); }
-      TABLES = ALL_TABLES.filter(x=> VISIBLE_IDS.has(x.id));
+      computeRenderSets();
       layoutTables();
       // Auto-fit once content appears for the first time
       if (TABLES.length && !FIRST_FIT_DONE){ try{ fitToContent(); }catch(_){} }
@@ -587,9 +685,18 @@ function buildSidebar(){
 }
 
 buildSidebar();
+computeRenderSets();
 layoutTables();
 window.addEventListener('resize', ()=>{ layoutTables(); });
 document.getElementById('viewport').addEventListener('scroll', ()=>{ drawEdges(); });
+// Live filter behavior
+const sideFilter = document.getElementById('sideFilter');
+if (sideFilter){
+  sideFilter.addEventListener('input', (e)=>{
+    FILTER_TEXT = (e.currentTarget.value||'').trim();
+    buildSidebar();
+  });
+}
 
 // ----- Pan (drag background) & Zoom (Ctrl/Alt+wheel) -----
 const viewport = document.getElementById('viewport');
