@@ -91,13 +91,15 @@ def extract(
 def impact(
     ctx: typer.Context,
     selector: str = typer.Option(..., "-s", "--selector", help="[+]db.schema.object.column[+] - use + to indicate direction"),
-    max_depth: Optional[int] = typer.Option(None),
+    max_depth: Optional[int] = typer.Option(None, help="Traversal depth; 0 means unlimited (full lineage)"),
     out: Optional[Path] = typer.Option(None),
     graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     engine = Engine(cfg)
-    req = ImpactRequest(selector=selector, max_depth=max_depth or 2, graph_dir=graph_dir)
+    # Default to 0 (unlimited) when not specified
+    effective_depth = 0 if max_depth is None else max_depth
+    req = ImpactRequest(selector=selector, max_depth=effective_depth, graph_dir=graph_dir)
     result = engine.run_impact(req)
     _emit(result, cfg.output_format, out)
 

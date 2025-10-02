@@ -44,7 +44,7 @@ class ExtractRequest:
 @dataclass
 class ImpactRequest:
     selector: str
-    max_depth: int = 2
+    max_depth: int = 0
     graph_dir: Optional[Path] = None
 
 
