@@ -586,12 +586,8 @@ function layoutTables(){
   const stageRectH = Math.ceil(maxBottom + TOP);
   stage.style.width = stageRectW + 'px';
   stage.style.height = stageRectH + 'px';
-  const svg = document.getElementById('wires');
-  svg.setAttribute('width', String(stageRectW));
-  svg.setAttribute('height', String(stageRectH));
-  svg.setAttribute('viewBox', `0 0 ${stageRectW} ${stageRectH}`);
-  svg.style.width = stageRectW + 'px';
-  svg.style.height = stageRectH + 'px';
+  // Sync wires box and scale to stage dimensions and current SCALE
+  updateWiresSize();
 
   drawEdges();
   requestAnimationFrame(drawEdges);
@@ -608,6 +604,23 @@ function layoutTables(){
     FIRST_FIT_DONE = true;
     setTimeout(()=>{ try{ fitToContent(); }catch(_){} }, 0);
   }
+}
+
+// Keep SVG wires in sync with stage size and zoom SCALE
+function updateWiresSize(){
+  const svg = document.getElementById('wires');
+  const stage = document.getElementById('stage');
+  if (!svg || !stage) return;
+  const w = Math.ceil(stage.offsetWidth);
+  const h = Math.ceil(stage.offsetHeight);
+  // Coordinate space stays unscaled (viewBox in stage units)
+  svg.setAttribute('width', String(w));
+  svg.setAttribute('height', String(h));
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  // Visual size follows current SCALE so paths (computed in stage units)
+  // align with CSS-transformed stage
+  svg.style.width = (w * SCALE) + 'px';
+  svg.style.height = (h * SCALE) + 'px';
 }
 
 function centerOf(el){
@@ -781,6 +794,7 @@ viewport.addEventListener('wheel', (e)=>{
   SCALE = Math.max(0.4, Math.min(2.5, SCALE * factor));
   const stage = document.getElementById('stage');
   stage.style.transform = `scale(${SCALE})`;
+  updateWiresSize();
 
   // Keep cursor position stable during zoom
   const rect = viewport.getBoundingClientRect();
@@ -802,6 +816,7 @@ function zoomBy(factor){
   SCALE = Math.max(0.4, Math.min(2.5, SCALE * factor));
   const stage = document.getElementById('stage');
   stage.style.transform = `scale(${SCALE})`;
+  updateWiresSize();
   const viewport = document.getElementById('viewport');
   const mx = viewport.clientWidth/2, my = viewport.clientHeight/2;
   const worldX = (viewport.scrollLeft + mx) / prev;
@@ -832,6 +847,7 @@ function fitToContent(){
   const scaleY = viewport.clientHeight / contentH;
   SCALE = Math.max(0.4, Math.min(1.0, Math.min(scaleX, scaleY)));
   stage.style.transform = `scale(${SCALE})`;
+  updateWiresSize();
   // center
   const cx = (minX + maxX)/2 - viewport.clientWidth/(2*SCALE);
   const cy = (minY + maxY)/2 - viewport.clientHeight/(2*SCALE);
@@ -1004,12 +1020,7 @@ window.addEventListener('mousemove', (e)=>{
   if (rightX + 60 > stage.offsetWidth){ stage.style.width = (rightX + 120) + 'px'; changed = true; }
   if (bottomY + 60 > stage.offsetHeight){ stage.style.height = (bottomY + 120) + 'px'; changed = true; }
   if (changed){
-    const svg = document.getElementById('wires');
-    svg.setAttribute('width', String(stage.offsetWidth));
-    svg.setAttribute('height', String(stage.offsetHeight));
-    svg.setAttribute('viewBox', `0 0 ${stage.offsetWidth} ${stage.offsetHeight}`);
-    svg.style.width = stage.offsetWidth + 'px';
-    svg.style.height = stage.offsetHeight + 'px';
+    updateWiresSize();
   }
   if (!window.__rafDrawing){
     window.__rafDrawing = true;
