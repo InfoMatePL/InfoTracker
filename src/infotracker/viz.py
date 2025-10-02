@@ -84,7 +84,8 @@ HTML_TMPL = """<!doctype html>
     --sel-bg:#fde68a; /* amber-300 */
     --sel-outline:#111827; /* slate-900 */
   }
-  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial}
+  html,body{height:100%; margin:0}
+  body{display:flex; flex-direction:column; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, Segoe UI, Roboto, Arial}
   /* Modern toolbar styling */
   #toolbar{
     position:sticky; top:0; z-index:50;
@@ -143,7 +144,14 @@ HTML_TMPL = """<!doctype html>
     #toolbar input::placeholder{ color:#94a3b8 }
     #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(59,130,246,0.25); }
   }
-  #viewport{position:relative; height:100%; overflow:auto}
+  /* Main split: left sidebar + right canvas */
+  #content{display:flex; flex:1 1 auto; min-height:0}
+  #sidebar{width:280px; max-width:40vw; overflow:auto; border-right:1px solid #e5e7eb; padding:10px; background:linear-gradient(180deg, rgba(255,255,255,0.6), rgba(255,255,255,0.35))}
+  #sidebar .side-header{font-weight:700; font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:#64748b; margin:4px 0 10px}
+  #sidebar .tbl-item{display:flex; align-items:center; gap:8px; padding:6px 4px; border-radius:6px; cursor:pointer}
+  #sidebar .tbl-item:hover{background: rgba(148,163,184,0.14)}
+  #sidebar input[type="checkbox"]{width:14px; height:14px}
+  #viewport{position:relative; flex:1 1 auto; min-height:0; overflow:auto}
   #stage{position:relative; min-width:100%; min-height:100%; transform-origin: 0 0;}
   svg.wires{position:absolute; inset:0; pointer-events:none; width:100%; height:100%; z-index:20}
   .empty{position:absolute; left:20px; top:20px; color:#6b7280; font-size:14px}
@@ -182,19 +190,26 @@ HTML_TMPL = """<!doctype html>
   <button id="btnZoomIn" title="Zoom in">+</button>
   <input id="search" type="text" placeholder="Search table/column… (Enter to jump)" />
 </div>
-<div id=\"viewport\">
-  <div id=\"stage\"></div>
-  <svg class=\"wires\" id=\"wires\" aria-hidden=\"true\">
-    <defs>
-      <marker id=\"arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"6\" refY=\"3.5\" orient=\"auto\">
-        <polygon points=\"0 0, 7 3.5, 0 7\" fill=\"var(--wire-strong)\"/>
-      </marker>
-      <!-- colorized arrow markers will be injected below (arrow-0..N) -->
-    </defs>
-  </svg>
+<div id="content">
+  <aside id="sidebar" aria-label="Tables">
+    <div class="side-header">Objects</div>
+    <div id="tableList"></div>
+  </aside>
+  <div id="viewport">
+    <div id="stage"></div>
+    <svg class="wires" id="wires" aria-hidden="true">
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3.5" orient="auto">
+          <polygon points="0 0, 7 3.5, 0 7" fill="var(--wire-strong)"/>
+        </marker>
+        <!-- colorized arrow markers will be injected below (arrow-0..N) -->
+      </defs>
+    </svg>
+  </div>
 </div>
 <script>
-const TABLES = __NODES__;
+const ALL_TABLES = __NODES__;
+let TABLES = []; // visible tables only (selected via sidebar)
 const EDGES = __EDGES__;
 const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 
@@ -203,6 +218,7 @@ const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
 // Global scale used by pan/zoom and wire projection; must be defined before first draw
 let SCALE = 1;
 let FIRST_FIT_DONE = false;
+let VISIBLE_IDS = new Set();
 
 // Lineage highlight globals (declared early to avoid TDZ on first draw)
 let COL_OUT = null; // Map colKey -> Array<edge>
@@ -303,11 +319,14 @@ function buildGraph(){
   const pred = new Map([...ids].map(id=>[id,new Set()]));
   EDGES.forEach(e=>{
     const s=parseUri(e.from), t=parseUri(e.to);
-    if (s.tableId!==t.tableId){
-      if(!adj.get(s.tableId).has(t.tableId)){
-        adj.get(s.tableId).add(t.tableId);
-        indeg.set(t.tableId, indeg.get(t.tableId)+1);
-        pred.get(t.tableId).add(s.tableId);
+    // Only consider edges between currently visible tables
+    if (s.tableId!==t.tableId && ids.has(s.tableId) && ids.has(t.tableId)){
+      const sAdj = adj.get(s.tableId);
+      if (sAdj && !sAdj.has(t.tableId)){
+        sAdj.add(t.tableId);
+        indeg.set(t.tableId, (indeg.get(t.tableId) || 0) + 1);
+        const pset = pred.get(t.tableId);
+        if (pset) pset.add(s.tableId);
       }
     }
   });
@@ -337,7 +356,7 @@ function layoutTables(){
   stage.innerHTML = '';
   
   if (!TABLES || !TABLES.length){
-    const info = document.createElement('div'); info.className='empty'; info.textContent = 'No edges found in column_graph.json';
+    const info = document.createElement('div'); info.className='empty'; info.textContent = 'No tables selected. Use the left panel to choose tables.';
     stage.appendChild(info);
     // also clear wires
     const svg = document.getElementById('wires');
@@ -388,7 +407,7 @@ function layoutTables(){
   });
   if (wires) stage.appendChild(wires);
   // Rows exist now -> (re)build column graph and mark rows clickable
-  buildColGraph();
+  try { buildColGraph(); } catch(_) {}
   // Sizes
   const maxWidth = Math.max(240, ...[...cardById.values()].map(el=>{
     const w = Math.max(el.querySelector('header').offsetWidth, ...Array.from(el.querySelectorAll('li span:nth-child(2)')).map(s=>s.offsetWidth+60));
@@ -473,6 +492,9 @@ function layoutTables(){
   stage.onclick = onStageClick;
   stage.onkeydown = onStageKeyDown;
 
+  // Reset selection state when the visible set changes
+  SELECTED_COL = null;
+
   // auto-fit on first successful layout so users see content immediately
   if (!FIRST_FIT_DONE && TABLES && TABLES.length){
     FIRST_FIT_DONE = true;
@@ -494,8 +516,10 @@ function drawEdges(){
   while(svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
 
   PATH_BY_EDGE.clear();
+  const visibleIds = new Set(TABLES.map(t=>t.id));
   EDGES.forEach(e=>{
     const s = parseUri(e.from), t = parseUri(e.to);
+    if (!visibleIds.has(s.tableId) || !visibleIds.has(t.tableId)) return;
     const sKey = (s.tableId + '.' + s.col).toLowerCase();
     const tKey = (t.tableId + '.' + t.col).toLowerCase();
     const sp = document.querySelector(`.port[data-key="${sKey}"][data-side="R"]`);
@@ -529,6 +553,40 @@ function drawEdges(){
   }
 }
 
+// Build sidebar with checkboxes (all unchecked by default)
+function buildSidebar(){
+  const list = document.getElementById('tableList');
+  if (!list) return;
+  list.innerHTML = '';
+  const items = [...ALL_TABLES].sort((a,b)=>{
+    const la = (a.label||a.full||'').toLowerCase();
+    const lb = (b.label||b.full||'').toLowerCase();
+    if (la === lb) return (a.id||'').localeCompare(b.id||'');
+    return la.localeCompare(lb);
+  });
+  items.forEach(t=>{
+    const id = 'chk-' + t.id;
+    const row = document.createElement('label');
+    row.className = 'tbl-item';
+    const cb = document.createElement('input'); cb.type='checkbox'; cb.id=id; cb.dataset.tid = t.id;
+    cb.addEventListener('change', (e)=>{
+      const tid = e.currentTarget.dataset.tid;
+      if (e.currentTarget.checked){ VISIBLE_IDS.add(tid); }
+      else { VISIBLE_IDS.delete(tid); }
+      TABLES = ALL_TABLES.filter(x=> VISIBLE_IDS.has(x.id));
+      layoutTables();
+      // Auto-fit once content appears for the first time
+      if (TABLES.length && !FIRST_FIT_DONE){ try{ fitToContent(); }catch(_){} }
+      else { drawEdges(); }
+    });
+    const name = document.createElement('span'); name.textContent = t.label || t.full || t.id;
+    name.title = t.full || t.id;
+    row.appendChild(cb); row.appendChild(name);
+    list.appendChild(row);
+  });
+}
+
+buildSidebar();
 layoutTables();
 window.addEventListener('resize', ()=>{ layoutTables(); });
 document.getElementById('viewport').addEventListener('scroll', ()=>{ drawEdges(); });
