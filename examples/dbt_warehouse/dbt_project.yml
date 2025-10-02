@@ -1,0 +1,63 @@
+# Example dbt_project.yml for InfoTracker integration
+# This demonstrates typical dbt configuration
+
+name: 'warehouse_example'
+version: '1.0.0'
+config-version: 2
+
+# Profile configuration (usually in separate profiles.yml)
+profile: 'warehouse'
+
+# Model paths
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Model configurations
+models:
+  warehouse_example:
+    # Sources & seeds (schema-only representations)
+    +materialized: table
+    +schema: dbo
+    
+    # Staging models
+    staging:
+      +materialized: view
+      +schema: staging
+      
+    # Dimensions
+    dimensions:
+      +materialized: table
+      +schema: dimensions
+      
+    # Facts
+    facts:
+      +materialized: table
+      +schema: facts
+      
+    # Analytics
+    analytics:
+      +materialized: view
+      +schema: analytics
+
+# Database configuration
+# InfoTracker will normalize all references to:
+# DefaultDB.dbo.<model_name>
+vars:
+  default_database: "DefaultDB"
+  default_schema: "dbo"
+
+# Seeds configuration
+seeds:
+  warehouse_example:
+    +schema: raw
+    +quote_columns: false
+
