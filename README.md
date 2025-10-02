@@ -141,6 +141,7 @@ infotracker --format json impact -s "..customer*" --graph-dir build/lineage > cu
 
 # Control traversal depth
 infotracker impact -s "+dbo.Orders.OrderID" --max-depth 2 --graph-dir build/lineage
+# Note: --max-depth defaults to 0 (unlimited / full lineage)
 ```
 
 ### Breaking Change Detection

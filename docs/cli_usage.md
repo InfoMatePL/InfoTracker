@@ -84,6 +84,7 @@ Usage:
 ```
 infotracker impact -s [+]schema.object.column[+] [--max-depth N] [--direction upstream|downstream] [--out out.json]
 ```
+- `--max-depth` default is 0, which means unlimited (full lineage).
 - Selector semantics: leading `+` = upstream seed; trailing `+` = downstream
 - Output: list of columns with paths and reasons
 
