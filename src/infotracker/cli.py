@@ -57,7 +57,7 @@ def extract(
     fail_on_warn: bool = typer.Option(False),
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
     exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
-    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files", show_choices=True),
+    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files. Supported: " + ", ".join(get_supported_encodings()), show_choices=True),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     
