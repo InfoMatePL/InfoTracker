@@ -175,6 +175,8 @@ HTML_TMPL = """<!doctype html>
   .theme-dark .side-resizer::after{ background:#1f2937 }
   .theme-dark .side-resizer:hover::after{ background:#475569 }
   .theme-dark body.resizing .side-resizer::after{ background:#64748b }
+  .side-resizer.hidden{ width:0 !important; cursor:default }
+  .side-resizer.hidden::after{ display:none }
   #sidebar *{ box-sizing: border-box }
   #sidebar .side-top{position:sticky; top:0; z-index:5; padding:6px 2px 10px 2px; margin:-10px -10px 10px -10px; background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)); border-bottom:1px solid #e5e7eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04)}
   #sidebar .side-header{padding:0 12px; font-weight:800; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#64748b; margin:4px 0 8px}
@@ -765,6 +767,11 @@ try{
   const collapsed = (savedSide === 'collapsed');
   const sideEl = document.getElementById('sidebar');
   if (collapsed && sideEl){ sideEl.classList.add('collapsed'); }
+  // Ensure resizer mirrors collapsed state on load
+  try{
+    const resEl = document.getElementById('sidebarResizer');
+    if (resEl){ resEl.classList.toggle('hidden', collapsed); }
+  }catch(_){ }
   // Restore saved width
   const savedW = parseInt(localStorage.getItem(SIDEBAR_W_KEY)||'', 10);
   if (!isNaN(savedW) && sideEl && savedW >= 160){ sideEl.style.width = savedW + 'px'; }
@@ -1014,10 +1021,24 @@ document.getElementById('btnZoomOut').addEventListener('click', ()=> zoomBy(0.9)
 document.getElementById('btnFit').addEventListener('click', ()=> fitToContent());
 document.getElementById('btnToggleSidebar').addEventListener('click', ()=>{
   const side = document.getElementById('sidebar');
+  const res = document.getElementById('sidebarResizer');
   if (!side) return;
   const willCollapse = !side.classList.contains('collapsed');
-  side.classList.toggle('collapsed', willCollapse);
-  try{ localStorage.setItem(SIDEBAR_KEY, willCollapse ? 'collapsed' : 'expanded'); }catch(_){}
+  if (willCollapse){
+    // Save current width and collapse to 0
+    const curW = side.offsetWidth || parseInt(side.style.width||'280', 10) || 280;
+    try{ localStorage.setItem(SIDEBAR_W_KEY, String(curW)); }catch(_){ }
+    side.classList.add('collapsed');
+    side.style.width = '0px';
+    if (res) res.classList.add('hidden');
+  } else {
+    // Restore saved width and expand
+    const savedW = parseInt(localStorage.getItem(SIDEBAR_W_KEY)||'280', 10) || 280;
+    side.classList.remove('collapsed');
+    side.style.width = Math.max(160, savedW) + 'px';
+    if (res) res.classList.remove('hidden');
+  }
+  try{ localStorage.setItem(SIDEBAR_KEY, willCollapse ? 'collapsed' : 'expanded'); }catch(_){ }
   // reflow wires due to size change
   setTimeout(()=>{ layoutTables(); }, 100);
 });
