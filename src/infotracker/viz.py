@@ -205,7 +205,11 @@ HTML_TMPL = """<!doctype html>
   .table-node{position:absolute; width:240px; background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:0 1px 2px rgba(0,0,0,.06)}
   .table-node{ cursor: grab; user-select: none; }
   .table-node.dragging{ box-shadow:0 6px 24px rgba(0,0,0,.18); cursor: grabbing; }
-  .table-node header{padding:8px 10px; font-weight:600; color:var(--header-text); background:var(--header); border-bottom:1px solid var(--border); border-radius:10px 10px 0 0; text-align:center}
+  .table-node header{position:relative; padding:8px 10px; font-weight:600; color:var(--header-text); background:var(--header); border-bottom:1px solid var(--border); border-radius:10px 10px 0 0; text-align:center}
+  .table-node header .title{ display:inline-block; pointer-events:none }
+  .table-node header .sel-btn{ position:absolute; right:8px; top:6px; height:24px; padding:2px 8px; border:1px solid rgba(255,255,255,.6); border-radius:6px; background:rgba(255,255,255,.15); color:#fff; font-weight:700; cursor:pointer }
+  .table-node header .sel-btn:hover{ background:rgba(255,255,255,.25) }
+  .table-node.selected{ box-shadow: 0 0 0 2px rgba(99,102,241,.35), 0 6px 18px rgba(0,0,0,.12) }
   .table-node ul{list-style:none; margin:0; padding:6px 10px 10px}
   .table-node.collapsed ul{ display:none }
   .table-node li{display:flex; align-items:center; justify-content:center; gap:8px; margin:4px 0; padding:6px 8px; background:var(--row); border:1px solid var(--row-border); border-radius:8px; white-space:nowrap; font-size:13px}
@@ -511,7 +515,16 @@ function layoutTables(){
     art.setAttribute('data-id', (t.id||'').toLowerCase());
     art.setAttribute('data-full', (t.full||'').toLowerCase());
     art.setAttribute('data-label', (t.label||'').toLowerCase());
-    const h = document.createElement('header'); h.textContent = t.label; h.title = t.full || t.label; art.appendChild(h);
+    const h = document.createElement('header'); h.title = t.full || t.label;
+    const title = document.createElement('span'); title.className='title'; title.textContent = t.label; h.appendChild(title);
+    const isSel = VISIBLE_IDS && VISIBLE_IDS.has && VISIBLE_IDS.has(t.id);
+    if (isSel) art.classList.add('selected');
+    const btn = document.createElement('button'); btn.className='sel-btn'; btn.type='button'; btn.textContent = isSel ? '−' : '+'; btn.title = isSel ? 'Unselect' : 'Select'; btn.dataset.tid = t.id;
+    btn.addEventListener('click', (ev)=>{ ev.stopPropagation(); ev.preventDefault(); toggleTableSelection(ev.currentTarget.dataset.tid); });
+    h.appendChild(btn);
+    // dblclick header toggles selection as well
+    h.addEventListener('dblclick', (ev)=>{ ev.stopPropagation(); toggleTableSelection(t.id); });
+    art.appendChild(h);
     const ul = document.createElement('ul');
     t.columns.forEach((c, i)=>{
       const li = document.createElement('li'); if(i%2) li.classList.add('alt');
@@ -764,6 +777,15 @@ function computeRenderSets(){
   NEIGHBOR_IDS = neighbors;
   const renderIds = new Set([...base, ...neighbors]);
   TABLES = ALL_TABLES.filter(x=> renderIds.has(x.id));
+}
+
+// Toggle table selection from canvas or programmatically; updates sidebar + layout
+function toggleTableSelection(tableId){
+  if (!tableId) return;
+  if (VISIBLE_IDS.has(tableId)) VISIBLE_IDS.delete(tableId); else VISIBLE_IDS.add(tableId);
+  computeRenderSets();
+  layoutTables();
+  buildSidebar();
 }
 
 // Build sidebar with checkboxes (all unchecked by default)
@@ -1161,8 +1183,8 @@ function bary(neighSet, posMap, fallback){
 let drag = null; // { el, startX, startY, left, top }
 function makeDraggable(card){
   card.addEventListener('mousedown', (e)=>{
-    // Allow clicking on rows without triggering drag
-    if (e.target && e.target.closest('li')) return;
+    // Allow clicking on rows or header button without triggering drag
+    if (e.target && (e.target.closest('li') || e.target.closest('.sel-btn'))) return;
     const target = e.currentTarget;
     drag = {
       el: target,
