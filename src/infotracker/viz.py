@@ -163,9 +163,18 @@ HTML_TMPL = """<!doctype html>
   }
   /* Main split: left sidebar + right canvas */
   #content{display:flex; flex:1 1 auto; min-height:0}
-  #sidebar{width:280px; max-width:40vw; overflow-y:auto; overflow-x:hidden; border-right:1px solid #e5e7eb; padding:10px; background:linear-gradient(180deg, var(--sidebar-bg-start), var(--sidebar-bg-end)); box-sizing:border-box; transition: width .2s ease, padding .2s ease, border-color .2s ease }
+  #sidebar{flex:0 0 auto; width:280px; min-width:160px; overflow-y:auto; overflow-x:hidden; border-right:1px solid #e5e7eb; padding:10px; background:linear-gradient(180deg, var(--sidebar-bg-start), var(--sidebar-bg-end)); box-sizing:border-box; transition: width .15s ease, padding .15s ease, border-color .15s ease }
   #sidebar.collapsed{ width:0; padding:0; border:none; overflow:hidden }
   #sidebar.collapsed *{ display:none }
+  /* Draggable vertical resizer between sidebar and canvas */
+  .side-resizer{ flex:0 0 auto; width:6px; cursor:col-resize; background:transparent; position:relative; z-index:30 }
+  .side-resizer::after{ content:""; position:absolute; top:0; bottom:0; left:2px; width:2px; background:#e5e7eb; opacity:.9 }
+  .side-resizer:hover::after{ background:#94a3b8 }
+  body.resizing .side-resizer::after{ background:#64748b }
+  body.resizing{ cursor: col-resize; user-select: none }
+  .theme-dark .side-resizer::after{ background:#1f2937 }
+  .theme-dark .side-resizer:hover::after{ background:#475569 }
+  .theme-dark body.resizing .side-resizer::after{ background:#64748b }
   #sidebar *{ box-sizing: border-box }
   #sidebar .side-top{position:sticky; top:0; z-index:5; padding:6px 2px 10px 2px; margin:-10px -10px 10px -10px; background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)); border-bottom:1px solid #e5e7eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04)}
   #sidebar .side-header{padding:0 12px; font-weight:800; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#64748b; margin:4px 0 8px}
@@ -245,6 +254,7 @@ HTML_TMPL = """<!doctype html>
     </div>
     <div id="tableList"></div>
   </aside>
+  <div id="sidebarResizer" class="side-resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar" tabindex="0"></div>
   <div id="viewport">
     <div id="stage"></div>
     <svg class="wires" id="wires" aria-hidden="true">
@@ -305,6 +315,7 @@ const ALL_TABLES = (Array.isArray(__ALL_TABLES_RAW__) && __ALL_TABLES_RAW__.leng
 let TABLES = []; // visible tables: selected + neighbors
 const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 const SIDEBAR_KEY = 'infotracker.sidebar';
+const SIDEBAR_W_KEY = 'infotracker.sidebar.width';
 
 // Helpers
 const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
@@ -754,6 +765,9 @@ try{
   const collapsed = (savedSide === 'collapsed');
   const sideEl = document.getElementById('sidebar');
   if (collapsed && sideEl){ sideEl.classList.add('collapsed'); }
+  // Restore saved width
+  const savedW = parseInt(localStorage.getItem(SIDEBAR_W_KEY)||'', 10);
+  if (!isNaN(savedW) && sideEl && savedW >= 160){ sideEl.style.width = savedW + 'px'; }
 }catch(_){}
 
 buildSidebar();
@@ -781,6 +795,58 @@ if (btnClearAll){
     buildSidebar();
   });
 }
+
+// Sidebar resizer: drag to adjust width (persists), keyboard arrows supported
+(function(){
+  const res = document.getElementById('sidebarResizer');
+  const side = document.getElementById('sidebar');
+  if (!res || !side) return;
+  let resizing = false, startX = 0, startW = 0;
+  const MIN_W = 160;
+  function maxWidth(){
+    try{ return Math.max(240, Math.floor(window.innerWidth * 0.7)); }catch(_){ return 800; }
+  }
+  function applyWidth(w, persist){
+    const clamped = Math.max(MIN_W, Math.min(maxWidth(), Math.round(w)));
+    side.style.width = clamped + 'px';
+    if (persist){ try{ localStorage.setItem(SIDEBAR_W_KEY, String(clamped)); }catch(_){ }
+    }
+    // Nodes don't move; just redraw wires to keep alignment during resize
+    if (!window.__rafSide){
+      window.__rafSide = true;
+      requestAnimationFrame(()=>{ window.__rafSide = false; drawEdges(); });
+    }
+  }
+  res.addEventListener('mousedown', (e)=>{
+    if (side.classList.contains('collapsed')) return;
+    resizing = true; startX = e.clientX; startW = side.offsetWidth;
+    document.body.classList.add('resizing');
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e)=>{
+    if (!resizing) return;
+    const dx = e.clientX - startX;
+    applyWidth(startW + dx, false);
+  });
+  window.addEventListener('mouseup', ()=>{
+    if (!resizing) return;
+    resizing = false; document.body.classList.remove('resizing');
+    const w = parseInt(side.style.width||'0', 10); if (w) applyWidth(w, true);
+  });
+  res.addEventListener('keydown', (e)=>{
+    if (side.classList.contains('collapsed')) return;
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight'){
+      const cur = side.offsetWidth || MIN_W;
+      const step = (e.shiftKey ? 40 : 10) * (e.key === 'ArrowLeft' ? -1 : 1);
+      applyWidth(cur + step, true);
+      e.preventDefault();
+    } else if (e.key === 'Enter'){
+      applyWidth(280, true);
+      e.preventDefault();
+    }
+  });
+  res.addEventListener('dblclick', ()=> applyWidth(280, true));
+})();
 
 // Theme toggle binding
 const themeToggle = document.getElementById('themeToggle');
