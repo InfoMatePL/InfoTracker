@@ -30,6 +30,9 @@ class SqlParser:
         self.current_database: Optional[str] = None  # Track current database context
         # cross-file object→DB registry (optional)
         self.registry = registry
+        # dbt specifics
+        self.dbt_mode: bool = False
+        self.default_schema: Optional[str] = "dbo"
     
     def _clean_proc_name(self, s: str) -> str:
         """Clean procedure name by removing semicolons and parameters."""
@@ -76,6 +79,24 @@ class SqlParser:
                 node.set("is_hashbytes", True)
         
         return root
+
+    def _extract_dbt_model_name(self, sql_text: str) -> Optional[str]:
+        """Extract dbt model logical name from leading comment, e.g.:
+        -- dbt model: stg_orders
+        Returns lowercased sanitized name or None if not found.
+        """
+        try:
+            head = "\n".join(sql_text.splitlines()[:8])
+            m = re.search(r"(?im)^\s*--\s*dbt\s+model:\s*([A-Za-z0-9_\.]+)", head)
+            if m:
+                name = m.group(1).strip()
+                # Drop any dotted prefixes accidentally captured
+                name = name.split('.')[-1]
+                from .openlineage_utils import sanitize_name
+                return sanitize_name(name)
+        except Exception:
+            pass
+        return None
     
     def _split_fqn(self, fqn: str):
         """Split fully qualified name into database, schema, table components."""
@@ -110,6 +131,14 @@ class SqlParser:
         pseudo = {"view", "function", "procedure"}
         if len(parts) >= 3 and parts[0].lower() in pseudo:
             parts = parts[1:]
+
+        # dbt mode: ignore DB/schema from references, normalize to default namespace+schema
+        if self.dbt_mode:
+            last = parts[-1] if parts else table_name
+            db = self.current_database or self.default_database or "InfoTrackerDW"
+            ns = f"mssql://localhost/{db}"
+            nm = f"{self.default_schema or 'dbo'}.{last}"
+            return ns, nm
 
         # Determine namespace DB from FQN if present; otherwise consult registry, then context
         db: Optional[str]
@@ -432,6 +461,17 @@ class SqlParser:
     def set_default_database(self, default_database: Optional[str]):
         """Set the default database for qualification."""
         self.default_database = default_database
+    
+    def set_default_schema(self, default_schema: Optional[str]):
+        """Set the default schema for dbt-mode normalization."""
+        if default_schema:
+            self.default_schema = default_schema
+        return self
+
+    def enable_dbt_mode(self, enabled: bool = True):
+        """Enable/disable dbt mode (compiled SELECT-only models)."""
+        self.dbt_mode = bool(enabled)
+        return self
     
     def _extract_database_from_use_statement(self, content: str) -> Optional[str]:
         """Extract database name from USE statement at the beginning of file."""
@@ -802,6 +842,87 @@ class SqlParser:
         self.temp_registry.clear()
         
         try:
+            # dbt mode: compiled SELECT-only models; derive target name from filename
+            if self.dbt_mode:
+                normalized_sql = self._normalize_tsql(sql_content)
+                preprocessed_sql = self._preprocess_sql(normalized_sql)
+                statements = sqlglot.parse(preprocessed_sql, read=self.dialect) or []
+                last_select = None
+                for st in reversed(statements):
+                    if isinstance(st, exp.Select):
+                        last_select = st
+                        break
+                if last_select is not None:
+                    # Prefer model name from header comment; fallback to filename stem
+                    model_name = self._extract_dbt_model_name(sql_content) or sanitize_name(object_hint or "dbt_model")
+                    nm = f"{self.default_schema or 'dbo'}.{model_name}"
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
+                    # Dependencies and lineage from last SELECT
+                    deps = self._extract_dependencies(last_select)
+                    deps_norm: Set[str] = set()
+                    for dep in deps:
+                        dep_s = sanitize_name(dep)
+                        parts = dep_s.split('.') if dep_s else []
+                        tbl = parts[-1] if parts else dep_s
+                        deps_norm.add(f"{self.default_schema or 'dbo'}.{tbl}")
+                    lineage, output_columns = self._extract_column_lineage(last_select, nm)
+                    # Decide object type: schema-only SELECT (no FROM) -> treat as table (seed/source)
+                    has_from_tables = any(True for _ in last_select.find_all(exp.Table))
+                    obj_type = "view" if has_from_tables else "table"
+                    schema = TableSchema(
+                        namespace=f"mssql://localhost/{db}",
+                        name=nm,
+                        columns=output_columns
+                    )
+                    self.schema_registry.register(schema)
+                    obj = ObjectInfo(
+                        name=nm,
+                        object_type=obj_type,
+                        schema=schema,
+                        lineage=lineage,
+                        dependencies=deps_norm
+                    )
+                    try:
+                        # Set dbt-style job path for OL emitter
+                        if object_hint:
+                            obj.job_name = f"dbt/models/{object_hint}.sql"
+                    except Exception:
+                        pass
+                    return obj
+                else:
+                    # Fallback for dbt files that don't expose a final SELECT (non-materializing/ephemeral patterns)
+                    model_name = self._extract_dbt_model_name(sql_content) or sanitize_name(object_hint or "dbt_model")
+                    nm = f"{self.default_schema or 'dbo'}.{model_name}"
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
+                    deps = self._extract_basic_dependencies(preprocessed_sql)
+                    # Normalize deps to default schema.table
+                    deps_norm: Set[str] = set()
+                    for dep in deps:
+                        dep_s = sanitize_name(dep)
+                        parts = dep_s.split('.') if dep_s else []
+                        tbl = parts[-1] if parts else dep_s
+                        deps_norm.add(f"{self.default_schema or 'dbo'}.{tbl}")
+                    schema = TableSchema(
+                        namespace=f"mssql://localhost/{db}",
+                        name=nm,
+                        columns=[]
+                    )
+                    self.schema_registry.register(schema)
+                    obj = ObjectInfo(
+                        name=nm,
+                        object_type="view",
+                        schema=schema,
+                        lineage=[],
+                        dependencies=deps_norm
+                    )
+                    obj.is_fallback = True
+                    obj.no_output_reason = "DBT_NO_FINAL_SELECT"
+                    try:
+                        if object_hint:
+                            obj.job_name = f"dbt/models/{object_hint}.sql"
+                    except Exception:
+                        pass
+                    return obj
             # Check if this file contains multiple objects and handle accordingly
             sql_upper = sql_content.upper()
             
@@ -947,8 +1068,14 @@ class SqlParser:
                 parts = (name or "").split(".")
                 return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
-            out_key = _strip_db(sanitize_name(last_persistent_output.schema.name or last_persistent_output.name))
-            all_inputs = {d for d in all_inputs if _strip_db(sanitize_name(d)) != out_key}
+            # Only compute out_key if we have a persistent output
+            out_key = None
+            if last_persistent_output is not None:
+                out_key = _strip_db(sanitize_name(
+                    (last_persistent_output.schema.name if getattr(last_persistent_output, 'schema', None) else last_persistent_output.name)
+                ))
+            if out_key:
+                all_inputs = {d for d in all_inputs if _strip_db(sanitize_name(d)) != out_key}
                 # Determine the main object
             if last_persistent_output:
                 # Use the last persistent output as the main object

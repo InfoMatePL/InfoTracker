@@ -16,6 +16,8 @@ class OpenLineageCfg:
 class RuntimeConfig:
     default_adapter: str = "mssql"
     default_database: Optional[str] = None
+    default_schema: Optional[str] = "dbo"
+    dbt_mode: bool = False
     sql_dir: str = "examples/warehouse/sql"
     out_dir: str = "build/lineage"
     include: List[str] = field(default_factory=lambda: ["*.sql"])
@@ -78,4 +80,3 @@ def load_config(path: Optional[Path]) -> RuntimeConfig:
     cfg.ignore = sorted(set(base + patterns))
     
     return cfg
-

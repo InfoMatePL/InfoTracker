@@ -81,6 +81,12 @@ class Engine:
         5) zbuduj graf kolumn do późniejszego impact
         """
         adapter = get_adapter(req.adapter, self.config)
+        # Apply dbt project context (default DB/schema) if in dbt mode
+        try:
+            if getattr(self.config, 'dbt_mode', False):
+                self._apply_dbt_context(req.sql_dir, adapter)
+        except Exception:
+            pass
         parser = adapter.parser
 
         # Load global object→DB registry and inject into parser (shared across files)
@@ -298,6 +304,38 @@ class Engine:
             "rows": outputs,     # lista list – _emit to obsługuje
             "warnings": warnings,
         }
+
+    def _apply_dbt_context(self, sql_dir: Path, adapter) -> None:
+        """If dbt_project.yml is present near sql_dir, use its defaults.
+
+        We read vars.default_database and vars.default_schema and, if not already
+        provided in config, set parser defaults accordingly. This keeps behavior
+        non-intrusive for classic SQL mode.
+        """
+        # Locate dbt_project.yml in sql_dir or its parent(s)
+        candidates = [
+            Path(sql_dir) / 'dbt_project.yml',
+            Path(sql_dir).parent / 'dbt_project.yml',
+        ]
+        project = next((p for p in candidates if p.exists()), None)
+        if not project:
+            return
+        data = yaml.safe_load(project.read_text(encoding='utf-8')) or {}
+        vars_cfg = data.get('vars', {}) or {}
+        db = vars_cfg.get('default_database')
+        sch = vars_cfg.get('default_schema')
+        # Apply only if not set in config to allow explicit overrides
+        try:
+            if db and not getattr(self.config, 'default_database', None):
+                self.config.default_database = db
+                if hasattr(adapter, 'parser'):
+                    adapter.parser.set_default_database(db)
+            if sch and not getattr(self.config, 'default_schema', None):
+                self.config.default_schema = sch
+                if hasattr(adapter, 'parser') and hasattr(adapter.parser, 'set_default_schema'):
+                    adapter.parser.set_default_schema(sch)
+        except Exception:
+            pass
 
     def _build_dependency_graph(self, objects: List[ObjectInfo]) -> Dict[str, Set[str]]:
         """Build dependency graph: object_name -> set of dependencies."""

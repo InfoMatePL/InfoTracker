@@ -53,6 +53,7 @@ def extract(
     sql_dir: Optional[Path] = typer.Option(None, exists=True, file_okay=False),
     out_dir: Optional[Path] = typer.Option(None, file_okay=False),
     adapter: Optional[str] = typer.Option(None),
+    dbt: bool = typer.Option(False, "--dbt", help="Enable dbt mode (compiled models)"),
     catalog: Optional[Path] = typer.Option(None, exists=True),
     fail_on_warn: bool = typer.Option(False),
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
@@ -60,6 +61,9 @@ def extract(
     encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files", show_choices=True),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    # dbt mode flag (overrides config)
+    if dbt:
+        cfg.dbt_mode = True
     
     # Validate encoding
     supported = get_supported_encodings()
@@ -94,8 +98,11 @@ def impact(
     max_depth: Optional[int] = typer.Option(None),
     out: Optional[Path] = typer.Option(None),
     graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
+    dbt: bool = typer.Option(False, "--dbt", help="dbt mode (for selector normalization)")
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    if dbt:
+        cfg.dbt_mode = True
     engine = Engine(cfg)
     req = ImpactRequest(selector=selector, max_depth=max_depth or 2, graph_dir=graph_dir)
     result = engine.run_impact(req)
@@ -109,9 +116,12 @@ def diff(
     head: Optional[Path] = typer.Option(None, "--head", help="Directory containing head OpenLineage artifacts"),
     format: str = typer.Option("text", "--format", help="Output format: text|json"),
     threshold: Optional[str] = typer.Option(None, "--threshold", help="Severity threshold: NON_BREAKING|POTENTIALLY_BREAKING|BREAKING"),
+    dbt: bool = typer.Option(False, "--dbt", help="dbt mode (no direct effect, for consistency)")
 ):
     """Compare two sets of OpenLineage artifacts for breaking changes."""
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    if dbt:
+        cfg.dbt_mode = True
     engine = Engine(cfg)
     
     if not base or not head:
@@ -212,4 +222,3 @@ def entrypoint() -> None:
 
 if __name__ == "__main__":
     entrypoint()
-
