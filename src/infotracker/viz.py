@@ -128,6 +128,11 @@ HTML_TMPL = """<!doctype html>
     box-shadow: 0 1px 0 rgba(255,255,255,0.8) inset;
     transition: border-color .15s ease, box-shadow .15s ease;
   }
+  /* Compact numeric input for depth */
+  #toolbar input.compact{
+    flex:0 0 auto; width:88px; min-width:88px; padding:6px 10px; border-radius:10px; background: linear-gradient(180deg, #ffffff, #f8fafc);
+    background-image:none;
+  }
   #toolbar input::placeholder{ color:#94a3b8 }
   #toolbar input:focus{ border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,0.25); outline: none }
   /* Keep sidebar toggle separated from the 3-button group */
@@ -244,6 +249,7 @@ HTML_TMPL = """<!doctype html>
   <button id="btnZoomOut" title="Zoom out">−</button>
   <button id="btnZoomIn" title="Zoom in">+</button>
   <button id="btnToggleSidebar" title="Hide/show sidebar">Sidebar</button>
+  <input id="depthInput" class="compact" type="number" min="0" step="1" title="Neighbor depth (0 = unlimited)" />
   <button id="btnToggleCollapse" title="Collapse/expand columns">Collapse</button>
   <input id="search" type="text" placeholder="Search table/column… (Enter to jump)" />
   <label class="theme-toggle" title="Toggle dark mode">
@@ -768,11 +774,37 @@ function computeRenderSets(){
   const base = new Set(VISIBLE_IDS);
   const neighbors = new Set();
   if (base.size){
+    // Build table-level adjacency once per call
+    const out = new Map(); // tableId -> Set(neighbors)
+    const inn = new Map();
     EDGES.forEach(e=>{
       const s = parseUri(e.from), t = parseUri(e.to);
-      if (base.has(s.tableId) && !base.has(t.tableId)) neighbors.add(t.tableId);
-      if (base.has(t.tableId) && !base.has(s.tableId)) neighbors.add(s.tableId);
+      if (s.tableId === t.tableId) return;
+      if (!out.has(s.tableId)) out.set(s.tableId, new Set());
+      if (!inn.has(t.tableId)) inn.set(t.tableId, new Set());
+      out.get(s.tableId).add(t.tableId);
+      inn.get(t.tableId).add(s.tableId);
     });
+    const dir = (CONFIG && CONFIG.direction) ? String(CONFIG.direction).toLowerCase() : 'both';
+    const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
+    const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw; // 0 => unlimited
+    let depth = 0;
+    let frontier = new Set(base);
+    const seen = new Set(base);
+    while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
+      const next = new Set();
+      frontier.forEach(u=>{
+        if (dir === 'down' || dir === 'both'){
+          const ns = out.get(u) || new Set();
+          ns.forEach(v=>{ if (!seen.has(v)){ seen.add(v); neighbors.add(v); next.add(v); } });
+        }
+        if (dir === 'up' || dir === 'both'){
+          const ps = inn.get(u) || new Set();
+          ps.forEach(v=>{ if (!seen.has(v)){ seen.add(v); neighbors.add(v); next.add(v); } });
+        }
+      });
+      frontier = next; depth++;
+    }
   }
   NEIGHBOR_IDS = neighbors;
   const renderIds = new Set([...base, ...neighbors]);
@@ -935,6 +967,19 @@ const themeToggle = document.getElementById('themeToggle');
 if (themeToggle){ themeToggle.addEventListener('change', (e)=>{ toggleTheme(!!e.currentTarget.checked); }); }
 // Sync collapse button label on load
 try{ updateCollapseButton(); }catch(_){ }
+
+// Depth input wiring
+const depthInput = document.getElementById('depthInput');
+if (depthInput){
+  const d = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
+  depthInput.value = isNaN(d) ? 1 : d;
+  depthInput.addEventListener('change', (e)=>{
+    const v = parseInt(e.currentTarget.value, 10);
+    CONFIG.depth = (isNaN(v) || v < 0) ? 1 : v;
+    computeRenderSets();
+    layoutTables();
+  });
+}
 
 // ----- Pan (drag background) & Zoom (Ctrl/Alt+wheel) -----
 const viewport = document.getElementById('viewport');
