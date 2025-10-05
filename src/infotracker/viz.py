@@ -169,6 +169,9 @@ HTML_TMPL = """<!doctype html>
   #sidebar *{ box-sizing: border-box }
   #sidebar .side-top{position:sticky; top:0; z-index:5; padding:6px 2px 10px 2px; margin:-10px -10px 10px -10px; background: linear-gradient(180deg, rgba(255,255,255,0.82), rgba(255,255,255,0.66)); border-bottom:1px solid #e5e7eb; box-shadow: 0 2px 8px rgba(0,0,0,0.04)}
   #sidebar .side-header{padding:0 12px; font-weight:800; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#64748b; margin:4px 0 8px}
+  #sidebar .side-actions{ display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:0 12px 8px 12px }
+  #sidebar .side-actions button{ appearance:none; -webkit-appearance:none; height:28px; padding:4px 10px; border:1px solid #cbd5e1; border-radius:8px; cursor:pointer; background: linear-gradient(180deg, #ffffff, #f8fafc); color:#0f172a; font-weight:600; letter-spacing:.01em }
+  #sidebar .side-actions button:hover{ background: linear-gradient(180deg, #ffffff, #f1f5f9) }
   #sidebar .side-filter{display:block; width:calc(100% - 24px); max-width:calc(100% - 24px); margin:0 12px; height:34px; padding:6px 12px 6px 34px; border:1px solid #cbd5e1; border-radius:10px; background:
       url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="%236b7280" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>') 10px center / 16px 16px no-repeat,
       linear-gradient(180deg, #ffffff, #f8fafc);
@@ -235,6 +238,9 @@ HTML_TMPL = """<!doctype html>
   <aside id="sidebar" aria-label="Tables">
     <div class="side-top">
       <div class="side-header">Objects</div>
+      <div class="side-actions">
+        <button id="btnClearAll" title="Uncheck all">Clear</button>
+      </div>
       <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects…" />
     </div>
     <div id="tableList"></div>
@@ -760,6 +766,18 @@ const sideFilter = document.getElementById('sideFilter');
 if (sideFilter){
   sideFilter.addEventListener('input', (e)=>{
     FILTER_TEXT = (e.currentTarget.value||'').trim();
+    buildSidebar();
+  });
+}
+
+// Clear-all selection in sidebar
+const btnClearAll = document.getElementById('btnClearAll');
+if (btnClearAll){
+  btnClearAll.addEventListener('click', ()=>{
+    try{ clearSelection(); }catch(_){ }
+    VISIBLE_IDS.clear();
+    computeRenderSets();
+    layoutTables();
     buildSidebar();
   });
 }

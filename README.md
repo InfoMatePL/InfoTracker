@@ -98,6 +98,7 @@ Flags:
 - --graph-dir DIR        Folder with column_graph.json (required)
 - --out PATH             Output HTML path (default: <graph_dir>/lineage_viz.html)
 Open the generated `lineage_viz.html` in your browser. You can click a column to highlight upstream/downstream lineage; press Enter in the search box to highlight all matches.
+By default, the canvas is empty. Use the left sidebar to toggle objects on (checkboxes are initially unchecked).
 ## 📖 Selector Syntax
 
 InfoTracker supports flexible column selectors for precise impact analysis:
@@ -282,6 +283,7 @@ infotracker viz --graph-dir build/lineage
 Tips:
 - Search supports table names, full IDs (namespace.schema.table), column names, and URIs. Press Enter to highlight all matches.
 - Click a column to switch into lineage mode (upstream/downstream highlight). Clicking another column clears the previous selection.
+ - Use the left panel to add/remove tables from the canvas. Edges render only between currently visible tables.
 
 ## 🧪 Testing
 
