@@ -207,6 +207,7 @@ HTML_TMPL = """<!doctype html>
   .table-node.dragging{ box-shadow:0 6px 24px rgba(0,0,0,.18); cursor: grabbing; }
   .table-node header{padding:8px 10px; font-weight:600; color:var(--header-text); background:var(--header); border-bottom:1px solid var(--border); border-radius:10px 10px 0 0; text-align:center}
   .table-node ul{list-style:none; margin:0; padding:6px 10px 10px}
+  .table-node.collapsed ul{ display:none }
   .table-node li{display:flex; align-items:center; justify-content:center; gap:8px; margin:4px 0; padding:6px 8px; background:var(--row); border:1px solid var(--row-border); border-radius:8px; white-space:nowrap; font-size:13px}
   .table-node li.alt{ background:var(--row-alt) }
   .table-node li.col-row{ cursor: pointer; }
@@ -239,6 +240,7 @@ HTML_TMPL = """<!doctype html>
   <button id="btnZoomOut" title="Zoom out">−</button>
   <button id="btnZoomIn" title="Zoom in">+</button>
   <button id="btnToggleSidebar" title="Hide/show sidebar">Sidebar</button>
+  <button id="btnToggleCollapse" title="Collapse/expand columns">Collapse</button>
   <input id="search" type="text" placeholder="Search table/column… (Enter to jump)" />
   <label class="theme-toggle" title="Toggle dark mode">
     <input id="themeToggle" type="checkbox" aria-label="Dark mode" />
@@ -318,6 +320,8 @@ let TABLES = []; // visible tables: selected + neighbors
 const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 const SIDEBAR_KEY = 'infotracker.sidebar';
 const SIDEBAR_W_KEY = 'infotracker.sidebar.width';
+const COLLAPSE_KEY = 'infotracker.collapse';
+let COLLAPSE = false;
 
 // Helpers
 const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
@@ -502,6 +506,7 @@ function layoutTables(){
   TABLES.forEach(t=>{
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
     if (NEIGHBOR_IDS && NEIGHBOR_IDS.has(t.id)) art.classList.add('neighbor');
+    if (COLLAPSE) art.classList.add('collapsed');
     // Attach searchable metadata
     art.setAttribute('data-id', (t.id||'').toLowerCase());
     art.setAttribute('data-full', (t.full||'').toLowerCase());
@@ -533,8 +538,8 @@ function layoutTables(){
     makeDraggable(art);
   });
   // Do not move the wires SVG; it remains a sibling of #stage
-  // Rows exist now -> (re)build column graph and mark rows clickable
-  try { buildColGraph(); } catch(_) {}
+  // Rows exist now -> (re)build column graph and mark rows clickable (only when expanded)
+  if (!COLLAPSE){ try { buildColGraph(); } catch(_) {} }
   // Sizes
   const maxWidth = Math.max(240, ...[...cardById.values()].map(el=>{
     const w = Math.max(el.querySelector('header').offsetWidth, ...Array.from(el.querySelectorAll('li span:nth-child(2)')).map(s=>s.offsetWidth+60));
@@ -650,6 +655,15 @@ function centerOf(el){
   return { x, y };
 }
 
+// Anchor on left/right side of a card (article.table-node)
+function anchorOfCard(card, side){
+  const r = card.getBoundingClientRect();
+  const s = document.getElementById('stage').getBoundingClientRect();
+  const y = (r.top - s.top + r.height/2) / SCALE;
+  const x = side === 'R' ? (r.right - s.left) / SCALE : (r.left - s.left) / SCALE;
+  return { x, y };
+}
+
 function drawEdges(){
   const svg = document.getElementById('wires');
   // clear old
@@ -658,6 +672,11 @@ function drawEdges(){
   ensureColorMarkers();
 
   PATH_BY_EDGE.clear();
+  // Collapsed mode: draw aggregated table->table edges
+  if (COLLAPSE){
+    drawEdgesCollapsed();
+    return;
+  }
   const selectedIds = new Set(VISIBLE_IDS);
   const neighborIds = new Set(NEIGHBOR_IDS);
   const visibleIds = new Set(TABLES.map(t=>t.id));
@@ -698,6 +717,37 @@ function drawEdges(){
   if (SELECTED_COL){
     try { highlightLineage(SELECTED_COL); } catch(_) {}
   }
+}
+
+function drawEdgesCollapsed(){
+  const svg = document.getElementById('wires');
+  const visibleIds = new Set(TABLES.map(t=>t.id));
+  const neighborIds = new Set(NEIGHBOR_IDS);
+  const selectedIds = new Set(VISIBLE_IDS);
+  const pairs = new Set();
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    if (s.tableId === t.tableId) return;
+    if (!visibleIds.has(s.tableId) || !visibleIds.has(t.tableId)) return;
+    pairs.add(s.tableId + '|' + t.tableId);
+  });
+  pairs.forEach(key=>{
+    const [sid, tid] = key.split('|');
+    const scard = document.getElementById('tbl-' + sid);
+    const tcard = document.getElementById('tbl-' + tid);
+    if (!scard || !tcard) return;
+    const a = anchorOfCard(scard, 'R');
+    const b = anchorOfCard(tcard, 'L');
+    const dx = Math.max(120, Math.abs(b.x - a.x)/2);
+    const d = `M ${a.x} ${a.y} C ${a.x+dx} ${a.y}, ${b.x-dx} ${b.y}, ${b.x} ${b.y}`;
+    const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+    p.setAttribute('d', d);
+    p.setAttribute('class','wire');
+    const isNeighborEdge = (neighborIds.has(sid) || neighborIds.has(tid)) && !(selectedIds.has(sid) && selectedIds.has(tid));
+    if (isNeighborEdge) p.classList.add('neighbor');
+    p.setAttribute('marker-end','url(#arrow)');
+    svg.appendChild(p);
+  });
 }
 
 // Compute render sets: selected + immediate neighbors for context
@@ -775,6 +825,9 @@ try{
   // Restore saved width
   const savedW = parseInt(localStorage.getItem(SIDEBAR_W_KEY)||'', 10);
   if (!isNaN(savedW) && sideEl && savedW >= 160){ sideEl.style.width = savedW + 'px'; }
+  // Load saved collapse-columns preference
+  const savedCollapse = localStorage.getItem(COLLAPSE_KEY);
+  if (savedCollapse === '1' || savedCollapse === 'true') COLLAPSE = true;
 }catch(_){}
 
 buildSidebar();
@@ -858,6 +911,8 @@ if (btnClearAll){
 // Theme toggle binding
 const themeToggle = document.getElementById('themeToggle');
 if (themeToggle){ themeToggle.addEventListener('change', (e)=>{ toggleTheme(!!e.currentTarget.checked); }); }
+// Sync collapse button label on load
+try{ updateCollapseButton(); }catch(_){ }
 
 // ----- Pan (drag background) & Zoom (Ctrl/Alt+wheel) -----
 const viewport = document.getElementById('viewport');
@@ -1041,6 +1096,18 @@ document.getElementById('btnToggleSidebar').addEventListener('click', ()=>{
   try{ localStorage.setItem(SIDEBAR_KEY, willCollapse ? 'collapsed' : 'expanded'); }catch(_){ }
   // reflow wires due to size change
   setTimeout(()=>{ layoutTables(); }, 100);
+});
+// Toggle collapse of columns globally
+function updateCollapseButton(){
+  const b = document.getElementById('btnToggleCollapse');
+  if (b) b.textContent = COLLAPSE ? 'Expand' : 'Collapse';
+}
+document.getElementById('btnToggleCollapse').addEventListener('click', ()=>{
+  COLLAPSE = !COLLAPSE;
+  try{ localStorage.setItem(COLLAPSE_KEY, COLLAPSE ? '1' : '0'); }catch(_){ }
+  try{ clearSelection(); }catch(_){ }
+  updateCollapseButton();
+  layoutTables();
 });
 document.getElementById('search').addEventListener('keydown', (e)=>{
   if (e.key === 'Enter'){
