@@ -9,6 +9,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+import os
 from rich.table import Table
 
 from .config import load_config, RuntimeConfig
@@ -16,8 +17,12 @@ from .engine import ExtractRequest, ImpactRequest, DiffRequest, Engine
 from .io_utils import get_supported_encodings
 
 
+# Disable ANSI colors globally unless explicitly enabled by user
+os.environ.setdefault("NO_COLOR", "1")
+os.environ.setdefault("CLICOLOR", "0")
+
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="InfoTracker CLI")
-console = Console()
+console = Console(no_color=True, color_system=None, force_terminal=False)
 
 logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
@@ -57,7 +62,7 @@ def extract(
     fail_on_warn: bool = typer.Option(False),
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
     exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
-    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files", show_choices=True),
+    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files. Supported: " + ", ".join(get_supported_encodings()), show_choices=True),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     
@@ -91,13 +96,21 @@ def extract(
 def impact(
     ctx: typer.Context,
     selector: str = typer.Option(..., "-s", "--selector", help="[+]db.schema.object.column[+] - use + to indicate direction"),
-    max_depth: Optional[int] = typer.Option(None),
+    max_depth: Optional[int] = typer.Option(None, help="Traversal depth; 0 means unlimited (full lineage)"),
     out: Optional[Path] = typer.Option(None),
-    graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
+    graph_dir: Path = typer.Option(..., "--graph-dir", exists=True, file_okay=False, help="Directory containing column_graph.json (required)"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     engine = Engine(cfg)
-    req = ImpactRequest(selector=selector, max_depth=max_depth or 2, graph_dir=graph_dir)
+    # Default to 0 (unlimited) when not specified
+    effective_depth = 0 if max_depth is None else max_depth
+    # Validate that column_graph.json exists in the provided graph_dir
+    graph_path = graph_dir / "column_graph.json"
+    if not graph_path.exists():
+        console.print(f"[red]ERROR: column_graph.json not found in {graph_dir}. Run 'infotracker extract' first.[/red]")
+        raise typer.Exit(1)
+
+    req = ImpactRequest(selector=selector, max_depth=effective_depth, graph_dir=graph_dir)
     result = engine.run_impact(req)
     _emit(result, cfg.output_format, out)
 
@@ -164,7 +177,8 @@ def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
     from rich.console import Console
     import json
 
-    console = Console()
+    # Use a no-color console for consistent, plain output
+    console = Console(no_color=True, color_system=None, force_terminal=False)
 
     if fmt == "json":
         content = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -186,7 +200,7 @@ def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
             # Capture table as string for file output
             from io import StringIO
             string_io = StringIO()
-            temp_console = Console(file=string_io, width=120)
+            temp_console = Console(file=string_io, width=120, no_color=True, color_system=None, force_terminal=False)
             temp_console.print(table)
             content = string_io.getvalue()
         else:
@@ -212,4 +226,3 @@ def entrypoint() -> None:
 
 if __name__ == "__main__":
     entrypoint()
-

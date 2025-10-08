@@ -4,6 +4,7 @@ Core data models for InfoTracker.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 from typing import Dict, List, Optional, Set, Any
 from enum import Enum
 
@@ -262,7 +263,8 @@ class ColumnGraph:
     
     def _traverse_upstream(self, column: ColumnNode, max_depth: int, visited: Set[str], current_depth: int = 0) -> List[ColumnEdge]:
         """Recursively traverse upstream dependencies."""
-        if max_depth <= 0 or current_depth >= max_depth:
+        # If max_depth == 0 → unlimited traversal. Only stop when max_depth > 0 and reached.
+        if max_depth > 0 and current_depth >= max_depth:
             return []
         
         column_key = str(column).lower()
@@ -283,7 +285,8 @@ class ColumnGraph:
     
     def _traverse_downstream(self, column: ColumnNode, max_depth: int, visited: Set[str], current_depth: int = 0) -> List[ColumnEdge]:
         """Recursively traverse downstream dependencies."""
-        if max_depth <= 0 or current_depth >= max_depth:
+        # If max_depth == 0 → unlimited traversal. Only stop when max_depth > 0 and reached.
+        if max_depth > 0 and current_depth >= max_depth:
             return []
         
         column_key = str(column).lower()
@@ -369,6 +372,54 @@ class ColumnGraph:
                     )
                     
                     self.add_edge(edge)
+
+    def distances_downstream(self, start: ColumnNode, max_depth: int = 0) -> Dict[str, int]:
+        """Compute BFS distances (levels) for downstream traversal from a start column.
+
+        Returns mapping of column-key -> level (1 for direct children, etc.).
+        If max_depth == 0, traverse without limit.
+        """
+        start_key = str(start).lower()
+        dist: Dict[str, int] = {}
+        q = deque([(start_key, 0)])
+        seen = {start_key}
+        while q:
+            u, d = q.popleft()
+            if max_depth > 0 and d >= max_depth:
+                continue
+            for e in self._downstream_edges.get(u, []) or []:
+                v = str(e.to_column).lower()
+                if v in seen:
+                    continue
+                level = d + 1
+                dist[v] = level
+                seen.add(v)
+                q.append((v, level))
+        return dist
+
+    def distances_upstream(self, start: ColumnNode, max_depth: int = 0) -> Dict[str, int]:
+        """Compute BFS distances (levels) for upstream traversal from a start column.
+
+        Returns mapping of column-key -> level (1 for direct parents, etc.).
+        If max_depth == 0, traverse without limit.
+        """
+        start_key = str(start).lower()
+        dist: Dict[str, int] = {}
+        q = deque([(start_key, 0)])
+        seen = {start_key}
+        while q:
+            u, d = q.popleft()
+            if max_depth > 0 and d >= max_depth:
+                continue
+            for e in self._upstream_edges.get(u, []) or []:
+                v = str(e.from_column).lower()
+                if v in seen:
+                    continue
+                level = d + 1
+                dist[v] = level
+                seen.add(v)
+                q.append((v, level))
+        return dist
     
     def find_column(self, selector: str) -> Optional[ColumnNode]:
         """Find a column by selector string (namespace.table.column)."""

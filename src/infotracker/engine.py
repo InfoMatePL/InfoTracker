@@ -44,7 +44,7 @@ class ExtractRequest:
 @dataclass
 class ImpactRequest:
     selector: str
-    max_depth: int = 2
+    max_depth: int = 0
     graph_dir: Optional[Path] = None
 
 
@@ -445,8 +445,8 @@ class Engine:
                 # schema.table.column -> namespace/schema.table.column
                 sel = f"mssql://localhost/InfoTrackerDW.{sel}"
             elif len(parts) == 4:
-                # database.schema.table.column -> namespace/database.schema.table.column  
-                sel = f"mssql://localhost/InfoTrackerDW.{sel}"
+                # database.schema.table.column -> host/database.schema.table.column (no default DB)
+                sel = f"mssql://localhost/{sel}"
             else:
                 return {
                     "columns": ["message"],
@@ -473,44 +473,87 @@ class Engine:
                 }
             targets = [target]
 
-        rows: List[List[str]] = []
+        # Compute BFS levels from the target(s) for topological sorting
+        # Build combined (min) distance maps for multi-target selections
+        def _merge_min(dst: Dict[str, int], src: Dict[str, int]):
+            for k, v in (src or {}).items():
+                if k not in dst or v < dst[k]:
+                    dst[k] = v
 
-        def edge_row(direction: str, e) -> List[str]:
-            return [
-                str(e.from_column), 
-                str(e.to_column), 
+        dist_up_all: Dict[str, int] = {}
+        dist_dn_all: Dict[str, int] = {}
+
+        if targets:
+            for t in targets:
+                try:
+                    du = self._column_graph.distances_upstream(t, req.max_depth or 0)
+                    dd = self._column_graph.distances_downstream(t, req.max_depth or 0)
+                    _merge_min(dist_up_all, du)
+                    _merge_min(dist_dn_all, dd)
+                except Exception:
+                    continue
+
+        rows_with_level: List[tuple] = []  # (level, direction, from, to, transform, desc)
+
+        def edge_row(direction: str, e) -> None:
+            # For impact output, normalize CAST/CASE to 'expression' per UX request
+            def _impact_transform_label(tt) -> str:
+                v = getattr(tt, "value", str(tt))
+                try:
+                    up = str(v).upper()
+                    if up in ("CAST", "CASE"):
+                        return "expression"
+                except Exception:
+                    pass
+                return v
+            from_s = str(e.from_column)
+            to_s = str(e.to_column)
+            # Determine topological level based on direction
+            if direction == "downstream":
+                lvl = dist_dn_all.get(to_s.lower(), None)
+            else:
+                lvl = dist_up_all.get(from_s.lower(), None)
+            rows_with_level.append((
+                (999999 if lvl is None else int(lvl)),
                 direction,
-                getattr(e.transformation_type, "value", str(e.transformation_type)),
+                from_s,
+                to_s,
+                _impact_transform_label(e.transformation_type),
                 e.transformation_description or "",
-            ]
+            ))
 
         # Process all target columns
         for target in targets:
             if direction_upstream:
                 for e in self._column_graph.get_upstream(target, req.max_depth):
-                    rows.append(edge_row("upstream", e))
+                    edge_row("upstream", e)
             if direction_downstream:
                 for e in self._column_graph.get_downstream(target, req.max_depth):
-                    rows.append(edge_row("downstream", e))
+                    edge_row("downstream", e)
+
+        # Sort rows topologically by (level, direction, from, to)
+        rows_with_level.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
 
         # Remove duplicates while preserving order
         seen = set()
-        unique_rows = []
-        for row in rows:
-            row_tuple = tuple(row)
-            if row_tuple not in seen:
-                seen.add(row_tuple)
-                unique_rows.append(row)
+        unique_rows: List[List[str]] = []
+        for lvl, direction, from_s, to_s, transf, desc in rows_with_level:
+            key_tuple = (from_s, to_s, direction, transf, desc)
+            if key_tuple in seen:
+                continue
+            seen.add(key_tuple)
+            level_str = "" if lvl is None else str(lvl)
+            unique_rows.append([from_s, to_s, direction, transf, desc, level_str])
 
         if not unique_rows:
             # Show info about the matched columns
             if len(targets) == 1:
-                unique_rows = [[str(targets[0]), str(targets[0]), "info", "", "No relationships found"]]
+                unique_rows = [[str(targets[0]), str(targets[0]), "info", "", "No relationships found", ""]]
             else:
-                unique_rows = [[f"Matched {len(targets)} columns", "", "info", "", f"Pattern: {req.selector}"]]
+                unique_rows = [[f"Matched {len(targets)} columns", "", "info", "", f"Pattern: {req.selector}", ""]]
 
         return {
-            "columns": ["from", "to", "direction", "transformation", "description"],
+            "columns": ["from", "to", "direction", "transformation", "description", "level"],
             "rows": unique_rows,
         }
 

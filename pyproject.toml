@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "InfoTracker"
-version = "0.5.1"
+version = "0.5.6"
 description = "Column-level SQL lineage, impact analysis, and breaking-change detection (MS SQL first)"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -116,10 +116,16 @@ class TestCLIIntegration:
 
     def test_impact_command_placeholder(self):
         """Test impact command (placeholder functionality)."""
-        result = self.runner.invoke(app, [
-            "impact",
-            "--selector", "STG.dbo.Customers.CustomerID"
-        ])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            graph_dir = Path(tmp_dir)
+            # Create a minimal, valid graph file
+            (graph_dir / "column_graph.json").write_text("{\"edges\": []}", encoding="utf-8")
+
+            result = self.runner.invoke(app, [
+                "impact",
+                "--selector", "STG.dbo.Customers.CustomerID",
+                "--graph-dir", str(graph_dir),
+            ])
         
         # Should run without error (even if functionality is placeholder)
         assert result.exit_code == 0
