@@ -265,7 +265,7 @@ HTML_TMPL = """<!doctype html>
         <button id="btnClearAll" title="Uncheck all">Clear</button>
         <button id="btnSelectAll" title="Select all objects">Select All</button>
       </div>
-      <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects…" />
+      <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects or columns…" />
     </div>
     <div id="tableList"></div>
   </aside>
@@ -833,8 +833,15 @@ function buildSidebar(){
     return la.localeCompare(lb);
   }).filter(t=>{
     if (!FILTER_TEXT) return true;
-    const q = FILTER_TEXT.toLowerCase();
-    return (t.label||'').toLowerCase().includes(q) || (t.full||'').toLowerCase().includes(q) || (t.id||'').toLowerCase().includes(q);
+    const q = (FILTER_TEXT||'').toLowerCase();
+    const label = (t.label||'').toLowerCase();
+    const full = (t.full||'').toLowerCase();
+    const idv  = (t.id||'').toLowerCase();
+    // Column match: use last segment after dot to allow inputs like schema.table.column
+    const colQuery = q.includes('.') ? q.split('.').pop() : q;
+    const cols = Array.isArray(t.columns) ? t.columns : [];
+    const hasCol = cols.some(c=> (c||'').toLowerCase().includes(colQuery));
+    return label.includes(q) || full.includes(q) || idv.includes(q) || hasCol;
   });
   if (!items.length){
     const empty = document.createElement('div');
