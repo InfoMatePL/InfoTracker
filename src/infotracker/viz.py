@@ -263,6 +263,7 @@ HTML_TMPL = """<!doctype html>
       <div class="side-header">Objects</div>
       <div class="side-actions">
         <button id="btnClearAll" title="Uncheck all">Clear</button>
+        <button id="btnSelectAll" title="Select all objects">Select All</button>
       </div>
       <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects…" />
     </div>
@@ -904,6 +905,20 @@ if (btnClearAll){
   btnClearAll.addEventListener('click', ()=>{
     try{ clearSelection(); }catch(_){ }
     VISIBLE_IDS.clear();
+    computeRenderSets();
+    layoutTables();
+    buildSidebar();
+  });
+}
+
+// Select-all objects in sidebar
+const btnSelectAll = document.getElementById('btnSelectAll');
+if (btnSelectAll){
+  btnSelectAll.addEventListener('click', ()=>{
+    try{ clearSelection(); }catch(_){ }
+    // Keep the same Set instance to avoid breaking references
+    VISIBLE_IDS.clear();
+    (ALL_TABLES || []).forEach(t=> VISIBLE_IDS.add(t.id));
     computeRenderSets();
     layoutTables();
     buildSidebar();
