@@ -1117,7 +1117,11 @@ class SqlParser:
             if fallback_result:
                 return fallback_result
             
-            logger.warning("parse failed: %s", e)
+            # Include object hint to help identify the failing file
+            try:
+                logger.warning("parse failed (object=%s): %s", object_hint, e)
+            except Exception:
+                logger.warning("parse failed: %s", e)
             # Return an object with error information
             db = self.current_database or self.default_database or "InfoTrackerDW"
             return ObjectInfo(

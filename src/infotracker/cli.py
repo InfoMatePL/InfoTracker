@@ -9,6 +9,7 @@ from typing import Optional
 
 import typer
 from rich.console import Console
+import os
 from rich.table import Table
 
 from .config import load_config, RuntimeConfig
@@ -16,8 +17,12 @@ from .engine import ExtractRequest, ImpactRequest, DiffRequest, Engine
 from .io_utils import get_supported_encodings
 
 
+# Disable ANSI colors globally unless explicitly enabled by user
+os.environ.setdefault("NO_COLOR", "1")
+os.environ.setdefault("CLICOLOR", "0")
+
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="InfoTracker CLI")
-console = Console()
+console = Console(no_color=True, color_system=None, force_terminal=False)
 
 logging.getLogger("sqlglot").setLevel(logging.ERROR)
 
@@ -182,7 +187,8 @@ def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
     from rich.console import Console
     import json
 
-    console = Console()
+    # Use a no-color console for consistent, plain output
+    console = Console(no_color=True, color_system=None, force_terminal=False)
 
     if fmt == "json":
         content = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -204,7 +210,7 @@ def _emit(payload: dict, fmt: str, out_path: Optional[Path] = None) -> None:
             # Capture table as string for file output
             from io import StringIO
             string_io = StringIO()
-            temp_console = Console(file=string_io, width=120)
+            temp_console = Console(file=string_io, width=120, no_color=True, color_system=None, force_terminal=False)
             temp_console.print(table)
             content = string_io.getvalue()
         else:

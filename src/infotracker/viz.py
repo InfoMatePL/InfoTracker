@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, Optional
 
 Edge = Dict[str, str]
 
@@ -17,6 +17,44 @@ Edge = Dict[str, str]
 def _load_edges(graph_path: Path) -> Sequence[Edge]:
     data = json.loads(graph_path.read_text(encoding="utf-8"))
     return data.get("edges", [])
+
+
+def _load_schema_orders(dir_or_graph: Path) -> Dict[str, List[str]]:
+    """Load column order per table from OpenLineage artifacts located next to column_graph.json.
+
+    Returns mapping: "<namespace>.<schema.table>" (lowercase) -> [col1, col2, ...]
+    """
+    # Accept either the graph path (file) or its parent directory
+    base_dir = dir_or_graph.parent if dir_or_graph.is_file() else dir_or_graph
+    orders: Dict[str, List[str]] = {}
+    try:
+        for p in base_dir.glob("*.json"):
+            # skip the graph file itself if present
+            if p.name == "column_graph.json":
+                continue
+            try:
+                j = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            outs = j.get("outputs") or []
+            if not outs:
+                continue
+            out = outs[0] or {}
+            ns = out.get("namespace")
+            nm = out.get("name")
+            if not (ns and nm):
+                continue
+            facets = out.get("facets") or {}
+            schema = facets.get("schema") or {}
+            fields = schema.get("fields") or []
+            cols = [f.get("name") for f in fields if isinstance(f, dict) and f.get("name")]
+            if cols:
+                key = f"{ns}.{nm}".lower()
+                orders[key] = cols
+    except Exception:
+        # fail-soft: no external ordering
+        return {}
+    return orders
 
 
 # ---------------- Model ➜ Simple structures ----------------
@@ -30,7 +68,7 @@ def _table_key(ns: str, tbl: str) -> str:
     return f"{ns}.{tbl}".lower()
 
 
-def _build_elements(edges: Iterable[Edge]) -> Tuple[List[Dict], List[Dict]]:
+def _build_elements(edges: Iterable[Edge], orders: Optional[Dict[str, List[str]]] = None) -> Tuple[List[Dict], List[Dict]]:
     """Build simple tables/edges lists for the HTML to render.
 
     tables: [{ id, label, full, columns: [str, ...] }]
@@ -49,14 +87,21 @@ def _build_elements(edges: Iterable[Edge]) -> Tuple[List[Dict], List[Dict]]:
                     "label": tbl,
                     "full": f"{ns}.{tbl}",
                     "namespace": ns,
-                    "columns": set(),
+                    "columns": [],  # keep insertion order
                 },
             )
-            tables[key]["columns"].add(col)
+            if col not in tables[key]["columns"]:
+                tables[key]["columns"].append(col)
 
     table_list: List[Dict] = []
+    orders = orders or {}
     for key, t in tables.items():
-        cols = sorted(t["columns"])  # deterministic
+        cols = list(t["columns"])  # already in encounter order
+        # If we have OpenLineage schema order for this table, apply it
+        order = orders.get(t["full"].lower())
+        if order:
+            pos = {c.lower(): i for i, c in enumerate(order)}
+            cols.sort(key=lambda c: pos.get(c.lower(), 10**9))
         table_list.append({
             "id": key,
             "label": t["label"],
@@ -205,6 +250,16 @@ HTML_TMPL = """<!doctype html>
   #viewport{position:relative; flex:1 1 auto; min-height:0; overflow:auto}
   #stage{position:relative; min-width:100%; min-height:100%; transform-origin: 0 0;}
   svg.wires{position:absolute; inset:0; pointer-events:none; width:100%; height:100%; z-index:20}
+  /* Context menu */
+  .ctx-menu{ position:fixed; z-index:1000; min-width:180px; background:#fff; color:#111827;
+    border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,.12);
+    padding:6px; display:none; }
+  .theme-dark .ctx-menu{ background:#0b1020; color:#e5eef5; border-color:#1e293b; }
+  .ctx-item{ padding:8px 10px; border-radius:8px; cursor:pointer; user-select:none; }
+  .ctx-item:hover{ background:#f1f5f9 } .theme-dark .ctx-item:hover{ background:#121a30 }
+  .ctx-sep{ height:1px; margin:6px 4px; background:#e5e7eb } .theme-dark .ctx-sep{ background:#1e293b }
+  /* Isolation */
+  .hidden{ display:none !important }
   .empty{position:absolute; left:20px; top:20px; color:#6b7280; font-size:14px}
   .empty{ top:80px }
   .table-node{position:absolute; width:240px; background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:0 1px 2px rgba(0,0,0,.06)}
@@ -263,8 +318,9 @@ HTML_TMPL = """<!doctype html>
       <div class="side-header">Objects</div>
       <div class="side-actions">
         <button id="btnClearAll" title="Uncheck all">Clear</button>
+        <button id="btnSelectAll" title="Select all objects">Select All</button>
       </div>
-      <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects…" />
+      <input id="sideFilter" class="side-filter" type="text" placeholder="Filter objects or columns…" />
     </div>
     <div id="tableList"></div>
   </aside>
@@ -281,6 +337,8 @@ HTML_TMPL = """<!doctype html>
     </svg>
   </div>
 </div>
+<!-- floating context menu for attribute rows -->
+<div id="ctxMenu" class="ctx-menu" role="menu" aria-hidden="true"></div>
 <script>
 // ---- Theme handling ----
 const THEME_KEY = 'infotracker.theme';
@@ -323,7 +381,8 @@ function __deriveTablesFromEdges(){
       t.columns.add(p.col);
     });
   });
-  return Array.from(m.values()).map(t=>({ id: t.id, label: t.label, full: t.full, columns: Array.from(t.columns).sort() }));
+  // Keep insertion order from edges; don't sort alphabetically
+  return Array.from(m.values()).map(t=>({ id: t.id, label: t.label, full: t.full, columns: Array.from(t.columns) }));
 }
 const ALL_TABLES = (Array.isArray(__ALL_TABLES_RAW__) && __ALL_TABLES_RAW__.length) ? __ALL_TABLES_RAW__ : __deriveTablesFromEdges();
 let TABLES = []; // visible tables: selected + neighbors
@@ -348,6 +407,10 @@ let COL_IN = null;  // Map colKey -> Array<edge>
 let ROW_BY_COL = new Map(); // colKey -> <li>
 let PATH_BY_EDGE = new Map(); // edgeKey -> <path>
 let SELECTED_COL = null;
+// Isolation mode (context menu)
+let ISOLATE = false;      // whether isolate-view is on
+let ISOLATE_DIR = 'both'; // 'up' | 'down' | 'both'
+let ISOLATE_SRC = null;   // source column key
 // Search hit globals
 let URI_BY_COL = null; // Map colKey -> example URI (from edges)
 
@@ -734,7 +797,7 @@ function drawEdges(){
   });
   // Reapply highlight if a column is selected (scroll/resize triggers redraw)
   if (SELECTED_COL){
-    try { highlightLineage(SELECTED_COL); } catch(_) {}
+    try { highlightLineage(SELECTED_COL, ISOLATE_DIR || 'both', ISOLATE || false); } catch(_) {}
   }
 }
 
@@ -832,8 +895,15 @@ function buildSidebar(){
     return la.localeCompare(lb);
   }).filter(t=>{
     if (!FILTER_TEXT) return true;
-    const q = FILTER_TEXT.toLowerCase();
-    return (t.label||'').toLowerCase().includes(q) || (t.full||'').toLowerCase().includes(q) || (t.id||'').toLowerCase().includes(q);
+    const q = (FILTER_TEXT||'').toLowerCase();
+    const label = (t.label||'').toLowerCase();
+    const full = (t.full||'').toLowerCase();
+    const idv  = (t.id||'').toLowerCase();
+    // Column match: use last segment after dot to allow inputs like schema.table.column
+    const colQuery = q.includes('.') ? q.split('.').pop() : q;
+    const cols = Array.isArray(t.columns) ? t.columns : [];
+    const hasCol = cols.some(c=> (c||'').toLowerCase().includes(colQuery));
+    return label.includes(q) || full.includes(q) || idv.includes(q) || hasCol;
   });
   if (!items.length){
     const empty = document.createElement('div');
@@ -904,6 +974,20 @@ if (btnClearAll){
   btnClearAll.addEventListener('click', ()=>{
     try{ clearSelection(); }catch(_){ }
     VISIBLE_IDS.clear();
+    computeRenderSets();
+    layoutTables();
+    buildSidebar();
+  });
+}
+
+// Select-all objects in sidebar
+const btnSelectAll = document.getElementById('btnSelectAll');
+if (btnSelectAll){
+  btnSelectAll.addEventListener('click', ()=>{
+    try{ clearSelection(); }catch(_){ }
+    // Keep the same Set instance to avoid breaking references
+    VISIBLE_IDS.clear();
+    (ALL_TABLES || []).forEach(t=> VISIBLE_IDS.add(t.id));
     computeRenderSets();
     layoutTables();
     buildSidebar();
@@ -1183,6 +1267,39 @@ document.getElementById('search').addEventListener('keydown', (e)=>{
   }
 });
 
+// ===== Context menu (right-click on column row) =====
+const ctxMenu = document.getElementById('ctxMenu');
+function openCtx(x,y, items){
+  if (!ctxMenu) return;
+  ctxMenu.innerHTML = '';
+  items.forEach(it=>{
+    if (it === 'sep'){ const s=document.createElement('div'); s.className='ctx-sep'; ctxMenu.appendChild(s); return; }
+    const d=document.createElement('div'); d.className='ctx-item'; d.textContent=it.label; d.tabIndex=0;
+    d.addEventListener('click', ()=>{ closeCtx(); it.onClick && it.onClick(); });
+    d.addEventListener('keydown', (ev)=>{ if (ev.key==='Enter'||ev.key===' ') { ev.preventDefault(); closeCtx(); it.onClick && it.onClick(); }});
+    ctxMenu.appendChild(d);
+  });
+  ctxMenu.style.left = x+'px'; ctxMenu.style.top = y+'px';
+  ctxMenu.style.display = 'block'; ctxMenu.setAttribute('aria-hidden','false');
+}
+function closeCtx(){ if (ctxMenu){ ctxMenu.style.display='none'; ctxMenu.setAttribute('aria-hidden','true'); } }
+document.addEventListener('click', ()=> closeCtx());
+document.addEventListener('keydown', (e)=>{ if (e.key==='Escape'){ closeCtx(); /* keep isolation until explicitly cleared via menu */ } });
+document.getElementById('stage').addEventListener('contextmenu', (e)=>{
+  const li = e.target && e.target.closest('li.col-row');
+  if (!li) return;
+  e.preventDefault();
+  const key = li.getAttribute('data-key'); if (!key) return;
+  const px = e.clientX, py = e.clientY;
+  openCtx(px, py, [
+    { label: 'Show downstream (attribute)', onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='down'; ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'down',true); drawEdges(); } },
+    { label: 'Show upstream (attribute)',   onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='up';   ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'up',true);   drawEdges(); } },
+    { label: 'Show both (attribute)',       onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='both'; ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'both',true); drawEdges(); } },
+    'sep',
+    { label: 'Clear filter',                onClick: ()=>{ clearSelection(); drawEdges(); } }
+  ]);
+});
+
 // ---- Crossing minimization (barycentric) ----
 function orderLayers(layers, graph){
   const maxRank = Math.max(...layers.keys());
@@ -1318,7 +1435,7 @@ function buildColGraph(){
 function onStageClick(e){
   const li = e.target && e.target.closest('li.col-row');
   if (!li){
-    clearSelection();
+    // Do not clear selection/isolation on background click
     return;
   }
   const key = li.getAttribute('data-key');
@@ -1351,46 +1468,55 @@ function selectColumnKey(key){
   }
   clearSelection();
   SELECTED_COL = key;
-  highlightLineage(key);
+  highlightLineage(key, 'both', ISOLATE);
 }
 
 function clearSelection(){
   SELECTED_COL = null;
+  ISOLATE = false; ISOLATE_DIR = 'both'; ISOLATE_SRC = null;
   // remove classes
   document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
-    el.classList.remove('dim','active','selected');
+    el.classList.remove('dim','active','selected','hidden');
   });
 }
 
-function highlightLineage(srcKey){
+function highlightLineage(srcKey, dir='both', isolate=false){
   const activeCols = new Set();
   const activeEdges = new Set();
-  // BFS downstream
-  const q1 = [srcKey]; const seen1 = new Set([srcKey]);
-  while(q1.length){
-    const u = q1.shift(); activeCols.add(u);
-    const outs = COL_OUT.get(u) || [];
-    outs.forEach(e=>{
-      const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
-      activeEdges.add(edgeKey(e));
-      if (!seen1.has(v)){ seen1.add(v); q1.push(v); }
-    });
+  // Downstream
+  if (dir==='down' || dir==='both'){
+    const q1 = [srcKey]; const seen1 = new Set([srcKey]);
+    while(q1.length){
+      const u = q1.shift(); activeCols.add(u);
+      const outs = COL_OUT.get(u) || [];
+      outs.forEach(e=>{
+        const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
+        activeEdges.add(edgeKey(e));
+        if (!seen1.has(v)){ seen1.add(v); q1.push(v); }
+      });
+    }
   }
-  // BFS upstream
-  const q2 = [srcKey]; const seen2 = new Set([srcKey]);
-  while(q2.length){
-    const u = q2.shift(); activeCols.add(u);
-    const ins = COL_IN.get(u) || [];
-    ins.forEach(e=>{
-      const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
-      activeEdges.add(edgeKey(e));
-      if (!seen2.has(v)){ seen2.add(v); q2.push(v); }
-    });
+  // Upstream
+  if (dir==='up' || dir==='both'){
+    const q2 = [srcKey]; const seen2 = new Set([srcKey]);
+    while(q2.length){
+      const u = q2.shift(); activeCols.add(u);
+      const ins = COL_IN.get(u) || [];
+      ins.forEach(e=>{
+        const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
+        activeEdges.add(edgeKey(e));
+        if (!seen2.has(v)){ seen2.add(v); q2.push(v); }
+      });
+    }
   }
-  applyHighlight(srcKey, activeCols, activeEdges);
+  applyHighlight(srcKey, activeCols, activeEdges, isolate);
 }
 
-function applyHighlight(srcKey, colSet, edgeSet){
+function applyHighlight(srcKey, colSet, edgeSet, isolate=false){
+  // Reset all
+  document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
+    el.classList.remove('dim','active','selected','hidden');
+  });
   // Default: dim everything
   document.querySelectorAll('.table-node').forEach(card=>card.classList.add('dim'));
   document.querySelectorAll('.table-node li').forEach(li=>li.classList.add('dim'));
@@ -1417,6 +1543,16 @@ function applyHighlight(srcKey, colSet, edgeSet){
   // Mark selected row distinctly
   const sel = ROW_BY_COL.get(srcKey);
   if (sel){ sel.classList.add('selected'); }
+  // Isolation mode: hide non-active instead of dim, hide tables without any active row
+  if (isolate){
+    document.querySelectorAll('svg .wire.dim').forEach(p=>p.classList.add('hidden'));
+    document.querySelectorAll('.table-node li.dim').forEach(li=>li.classList.add('hidden'));
+    document.querySelectorAll('.table-node').forEach(card=>{
+      const anyActive = !!card.querySelector('li.active, li.selected');
+      if (!anyActive){ card.classList.add('hidden'); }
+      card.classList.remove('dim');
+    });
+  }
 }
 
 function clearSearchHits(){
@@ -1477,7 +1613,8 @@ function highlightSearch(q){
 # ---------------- Public API ----------------
 def build_viz_html(graph_path: Path, focus=None, depth: int = 2, direction: str = "both") -> str:
     edges = _load_edges(graph_path)
-    tables, e = _build_elements(edges)
+    schema_orders = _load_schema_orders(graph_path)
+    tables, e = _build_elements(edges, orders=schema_orders)
     html = HTML_TMPL
     html = html.replace("__NODES__", json.dumps(tables, ensure_ascii=False))
     html = html.replace("__EDGES__", json.dumps(e, ensure_ascii=False))
