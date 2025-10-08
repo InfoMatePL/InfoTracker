@@ -476,11 +476,21 @@ class Engine:
         rows: List[List[str]] = []
 
         def edge_row(direction: str, e) -> List[str]:
+            # For impact output, normalize CAST/CASE to 'expression' per UX request
+            def _impact_transform_label(tt) -> str:
+                v = getattr(tt, "value", str(tt))
+                try:
+                    up = str(v).upper()
+                    if up in ("CAST", "CASE"):
+                        return "expression"
+                except Exception:
+                    pass
+                return v
             return [
                 str(e.from_column), 
                 str(e.to_column), 
                 direction,
-                getattr(e.transformation_type, "value", str(e.transformation_type)),
+                _impact_transform_label(e.transformation_type),
                 e.transformation_description or "",
             ]
 
