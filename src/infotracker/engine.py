@@ -44,7 +44,7 @@ class ExtractRequest:
 @dataclass
 class ImpactRequest:
     selector: str
-    max_depth: int = 2
+    max_depth: int = 0
     graph_dir: Optional[Path] = None
 
 
@@ -483,8 +483,8 @@ class Engine:
                 # schema.table.column -> namespace/schema.table.column
                 sel = f"mssql://localhost/InfoTrackerDW.{sel}"
             elif len(parts) == 4:
-                # database.schema.table.column -> namespace/database.schema.table.column  
-                sel = f"mssql://localhost/InfoTrackerDW.{sel}"
+                # database.schema.table.column -> host/database.schema.table.column (no default DB)
+                sel = f"mssql://localhost/{sel}"
             else:
                 return {
                     "columns": ["message"],

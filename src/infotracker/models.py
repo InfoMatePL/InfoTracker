@@ -262,7 +262,8 @@ class ColumnGraph:
     
     def _traverse_upstream(self, column: ColumnNode, max_depth: int, visited: Set[str], current_depth: int = 0) -> List[ColumnEdge]:
         """Recursively traverse upstream dependencies."""
-        if max_depth <= 0 or current_depth >= max_depth:
+        # If max_depth == 0 → unlimited traversal. Only stop when max_depth > 0 and reached.
+        if max_depth > 0 and current_depth >= max_depth:
             return []
         
         column_key = str(column).lower()
@@ -283,7 +284,8 @@ class ColumnGraph:
     
     def _traverse_downstream(self, column: ColumnNode, max_depth: int, visited: Set[str], current_depth: int = 0) -> List[ColumnEdge]:
         """Recursively traverse downstream dependencies."""
-        if max_depth <= 0 or current_depth >= max_depth:
+        # If max_depth == 0 → unlimited traversal. Only stop when max_depth > 0 and reached.
+        if max_depth > 0 and current_depth >= max_depth:
             return []
         
         column_key = str(column).lower()

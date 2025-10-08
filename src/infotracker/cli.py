@@ -58,7 +58,7 @@ def extract(
     fail_on_warn: bool = typer.Option(False),
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
     exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
-    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files", show_choices=True),
+    encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files. Supported: " + ", ".join(get_supported_encodings()), show_choices=True),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
     # dbt mode flag (overrides config)
@@ -95,7 +95,7 @@ def extract(
 def impact(
     ctx: typer.Context,
     selector: str = typer.Option(..., "-s", "--selector", help="[+]db.schema.object.column[+] - use + to indicate direction"),
-    max_depth: Optional[int] = typer.Option(None),
+    max_depth: Optional[int] = typer.Option(None, help="Traversal depth; 0 means unlimited (full lineage)"),
     out: Optional[Path] = typer.Option(None),
     graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
     dbt: bool = typer.Option(False, "--dbt", help="dbt mode (for selector normalization)")
@@ -104,7 +104,15 @@ def impact(
     if dbt:
         cfg.dbt_mode = True
     engine = Engine(cfg)
-    req = ImpactRequest(selector=selector, max_depth=max_depth or 2, graph_dir=graph_dir)
+    # Default to 0 (unlimited) when not specified
+    effective_depth = 0 if max_depth is None else max_depth
+    # Validate that column_graph.json exists in the provided graph_dir
+    graph_path = graph_dir / "column_graph.json"
+    if not graph_path.exists():
+        console.print(f"[red]ERROR: column_graph.json not found in {graph_dir}. Run 'infotracker extract' first.[/red]")
+        raise typer.Exit(1)
+
+    req = ImpactRequest(selector=selector, max_depth=effective_depth, graph_dir=graph_dir)
     result = engine.run_impact(req)
     _emit(result, cfg.output_format, out)
 

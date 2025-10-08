@@ -82,15 +82,17 @@ infotracker extract --sql-dir sql --out-dir build/lineage --adapter mssql --cata
 ### impact
 Usage:
 ```
-infotracker impact -s [+]schema.object.column[+] [--max-depth N] [--direction upstream|downstream] [--out out.json]
+infotracker impact -s [+]schema.object.column[+] --graph-dir DIR [--max-depth N] [--out out.json]
 ```
+- --graph-dir DIR is required and must contain column_graph.json (produced by extract)
+- --max-depth default is 0, which means unlimited (full lineage)
 - Selector semantics: leading `+` = upstream seed; trailing `+` = downstream
 - Output: list of columns with paths and reasons
 
 Examples:
 ```bash
-infotracker impact -s +dbo.Orders.OrderID+
-infotracker impact -s dbo.fct_sales.Revenue --direction upstream --max-depth 2
+infotracker impact -s +dbo.Orders.OrderID+ --graph-dir build/lineage
+infotracker impact -s dbo.fct_sales.Revenue --max-depth 2 --graph-dir build/lineage
 ```
 
 ### diff
