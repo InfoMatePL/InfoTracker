@@ -1238,7 +1238,7 @@ function openCtx(x,y, items){
 }
 function closeCtx(){ if (ctxMenu){ ctxMenu.style.display='none'; ctxMenu.setAttribute('aria-hidden','true'); } }
 document.addEventListener('click', ()=> closeCtx());
-document.addEventListener('keydown', (e)=>{ if (e.key==='Escape'){ closeCtx(); if (ISOLATE){ clearSelection(); drawEdges(); } }});
+document.addEventListener('keydown', (e)=>{ if (e.key==='Escape'){ closeCtx(); /* keep isolation until explicitly cleared via menu */ } });
 document.getElementById('stage').addEventListener('contextmenu', (e)=>{
   const li = e.target && e.target.closest('li.col-row');
   if (!li) return;
@@ -1389,7 +1389,7 @@ function buildColGraph(){
 function onStageClick(e){
   const li = e.target && e.target.closest('li.col-row');
   if (!li){
-    clearSelection();
+    // Do not clear selection/isolation on background click
     return;
   }
   const key = li.getAttribute('data-key');
