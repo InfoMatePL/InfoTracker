@@ -205,6 +205,16 @@ HTML_TMPL = """<!doctype html>
   #viewport{position:relative; flex:1 1 auto; min-height:0; overflow:auto}
   #stage{position:relative; min-width:100%; min-height:100%; transform-origin: 0 0;}
   svg.wires{position:absolute; inset:0; pointer-events:none; width:100%; height:100%; z-index:20}
+  /* Context menu */
+  .ctx-menu{ position:fixed; z-index:1000; min-width:180px; background:#fff; color:#111827;
+    border:1px solid #e5e7eb; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,.12);
+    padding:6px; display:none; }
+  .theme-dark .ctx-menu{ background:#0b1020; color:#e5eef5; border-color:#1e293b; }
+  .ctx-item{ padding:8px 10px; border-radius:8px; cursor:pointer; user-select:none; }
+  .ctx-item:hover{ background:#f1f5f9 } .theme-dark .ctx-item:hover{ background:#121a30 }
+  .ctx-sep{ height:1px; margin:6px 4px; background:#e5e7eb } .theme-dark .ctx-sep{ background:#1e293b }
+  /* Isolation */
+  .hidden{ display:none !important }
   .empty{position:absolute; left:20px; top:20px; color:#6b7280; font-size:14px}
   .empty{ top:80px }
   .table-node{position:absolute; width:240px; background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:0 1px 2px rgba(0,0,0,.06)}
@@ -282,6 +292,8 @@ HTML_TMPL = """<!doctype html>
     </svg>
   </div>
 </div>
+<!-- floating context menu for attribute rows -->
+<div id="ctxMenu" class="ctx-menu" role="menu" aria-hidden="true"></div>
 <script>
 // ---- Theme handling ----
 const THEME_KEY = 'infotracker.theme';
@@ -349,6 +361,10 @@ let COL_IN = null;  // Map colKey -> Array<edge>
 let ROW_BY_COL = new Map(); // colKey -> <li>
 let PATH_BY_EDGE = new Map(); // edgeKey -> <path>
 let SELECTED_COL = null;
+// Isolation mode (context menu)
+let ISOLATE = false;      // whether isolate-view is on
+let ISOLATE_DIR = 'both'; // 'up' | 'down' | 'both'
+let ISOLATE_SRC = null;   // source column key
 // Search hit globals
 let URI_BY_COL = null; // Map colKey -> example URI (from edges)
 
@@ -735,7 +751,7 @@ function drawEdges(){
   });
   // Reapply highlight if a column is selected (scroll/resize triggers redraw)
   if (SELECTED_COL){
-    try { highlightLineage(SELECTED_COL); } catch(_) {}
+    try { highlightLineage(SELECTED_COL, ISOLATE_DIR || 'both', ISOLATE || false); } catch(_) {}
   }
 }
 
@@ -1205,6 +1221,39 @@ document.getElementById('search').addEventListener('keydown', (e)=>{
   }
 });
 
+// ===== Context menu (right-click on column row) =====
+const ctxMenu = document.getElementById('ctxMenu');
+function openCtx(x,y, items){
+  if (!ctxMenu) return;
+  ctxMenu.innerHTML = '';
+  items.forEach(it=>{
+    if (it === 'sep'){ const s=document.createElement('div'); s.className='ctx-sep'; ctxMenu.appendChild(s); return; }
+    const d=document.createElement('div'); d.className='ctx-item'; d.textContent=it.label; d.tabIndex=0;
+    d.addEventListener('click', ()=>{ closeCtx(); it.onClick && it.onClick(); });
+    d.addEventListener('keydown', (ev)=>{ if (ev.key==='Enter'||ev.key===' ') { ev.preventDefault(); closeCtx(); it.onClick && it.onClick(); }});
+    ctxMenu.appendChild(d);
+  });
+  ctxMenu.style.left = x+'px'; ctxMenu.style.top = y+'px';
+  ctxMenu.style.display = 'block'; ctxMenu.setAttribute('aria-hidden','false');
+}
+function closeCtx(){ if (ctxMenu){ ctxMenu.style.display='none'; ctxMenu.setAttribute('aria-hidden','true'); } }
+document.addEventListener('click', ()=> closeCtx());
+document.addEventListener('keydown', (e)=>{ if (e.key==='Escape'){ closeCtx(); if (ISOLATE){ clearSelection(); drawEdges(); } }});
+document.getElementById('stage').addEventListener('contextmenu', (e)=>{
+  const li = e.target && e.target.closest('li.col-row');
+  if (!li) return;
+  e.preventDefault();
+  const key = li.getAttribute('data-key'); if (!key) return;
+  const px = e.clientX, py = e.clientY;
+  openCtx(px, py, [
+    { label: 'Show downstream (attribute)', onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='down'; ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'down',true); drawEdges(); } },
+    { label: 'Show upstream (attribute)',   onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='up';   ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'up',true);   drawEdges(); } },
+    { label: 'Show both (attribute)',       onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='both'; ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'both',true); drawEdges(); } },
+    'sep',
+    { label: 'Clear filter',                onClick: ()=>{ clearSelection(); drawEdges(); } }
+  ]);
+});
+
 // ---- Crossing minimization (barycentric) ----
 function orderLayers(layers, graph){
   const maxRank = Math.max(...layers.keys());
@@ -1373,46 +1422,55 @@ function selectColumnKey(key){
   }
   clearSelection();
   SELECTED_COL = key;
-  highlightLineage(key);
+  highlightLineage(key, 'both', ISOLATE);
 }
 
 function clearSelection(){
   SELECTED_COL = null;
+  ISOLATE = false; ISOLATE_DIR = 'both'; ISOLATE_SRC = null;
   // remove classes
   document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
-    el.classList.remove('dim','active','selected');
+    el.classList.remove('dim','active','selected','hidden');
   });
 }
 
-function highlightLineage(srcKey){
+function highlightLineage(srcKey, dir='both', isolate=false){
   const activeCols = new Set();
   const activeEdges = new Set();
-  // BFS downstream
-  const q1 = [srcKey]; const seen1 = new Set([srcKey]);
-  while(q1.length){
-    const u = q1.shift(); activeCols.add(u);
-    const outs = COL_OUT.get(u) || [];
-    outs.forEach(e=>{
-      const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
-      activeEdges.add(edgeKey(e));
-      if (!seen1.has(v)){ seen1.add(v); q1.push(v); }
-    });
+  // Downstream
+  if (dir==='down' || dir==='both'){
+    const q1 = [srcKey]; const seen1 = new Set([srcKey]);
+    while(q1.length){
+      const u = q1.shift(); activeCols.add(u);
+      const outs = COL_OUT.get(u) || [];
+      outs.forEach(e=>{
+        const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
+        activeEdges.add(edgeKey(e));
+        if (!seen1.has(v)){ seen1.add(v); q1.push(v); }
+      });
+    }
   }
-  // BFS upstream
-  const q2 = [srcKey]; const seen2 = new Set([srcKey]);
-  while(q2.length){
-    const u = q2.shift(); activeCols.add(u);
-    const ins = COL_IN.get(u) || [];
-    ins.forEach(e=>{
-      const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
-      activeEdges.add(edgeKey(e));
-      if (!seen2.has(v)){ seen2.add(v); q2.push(v); }
-    });
+  // Upstream
+  if (dir==='up' || dir==='both'){
+    const q2 = [srcKey]; const seen2 = new Set([srcKey]);
+    while(q2.length){
+      const u = q2.shift(); activeCols.add(u);
+      const ins = COL_IN.get(u) || [];
+      ins.forEach(e=>{
+        const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
+        activeEdges.add(edgeKey(e));
+        if (!seen2.has(v)){ seen2.add(v); q2.push(v); }
+      });
+    }
   }
-  applyHighlight(srcKey, activeCols, activeEdges);
+  applyHighlight(srcKey, activeCols, activeEdges, isolate);
 }
 
-function applyHighlight(srcKey, colSet, edgeSet){
+function applyHighlight(srcKey, colSet, edgeSet, isolate=false){
+  // Reset all
+  document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
+    el.classList.remove('dim','active','selected','hidden');
+  });
   // Default: dim everything
   document.querySelectorAll('.table-node').forEach(card=>card.classList.add('dim'));
   document.querySelectorAll('.table-node li').forEach(li=>li.classList.add('dim'));
@@ -1439,6 +1497,16 @@ function applyHighlight(srcKey, colSet, edgeSet){
   // Mark selected row distinctly
   const sel = ROW_BY_COL.get(srcKey);
   if (sel){ sel.classList.add('selected'); }
+  // Isolation mode: hide non-active instead of dim, hide tables without any active row
+  if (isolate){
+    document.querySelectorAll('svg .wire.dim').forEach(p=>p.classList.add('hidden'));
+    document.querySelectorAll('.table-node li.dim').forEach(li=>li.classList.add('hidden'));
+    document.querySelectorAll('.table-node').forEach(card=>{
+      const anyActive = !!card.querySelector('li.active, li.selected');
+      if (!anyActive){ card.classList.add('hidden'); }
+      card.classList.remove('dim');
+    });
+  }
 }
 
 function clearSearchHits(){
