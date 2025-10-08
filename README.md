@@ -17,6 +17,7 @@ InfoTracker is a powerful command-line tool that parses T-SQL files and generate
 - **Breaking change detection** - Detect schema changes that could break downstream processes
 - **Multiple output formats** - Text tables or JSON for integration with other tools
 - **OpenLineage compatible** - Standard format for data lineage interoperability
+- **Rich HTML viz** - Zoom/pan, column search, per‑attribute isolate (UP/DOWN/BOTH), sidebar resize and select/clear all
 - **Advanced SQL objects** - Table-valued functions (TVF) and dataset-returning procedures
 - **Temp table tracking** - Full lineage through EXEC into temp tables
 
@@ -49,6 +50,7 @@ infotracker --help
 ```bash
 # Extract lineage from SQL files
 infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
+ 
 ```
 Flags:
 - --sql-dir DIR          Directory with .sql files (required)
@@ -186,14 +188,15 @@ infotracker diff --base build/baseline --head build/current --threshold BREAKING
 
 ## Output Format
 
-Impact analysis returns these columns:
+Impact analysis returns these columns (topologically sorted by level):
 - **from** - Source column (fully qualified)
 - **to** - Target column (fully qualified)  
 - **direction** - `upstream` or `downstream`
-- **transformation** - Type of transformation (`IDENTITY`, `ARITHMETIC`, `AGGREGATION`, `CASE_AGGREGATION`, `DATE_FUNCTION`, `WINDOW`, etc.)
+- **transformation** - Type of transformation (`IDENTITY`, `ARITHMETIC`, `AGGREGATION`, `CASE_AGGREGATION`, `DATE_FUNCTION`, `WINDOW`, etc.). For UX clarity, CAST and CASE are shown as `expression`.
 - **description** - Human-readable transformation description
+- **level** - Topological distance from the selected column (1 = direct neighbor, then 2, 3, …)
 
-Results are automatically deduplicated. Use `--format json` for machine-readable output.
+Results are automatically deduplicated and sorted topologically by level (then direction/from/to). Use `--format json` for machine-readable output.
 
 ### New Transformation Types
 
@@ -283,7 +286,11 @@ infotracker viz --graph-dir build/lineage
 Tips:
 - Search supports table names, full IDs (namespace.schema.table), column names, and URIs. Press Enter to highlight all matches.
 - Click a column to switch into lineage mode (upstream/downstream highlight). Clicking another column clears the previous selection.
- - Use the left panel to add/remove tables from the canvas. Edges render only between currently visible tables.
+- Right‑click a column row to open a context menu: Show upstream, Show downstream, Show both, Clear filter. In isolate mode only the path columns and edges remain visible (background clicks won’t clear; use Clear filter).
+- Left sidebar: live filter (matches tables and column names), Select All / Clear buttons, and a draggable resizer between sidebar and canvas. Sidebar toggle remembers last width.
+- Depth input in the toolbar limits neighbor layers rendered around selected tables.
+- Collapse button toggles between full column rows and compact “object‑only” view (single arrows object→object).
+- Column order in cards follows DDL/Schema order (from OpenLineage artifacts) instead of alphabetical.
 
 ## 🧪 Testing
 
