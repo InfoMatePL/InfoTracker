@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple, Optional
 
 Edge = Dict[str, str]
 
@@ -17,6 +17,44 @@ Edge = Dict[str, str]
 def _load_edges(graph_path: Path) -> Sequence[Edge]:
     data = json.loads(graph_path.read_text(encoding="utf-8"))
     return data.get("edges", [])
+
+
+def _load_schema_orders(dir_or_graph: Path) -> Dict[str, List[str]]:
+    """Load column order per table from OpenLineage artifacts located next to column_graph.json.
+
+    Returns mapping: "<namespace>.<schema.table>" (lowercase) -> [col1, col2, ...]
+    """
+    # Accept either the graph path (file) or its parent directory
+    base_dir = dir_or_graph.parent if dir_or_graph.is_file() else dir_or_graph
+    orders: Dict[str, List[str]] = {}
+    try:
+        for p in base_dir.glob("*.json"):
+            # skip the graph file itself if present
+            if p.name == "column_graph.json":
+                continue
+            try:
+                j = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            outs = j.get("outputs") or []
+            if not outs:
+                continue
+            out = outs[0] or {}
+            ns = out.get("namespace")
+            nm = out.get("name")
+            if not (ns and nm):
+                continue
+            facets = out.get("facets") or {}
+            schema = facets.get("schema") or {}
+            fields = schema.get("fields") or []
+            cols = [f.get("name") for f in fields if isinstance(f, dict) and f.get("name")]
+            if cols:
+                key = f"{ns}.{nm}".lower()
+                orders[key] = cols
+    except Exception:
+        # fail-soft: no external ordering
+        return {}
+    return orders
 
 
 # ---------------- Model ➜ Simple structures ----------------
@@ -30,7 +68,7 @@ def _table_key(ns: str, tbl: str) -> str:
     return f"{ns}.{tbl}".lower()
 
 
-def _build_elements(edges: Iterable[Edge]) -> Tuple[List[Dict], List[Dict]]:
+def _build_elements(edges: Iterable[Edge], orders: Optional[Dict[str, List[str]]] = None) -> Tuple[List[Dict], List[Dict]]:
     """Build simple tables/edges lists for the HTML to render.
 
     tables: [{ id, label, full, columns: [str, ...] }]
@@ -49,14 +87,21 @@ def _build_elements(edges: Iterable[Edge]) -> Tuple[List[Dict], List[Dict]]:
                     "label": tbl,
                     "full": f"{ns}.{tbl}",
                     "namespace": ns,
-                    "columns": set(),
+                    "columns": [],  # keep insertion order
                 },
             )
-            tables[key]["columns"].add(col)
+            if col not in tables[key]["columns"]:
+                tables[key]["columns"].append(col)
 
     table_list: List[Dict] = []
+    orders = orders or {}
     for key, t in tables.items():
-        cols = sorted(t["columns"])  # deterministic
+        cols = list(t["columns"])  # already in encounter order
+        # If we have OpenLineage schema order for this table, apply it
+        order = orders.get(t["full"].lower())
+        if order:
+            pos = {c.lower(): i for i, c in enumerate(order)}
+            cols.sort(key=lambda c: pos.get(c.lower(), 10**9))
         table_list.append({
             "id": key,
             "label": t["label"],
@@ -336,7 +381,8 @@ function __deriveTablesFromEdges(){
       t.columns.add(p.col);
     });
   });
-  return Array.from(m.values()).map(t=>({ id: t.id, label: t.label, full: t.full, columns: Array.from(t.columns).sort() }));
+  // Keep insertion order from edges; don't sort alphabetically
+  return Array.from(m.values()).map(t=>({ id: t.id, label: t.label, full: t.full, columns: Array.from(t.columns) }));
 }
 const ALL_TABLES = (Array.isArray(__ALL_TABLES_RAW__) && __ALL_TABLES_RAW__.length) ? __ALL_TABLES_RAW__ : __deriveTablesFromEdges();
 let TABLES = []; // visible tables: selected + neighbors
@@ -1567,7 +1613,8 @@ function highlightSearch(q){
 # ---------------- Public API ----------------
 def build_viz_html(graph_path: Path, focus=None, depth: int = 2, direction: str = "both") -> str:
     edges = _load_edges(graph_path)
-    tables, e = _build_elements(edges)
+    schema_orders = _load_schema_orders(graph_path)
+    tables, e = _build_elements(edges, orders=schema_orders)
     html = HTML_TMPL
     html = html.replace("__NODES__", json.dumps(tables, ensure_ascii=False))
     html = html.replace("__EDGES__", json.dumps(e, ensure_ascii=False))
