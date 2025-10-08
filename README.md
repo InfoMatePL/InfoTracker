@@ -17,6 +17,7 @@ InfoTracker is a powerful command-line tool that parses T-SQL files and generate
 - **Breaking change detection** - Detect schema changes that could break downstream processes
 - **Multiple output formats** - Text tables or JSON for integration with other tools
 - **OpenLineage compatible** - Standard format for data lineage interoperability
+ - **dbt (compiled SQL) support** - Run on compiled dbt models with `--dbt`
 - **Rich HTML viz** - Zoom/pan, column search, per‑attribute isolate (UP/DOWN/BOTH), sidebar resize and select/clear all
 - **Advanced SQL objects** - Table-valued functions (TVF) and dataset-returning procedures
 - **Temp table tracking** - Full lineage through EXEC into temp tables
@@ -50,7 +51,9 @@ infotracker --help
 ```bash
 # Extract lineage from SQL files
 infotracker extract --sql-dir examples/warehouse/sql --out-dir build/lineage
- 
+
+# Extract lineage from compiled dbt models
+infotracker extract --dbt --sql-dir examples/dbt_warehouse/models --out-dir build/dbt_lineage
 ```
 Flags:
 - --sql-dir DIR          Directory with .sql files (required)
@@ -61,6 +64,7 @@ Flags:
 - --include PATTERN      Glob include filter
 - --exclude PATTERN      Glob exclude filter
 - --encoding NAME        File encoding for SQL files (default: auto)
+ - --dbt                  Enable dbt mode (compiled SQL)
 
 ### 2. Run Impact Analysis
 ```bash
