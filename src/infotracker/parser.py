@@ -26,6 +26,14 @@ class SqlParser:
         self.schema_registry = SchemaRegistry()
         self.cte_registry: Dict[str, List[str]] = {}  # CTE name -> column list
         self.temp_registry: Dict[str, List[str]] = {}  # Temp table name -> column list
+        # Track temp table sources (base deps) and per-column lineage
+        self.temp_sources: Dict[str, Set[str]] = {}  # "#tmp" -> base deps (schema.table)
+        self.temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}  # "#tmp" or "#tmp@v" -> col -> [refs]
+        # Procedure-level accumulator for multiple INSERTs into the same target
+        # target schema.table -> { out_col -> set of (ns, table, col) }
+        self._proc_acc: Dict[str, Dict[str, Set[tuple[str, str, str]]]] = {}
+        # Temp versioning within a file/procedure: "#tmp" -> current version number
+        self._temp_version: Dict[str, int] = {}
         self.default_database: Optional[str] = None  # Will be set from config
         self.current_database: Optional[str] = None  # Track current database context
         # cross-file object→DB registry (optional)
@@ -33,6 +41,43 @@ class SqlParser:
         # dbt specifics
         self.dbt_mode: bool = False
         self.default_schema: Optional[str] = "dbo"
+    
+    # ---- Helpers: procedure accumulator ----
+    def _proc_acc_init(self, target_fqn: str) -> None:
+        self._proc_acc.setdefault(target_fqn, {})
+
+    def _proc_acc_add(self, target_fqn: str, col_lineage: List[ColumnLineage]) -> None:
+        acc = self._proc_acc.setdefault(target_fqn, {})
+        for lin in (col_lineage or []):
+            s = acc.setdefault(lin.output_column, set())
+            for ref in (lin.input_fields or []):
+                try:
+                    s.add((ref.namespace, ref.table_name, ref.column_name))
+                except Exception:
+                    s.add((str(getattr(ref, "namespace", "")), str(getattr(ref, "table_name", "")), str(getattr(ref, "column_name", ""))))
+
+    def _proc_acc_finalize(self, target_fqn: str) -> List[ColumnLineage]:
+        acc = self._proc_acc.get(target_fqn, {})
+        out: List[ColumnLineage] = []
+        for col, inputs in acc.items():
+            refs = [ColumnReference(namespace=a, table_name=b, column_name=c) for (a, b, c) in sorted(inputs)]
+            out.append(ColumnLineage(
+                output_column=col,
+                input_fields=refs,
+                transformation_type=TransformationType.IDENTITY,
+                transformation_description="merged from multiple branches"
+            ))
+        return out
+
+    # ---- Helpers: temp versioning ----
+    def _temp_next(self, name: str) -> str:
+        v = self._temp_version.get(name, 0) + 1
+        self._temp_version[name] = v
+        return f"{name}@{v}"
+
+    def _temp_current(self, name: str) -> Optional[str]:
+        v = self._temp_version.get(name)
+        return f"{name}@{v}" if v else None
     
     def _clean_proc_name(self, s: str) -> str:
         """Clean procedure name by removing semicolons and parameters."""
@@ -314,6 +359,21 @@ class SqlParser:
         if not table_fqn:
             return
         db, sch, tbl = self._split_fqn(table_fqn)
+        # Expand temp table column refs to their base lineage if known
+        try:
+            simple = tbl if tbl else None
+            if simple and simple.startswith('#'):
+                # Use versioned lineage if present
+                ver = self._temp_current(simple)
+                colname = col_exp.name
+                if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
+                    out_list.extend(self.temp_lineage[ver][colname])
+                    return
+                if simple in self.temp_lineage and colname in self.temp_lineage[simple]:
+                    out_list.extend(self.temp_lineage[simple][colname])
+                    return
+        except Exception:
+            pass
         out_list.append(ColumnReference(
             namespace=f"mssql://localhost/{db}" if db else "mssql://localhost",
             table_name=f"{sch}.{tbl}",  # <== tylko schema.table
@@ -847,6 +907,10 @@ class SqlParser:
         # Reset registries for each file to avoid contamination
         self.cte_registry.clear()
         self.temp_registry.clear()
+        self.temp_sources.clear()
+        self.temp_lineage.clear()
+        self._proc_acc.clear()
+        self._temp_version.clear()
         
         try:
             # dbt mode: compiled SELECT-only models; derive target name from filename
@@ -1039,6 +1103,12 @@ class SqlParser:
                         obj = self._parse_insert_select(statement, object_hint)
                         if obj:
                             all_outputs.append(obj)
+                            # Accumulate per-target lineage across branches for procedures/scripts
+                            try:
+                                self._proc_acc_init(obj.name)
+                                self._proc_acc_add(obj.name, obj.lineage or [])
+                            except Exception:
+                                pass
                             # Check if this is a persistent table (main output)
                             if not obj.name.startswith("#") and "tempdb" not in obj.name.lower():
                                 last_persistent_output = obj
@@ -1089,6 +1159,13 @@ class SqlParser:
                 main_object = last_persistent_output
                 # Update its dependencies with all collected inputs
                 main_object.dependencies = all_inputs
+                # If we accumulated lineage across multiple branches for this target, finalize it
+                try:
+                    merged = self._proc_acc_finalize(main_object.name)
+                    if merged:
+                        main_object.lineage = merged
+                except Exception:
+                    pass
             elif all_outputs:
                 # Use the last output if no persistent one found
                 main_object = all_outputs[-1]
@@ -1194,10 +1271,27 @@ class SqlParser:
         # Extract column lineage
         lineage, output_columns = self._extract_column_lineage(statement, table_name)
         
-        # Register temp table columns if this is a temp table
-        if table_name.startswith('#'):
+        # Register temp table metadata if this is a temp table
+        if table_name.startswith('#') or 'tempdb..#' in str(table_name):
             temp_cols = [col.name for col in output_columns]
-            self.temp_registry[table_name] = temp_cols
+            # Resolve a simple key like "#tmp"
+            simple_key = table_name.split('.')[-1]
+            # Version the temp so multiple INTOs don't mix lineages
+            ver_key = self._temp_next(simple_key)
+            # Store current version columns and also expose simple name to latest version cols
+            self.temp_registry[ver_key] = temp_cols
+            self.temp_registry[simple_key] = temp_cols
+            # Remember base sources (normalized deps already from _extract_dependencies flow)
+            self.temp_sources[simple_key] = set(dependencies)
+            # Save per-column lineage of the temp so later reads can inline sources
+            try:
+                col_map: Dict[str, List[ColumnReference]] = {}
+                for lin in lineage:
+                    col_map[lin.output_column] = list(lin.input_fields or [])
+                self.temp_lineage[ver_key] = col_map
+                self.temp_lineage[simple_key] = col_map  # latest active version
+            except Exception:
+                pass
         
         schema = TableSchema(
             namespace=namespace,
@@ -1255,22 +1349,29 @@ class SqlParser:
                     procedure_name = self._get_full_table_name(raw_proc_name)
                     dependencies.add(procedure_name)
             
-            # For EXEC temp tables, we create placeholder columns since we can't determine 
-            # the actual structure without executing the procedure
-            # Create at least 2 output columns as per the requirement
-            output_columns = [
-                ColumnSchema(
-                    name="output_col_1",
-                    data_type="unknown",
-                    ordinal=0,
-                    nullable=True
-                ),
-                ColumnSchema(
-                    name="output_col_2",
-                    data_type="unknown",
-                    ordinal=1,
-                    nullable=True
-                )
+            # Try to capture target column list for positional mapping
+            target_columns: List[ColumnSchema] = []
+            try:
+                cols_arg = statement.args.get('columns') if hasattr(statement, 'args') else None
+                if cols_arg:
+                    for i, c in enumerate(cols_arg or []):
+                        name = None
+                        if hasattr(c, 'name') and getattr(c, 'name'):
+                            name = str(getattr(c, 'name'))
+                        elif hasattr(c, 'this'):
+                            name = str(getattr(c, 'this'))
+                        else:
+                            name = str(c)
+                        if name:
+                            target_columns.append(ColumnSchema(name=name.strip('[]'), data_type="unknown", ordinal=i, nullable=True))
+            except Exception:
+                target_columns = []
+
+            # For EXEC temp tables, we create placeholder columns since we can't determine
+            # the actual structure without executing the procedure, unless target columns provided
+            output_columns = target_columns or [
+                ColumnSchema(name="output_col_1", data_type="unknown", ordinal=0, nullable=True),
+                ColumnSchema(name="output_col_2", data_type="unknown", ordinal=1, nullable=True),
             ]
             
             # Create placeholder lineage pointing to the procedure
@@ -1278,13 +1379,10 @@ class SqlParser:
             if procedure_name:
                 ns, nm = self._ns_and_name(procedure_name)
                 for i, col in enumerate(output_columns):
+                    input_col = col.name if target_columns else "*"
                     lineage.append(ColumnLineage(
                         output_column=col.name,
-                        input_fields=[ColumnReference(
-                            namespace=ns,
-                            table_name=nm,
-                            column_name="*"  # Wildcard since we don't know the procedure output
-                        )],
+                        input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=input_col)],
                         transformation_type=TransformationType.EXEC,
                         transformation_description=f"INSERT INTO {table_name} EXEC {nm}"
                     ))
@@ -1337,6 +1435,18 @@ class SqlParser:
             
         # Extract dependencies (tables referenced in FROM/JOIN)
         dependencies = self._extract_dependencies(select_expr)
+        # Expand temp dependencies to their base sources if we have them
+        if dependencies:
+            expanded: Set[str] = set()
+            for d in dependencies:
+                if d.startswith('tempdb..#') or d.startswith('#'):
+                    simple = d.split('.')[-1]
+                    bases = self.temp_sources.get(simple)
+                    if bases:
+                        expanded.update(bases)
+                else:
+                    expanded.add(d)
+            dependencies = expanded
         
         # Extract column lineage
         lineage, output_columns = self._extract_column_lineage(select_expr, table_name)
