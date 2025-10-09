@@ -763,7 +763,7 @@ class SqlParser:
         self.schema_registry.register(schema)
         
         # Create and return ObjectInfo with enhanced dependencies
-        return ObjectInfo(
+        obj = ObjectInfo(
             name=table_name,
             object_type=object_type,
             schema=schema,
@@ -771,6 +771,13 @@ class SqlParser:
             dependencies=all_dependencies,  # Use all extracted dependencies
             is_fallback=True
         )
+        # In dbt mode, expose dbt-style job path to keep consistency with dbt models
+        try:
+            if getattr(self, 'dbt_mode', False) and object_hint:
+                obj.job_name = f"dbt/models/{object_hint}.sql"
+        except Exception:
+            pass
+        return obj
     
     def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
         """Find the last SELECT statement in SQL content using SQLGlot AST."""
@@ -1122,19 +1129,28 @@ class SqlParser:
                 logger.warning("parse failed (object=%s): %s", object_hint, e)
             except Exception:
                 logger.warning("parse failed: %s", e)
-            # Return an object with error information
+            # Return an object with error information (dbt-aware fallback)
             db = self.current_database or self.default_database or "InfoTrackerDW"
-            return ObjectInfo(
-                name=sanitize_name(object_hint or "unknown"),
+            model_name = sanitize_name(object_hint or "unknown")
+            nm = f"{self.default_schema or 'dbo'}.{model_name}" if getattr(self, 'dbt_mode', False) else model_name
+            obj = ObjectInfo(
+                name=nm,
                 object_type="unknown",
                 schema=TableSchema(
                     namespace=f"mssql://localhost/{db}",
-                    name=sanitize_name(object_hint or "unknown"),
+                    name=nm,
                     columns=[]
                 ),
                 lineage=[],
                 dependencies=set()
             )
+            # Ensure dbt-style job path if applicable
+            try:
+                if getattr(self, 'dbt_mode', False) and object_hint:
+                    obj.job_name = f"dbt/models/{object_hint}.sql"
+            except Exception:
+                pass
+            return obj
     
     def _is_select_into(self, statement: exp.Select) -> bool:
         """Check if this is a SELECT INTO statement."""

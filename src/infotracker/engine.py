@@ -129,12 +129,7 @@ class Engine:
                 warnings += 1
                 logger.warning("catalog path not found: %s", catalog_path)
 
-        # 2) Include/Exclude (listy)
-        def match_any(p: Path, patterns: Optional[List[str]]) -> bool:
-            if not patterns:
-                return True
-            return any(p.match(g) for g in patterns)
-
+        # 2) Include/Exclude (relative to sql_dir, robust to patterns like "**/file.sql" and "file.sql")
         includes: Optional[List[str]] = None
         excludes: Optional[List[str]] = None
 
@@ -149,10 +144,20 @@ class Engine:
             excludes = list(self.config.exclude)
 
         sql_root = Path(req.sql_dir)
-        sql_files = [
-            p for p in sorted(sql_root.rglob("*.sql"))
-            if match_any(p, includes) and not match_any(p, excludes)
-        ]
+        sql_files: List[Path] = []
+        for p in sorted(sql_root.rglob("*.sql")):
+            try:
+                rel = p.relative_to(sql_root).as_posix()
+            except Exception:
+                rel = p.name
+            inc_ok = True if not includes else any(
+                fnmatch(rel, pat) or fnmatch(p.name, pat) for pat in includes
+            )
+            exc_ok = any(
+                fnmatch(rel, pat) or fnmatch(p.name, pat) for pat in (excludes or [])
+            )
+            if inc_ok and not exc_ok:
+                sql_files.append(p)
 
         # 3) Parse all files first to build dependency graph
         out_dir = Path(req.out_dir)
