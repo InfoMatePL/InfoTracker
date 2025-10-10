@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import List, Optional, Set, Dict, Any
+from functools import lru_cache
 
 import sqlglot
 from sqlglot import expressions as exp
@@ -16,6 +17,74 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Precompiled regexes for light scans and pre-scan in engine
+RE_SINGLELINE_COMMENT = re.compile(r"--.*?$", re.MULTILINE)
+RE_MULTILINE_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+RE_FQN3 = re.compile(r"(?i)(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
+RE_INSERT_INTO3 = re.compile(r"(?i)\bINSERT\s+INTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
+RE_SELECT_INTO3 = re.compile(r"(?is)\bSELECT\b.*?\bINTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
+
+@lru_cache(maxsize=65536)
+def _cached_split_fqn_core(fqn: str):
+    parts = (fqn or "").split(".")
+    if len(parts) >= 3:
+        return parts[0], parts[1], ".".join(parts[2:])
+    if len(parts) == 2:
+        return None, parts[0], parts[1]
+    return None, "dbo", (parts[0] if parts else None)
+
+def _rewrite_case_with_commas_to_iif(sql: str) -> str:
+    """Rewrite non-standard 'CASE WHEN cond, true, false' to IIF(cond, true, false)."""
+    pat_paren = re.compile(
+        r"""
+        CASE\s+WHEN
+        \s+(?P<cond>[^,()]+(?:\([^)]*\)[^,()]*)*)
+        \s*,\s*(?P<t>[^,()]+(?:\([^)]*\)[^,()]*)*)
+        \s*,\s*(?P<f>[^)]+?)
+        \s*\)
+        """,
+        re.IGNORECASE | re.VERBOSE | re.DOTALL,
+    )
+    pat_end = re.compile(
+        r"""
+        CASE\s+WHEN
+        \s+(?P<cond>[^,END]+?)
+        \s*,\s*(?P<t>[^,END]+?)
+        \s*,\s*(?P<f>[^END]+?)
+        \s*END
+        """,
+        re.IGNORECASE | re.VERBOSE | re.DOTALL,
+    )
+    def _repl(m: re.Match) -> str:
+        cond = (m.group('cond') or '').strip()
+        t = (m.group('t') or '').strip()
+        f = (m.group('f') or '').strip()
+        return f"IIF({cond}, {t}, {f})"
+    sql2 = pat_paren.sub(_repl, sql or "")
+    sql3 = pat_end.sub(_repl, sql2)
+    return sql3
+
+def _strip_udf_options_between_returns_and_as(sql: str) -> str:
+    """Strip options between RETURNS ... and AS in UDF definitions."""
+    pat = re.compile(
+        r"""
+        (?P<head>\bRETURNS\b
+            \s+ (?: TABLE | [A-Z0-9_]+
+                 (?:\s*\([^\)]*\))?
+            )
+        )
+        (?P<middle>
+            (?!\s*AS\b)
+            [\s\S]*?
+        )
+        \bAS\b
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+    def _repl(m: re.Match) -> str:
+        return f"{m.group('head')}\nAS"
+    return pat.sub(_repl, sql or "")
 
 
 class SqlParser:
@@ -144,13 +213,11 @@ class SqlParser:
         return None
     
     def _split_fqn(self, fqn: str):
-        """Split fully qualified name into database, schema, table components."""
-        parts = (fqn or "").split(".")
-        if len(parts) >= 3: 
-            return parts[0], parts[1], ".".join(parts[2:])
-        if len(parts) == 2: 
-            return (self.current_database or self.default_database), parts[0], parts[1]
-        return (self.current_database or self.default_database), "dbo", (parts[0] if parts else None)
+        """Split fully qualified name into database, schema, table components (uses cached core)."""
+        db, sch, tbl = _cached_split_fqn_core(fqn)
+        if db is None:
+            db = self.current_database or self.default_database
+        return db, sch, tbl
 
     def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
         """Return (namespace, schema.table) regardless of input format.
@@ -628,6 +695,13 @@ class SqlParser:
         
         # Cut to first significant statement
         processed_sql = self._cut_to_first_statement(processed_sql)
+        
+        # Final rewrites before sqlglot: UDF RETURNS options cleanup and CASE-with-commas -> IIF
+        try:
+            processed_sql = _strip_udf_options_between_returns_and_as(processed_sql)
+            processed_sql = _rewrite_case_with_commas_to_iif(processed_sql)
+        except Exception:
+            pass
         
         return processed_sql
     
