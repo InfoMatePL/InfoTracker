@@ -80,70 +80,77 @@ def read_text_safely(path: str | Path, encoding: str = "auto") -> str:
 
 
 def _detect_and_decode(raw_content: bytes, file_path: Path) -> str:
-    """
-    Detect encoding and decode content.
-    
-    Args:
-        raw_content: Raw file bytes
-        file_path: File path for logging
-        
-    Returns:
-        Decoded content string
-        
-    Raises:
-        UnicodeDecodeError: If no encoding works
-    """
+    """Smarter auto-detection: evaluate multiple encodings and pick best scored candidate.
 
-    # Quick BOM check first
-    bom_encoding = _detect_bom(raw_content)
-    if bom_encoding:
+    Score = prior (hint strength) + text_quality + SQL bonus (+ small tie-breakers).
+    """
+    candidates: list[tuple[str, str, float]] = []  # (encoding, text, prior)
+
+    # 1) BOM (strong signal)
+    bom = _detect_bom(raw_content)
+    if bom:
         try:
-            content = raw_content.decode(bom_encoding, errors="strict")
-            logger.debug(f"Detected BOM encoding {bom_encoding} for {file_path}")
-            return content
-        except UnicodeDecodeError:
-            pass  # Fall back to other methods
-    
-    guess = _looks_like_utf16(raw_content)
-    if guess:
-        try:
-            content = raw_content.decode(guess, errors="strict")
-            logger.debug(f"Heuristic detected {guess} for {file_path}")
-            return content
+            txt = raw_content.decode(bom, errors="strict")
+            candidates.append((bom, txt, 2.0))
         except UnicodeDecodeError:
             pass
 
-    # Try common encodings
-    last_error = None
-    for encoding in COMMON_ENCODINGS:
+    # 2) Heuristic UTF-16 by NUL distribution
+    utf16_guess = _looks_like_utf16(raw_content)
+    if utf16_guess:
         try:
-            content = raw_content.decode(encoding, errors="strict")
-            logger.debug(f"Detected encoding {encoding} for {file_path}")
-            return content
-        except UnicodeDecodeError as e:
-            last_error = e
+            txt = raw_content.decode(utf16_guess, errors="strict")
+            candidates.append((utf16_guess, txt, 0.5))
+        except UnicodeDecodeError:
+            pass
+
+    # 3) Try common encodings (unordered, we will rank)
+    for enc in COMMON_ENCODINGS:
+        try:
+            txt = raw_content.decode(enc, errors="strict")
+            candidates.append((enc, txt, 0.0))
+        except UnicodeDecodeError:
             continue
-    
-    # If charset-normalizer is available, try it as last resort
+
+    # 4) charset-normalizer (if available)
     try:
         import charset_normalizer
         result = charset_normalizer.from_bytes(raw_content)
         if result and result.best():
-            encoding = result.best().encoding
-            content = str(result.best())
-            logger.debug(f"charset-normalizer detected encoding {encoding} for {file_path}")
-            return content
-    except ImportError:
-        pass  # charset-normalizer not available, continue with error
+            enc = result.best().encoding or "unknown"
+            txt = str(result.best())
+            candidates.append((enc, txt, 0.25))
     except Exception:
-        pass  # charset-normalizer failed, continue with error
-    
-    # All attempts failed
-    raise UnicodeDecodeError(
-        "auto-detect", raw_content, 0, len(raw_content),
-        f"Cannot decode {file_path} with any common encoding. "
-        f"Try specifying encoding explicitly (e.g., --encoding cp1250, --encoding utf-16)"
+        pass
+
+    if not candidates:
+        raise UnicodeDecodeError(
+            "auto-detect", raw_content, 0, len(raw_content),
+            f"Cannot decode {file_path} with any known encoding. Try --encoding cp1250 or --encoding utf-16."
+        )
+
+    # 5) Score candidates
+    best = None
+    best_score = -1.0
+    for enc, txt, prior in candidates:
+        q = _text_quality_score(txt)
+        sqlish = _looks_like_sql(txt)
+        score = prior + q + (1.0 if sqlish else 0.0)
+        # tie-breakers / preferences
+        if enc in ("utf-8", "utf-8-sig"):
+            score += 0.05
+        if q < 0.85 and not sqlish:
+            score -= 0.15
+        if score > best_score:
+            best = (enc, txt, q, sqlish, score)
+            best_score = score
+
+    chosen_enc, chosen_txt, q, sqlish, score = best  # type: ignore[misc]
+    logger.debug(
+        "Auto-picked %s for %s (score=%.2f, quality=%.2f, sqlish=%s)",
+        chosen_enc, file_path, score, q, sqlish,
     )
+    return chosen_txt
 
 
 def _looks_like_utf16(raw: bytes) -> Optional[str]:
