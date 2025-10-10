@@ -66,18 +66,11 @@ def _rewrite_case_with_commas_to_iif(sql: str) -> str:
     return sql3
 
 def _strip_udf_options_between_returns_and_as(sql: str) -> str:
-    """Strip options between RETURNS ... and AS in UDF definitions."""
+    """Strip options between RETURNS TABLE and AS (for TVFs only)."""
     pat = re.compile(
         r"""
-        (?P<head>\bRETURNS\b
-            \s+ (?: TABLE | [A-Z0-9_]+
-                 (?:\s*\([^\)]*\))?
-            )
-        )
-        (?P<middle>
-            (?!\s*AS\b)
-            [\s\S]*?
-        )
+        (?P<head>\bRETURNS\b\s+TABLE)
+        (?P<middle>(?!\s*AS\b)[\s\S]*?)
         \bAS\b
         """,
         re.IGNORECASE | re.VERBOSE,
@@ -110,6 +103,8 @@ class SqlParser:
         # dbt specifics
         self.dbt_mode: bool = False
         self.default_schema: Optional[str] = "dbo"
+        # Track current file name for logging context
+        self._current_file: Optional[str] = None
     
     # ---- Helpers: procedure accumulator ----
     def _proc_acc_init(self, target_fqn: str) -> None:
@@ -161,6 +156,12 @@ class SqlParser:
     def _normalize_tsql(self, text: str) -> str:
         """Normalize T-SQL to improve sqlglot parsing compatibility."""
         t = text.replace("\r\n", "\n")
+        # Strip ANSI escape sequences and BiDi control characters if any snuck in
+        try:
+            t = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", t)
+            t = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069]", "", t)
+        except Exception:
+            pass
         
         # Strip technical banners and settings
         t = re.sub(r"^\s*SET\s+(ANSI_NULLS|QUOTED_IDENTIFIER)\s+(ON|OFF)\s*;?\s*$", "", t, flags=re.I|re.M)
@@ -193,6 +194,47 @@ class SqlParser:
                 node.set("is_hashbytes", True)
         
         return root
+
+    # ---- Logging helpers with file context ----
+    def _log_info(self, msg: str, *args) -> None:
+        prefix = f"[file={self._current_file or '-'}] "
+        try:
+            text = (msg % args) if args else str(msg)
+        except Exception:
+            text = str(msg)
+        # strip ANSI/BiDi from log text for readability
+        try:
+            text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+            text = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069]", "", text)
+        except Exception:
+            pass
+        logger.info(prefix + text)
+
+    def _log_warning(self, msg: str, *args) -> None:
+        prefix = f"[file={self._current_file or '-'}] "
+        try:
+            text = (msg % args) if args else str(msg)
+        except Exception:
+            text = str(msg)
+        try:
+            text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+            text = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069]", "", text)
+        except Exception:
+            pass
+        logger.warning(prefix + text)
+
+    def _log_debug(self, msg: str, *args) -> None:
+        prefix = f"[file={self._current_file or '-'}] "
+        try:
+            text = (msg % args) if args else str(msg)
+        except Exception:
+            text = str(msg)
+        try:
+            text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text)
+            text = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069]", "", text)
+        except Exception:
+            pass
+        logger.debug(prefix + text)
 
     def _extract_dbt_model_name(self, sql_text: str) -> Optional[str]:
         """Extract dbt model logical name from leading comment, e.g.:
@@ -612,7 +654,7 @@ class SqlParser:
             use_match = re.match(r'USE\s+(?::([^:]+):|(?:\[([^\]]+)\]|(\w+)))', line, re.IGNORECASE)
             if use_match:
                 db_name = use_match.group(1) or use_match.group(2) or use_match.group(3)
-                logger.debug(f"Found USE statement, setting database to: {db_name}")
+                self._log_debug(f"Found USE statement, setting database to: {db_name}")
                 return db_name
             
             # If we hit a non-comment, non-USE statement, stop looking
@@ -965,7 +1007,7 @@ class SqlParser:
             return last_select
                 
         except Exception as e:
-            logger.debug(f"Fallback SELECT extraction failed: {e}")
+            self._log_debug(f"Fallback SELECT extraction failed: {e}")
             
         return None
     
@@ -973,10 +1015,22 @@ class SqlParser:
         """Parse a SQL file and extract object information."""
         from .openlineage_utils import sanitize_name
         
+        # Track current file for log context. If engine pre-set _current_file (real file path), keep it.
+        prev_file = self._current_file
+        if not self._current_file:
+            self._current_file = object_hint or prev_file
         # Reset current database to default for each file
         self.current_database = self.default_database
         # Keep the raw SQL for DB inference when object name lacks explicit DB
         self._current_raw_sql = sql_content
+        # Diagnostics: log RETURNS...AS window (escaped) after lightweight normalization
+        try:
+            dbg = self._normalize_tsql(sql_content)
+            m = re.search(r'(?is)\bRETURNS\b(.{0,120}?)\bAS\b', dbg)
+            window = m.group(0) if m else "<no match>"
+            self._log_debug("RETURNS-window=%r", window)
+        except Exception:
+            pass
         
         # Reset registries for each file to avoid contamination
         self.cte_registry.clear()
@@ -1277,9 +1331,9 @@ class SqlParser:
             
             # Include object hint to help identify the failing file
             try:
-                logger.warning("parse failed (object=%s): %s", object_hint, e)
+                self._log_warning("parse failed (object=%s): %s", object_hint, e)
             except Exception:
-                logger.warning("parse failed: %s", e)
+                self._log_warning("parse failed: %s", e)
             # Return an object with error information (dbt-aware fallback)
             db = self.current_database or self.default_database or "InfoTrackerDW"
             model_name = sanitize_name(object_hint or "unknown")
@@ -1301,6 +1355,8 @@ class SqlParser:
                     obj.job_name = f"dbt/models/{object_hint}.sql"
             except Exception:
                 pass
+            # Restore previous file context before returning
+            self._current_file = prev_file
             return obj
     
     def _is_select_into(self, statement: exp.Select) -> bool:
@@ -3906,7 +3962,7 @@ class SqlParser:
                     ))
             
         except Exception as e:
-            logger.debug(f"Basic lineage extraction failed: {e}")
+            self._log_debug(f"Basic lineage extraction failed: {e}")
             
         return lineage
     
@@ -4275,7 +4331,7 @@ class SqlParser:
                                     stmt_deps = self._extract_dependencies(parsed_stmt.expression)
                                     dependencies.update(stmt_deps)
                 except Exception as e:
-                    logger.debug(f"Failed to parse statement in MSTVF: {e}")
+                    self._log_debug(f"Failed to parse statement in MSTVF: {e}")
                     continue
         
         return lineage, dependencies

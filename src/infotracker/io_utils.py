@@ -18,6 +18,19 @@ COMMON_ENCODINGS = [
     'cp1250'
 ]
 
+# Regexes to strip ANSI escape sequences and BiDi control characters
+import re
+_ANSI_ESC_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_BIDI_CTRL_RE = re.compile(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069]")
+
+def _strip_ansi_bidi(s: str) -> str:
+    """Remove ANSI escape sequences and Unicode BiDi control chars from text."""
+    if not s:
+        return s
+    s = _ANSI_ESC_RE.sub('', s)
+    s = _BIDI_CTRL_RE.sub('', s)
+    return s
+
 
 def read_text_safely(path: str | Path, encoding: str = "auto") -> str:
     """
@@ -304,6 +317,9 @@ def _normalize_content(content: str) -> str:
     Returns:
         Normalized content string
     """
+    # Strip ANSI/BiDi controls first
+    content = _strip_ansi_bidi(content)
+
     # Normalize line endings to \n
     content = content.replace('\r\n', '\n').replace('\r', '\n')
     

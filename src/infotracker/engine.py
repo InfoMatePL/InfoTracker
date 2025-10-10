@@ -173,6 +173,11 @@ class Engine:
         for sql_path in sql_files:
             try:
                 sql_text = read_text_safely(sql_path, encoding=req.encoding)
+                # set current file for logging context (relative to sql_root)
+                try:
+                    parser._current_file = sql_path.relative_to(sql_root).as_posix()
+                except Exception:
+                    parser._current_file = str(sql_path)
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
                 
                 # Store mapping for later processing
@@ -218,6 +223,11 @@ class Engine:
             for sql_path in sql_file_map[obj_name]:
                 try:
                     sql_text = read_text_safely(sql_path, encoding=req.encoding)
+                    # set current file for logging context (relative to sql_root)
+                    try:
+                        parser._current_file = sql_path.relative_to(sql_root).as_posix()
+                    except Exception:
+                        parser._current_file = str(sql_path)
 
                     # Parse with updated schema registry (now has dependencies resolved)
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
