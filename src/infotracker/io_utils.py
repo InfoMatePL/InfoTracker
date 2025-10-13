@@ -98,6 +98,7 @@ def _detect_and_decode(raw_content: bytes, file_path: Path) -> str:
     Score = prior (hint strength) + text_quality + SQL bonus (+ small tie-breakers).
     """
     candidates: list[tuple[str, str, float]] = []  # (encoding, text, prior)
+    have_known = False
 
     # 1) BOM (strong signal)
     bom = _detect_bom(raw_content)
@@ -105,6 +106,7 @@ def _detect_and_decode(raw_content: bytes, file_path: Path) -> str:
         try:
             txt = raw_content.decode(bom, errors="strict")
             candidates.append((bom, txt, 2.0))
+            have_known = True
         except UnicodeDecodeError:
             pass
 
@@ -114,6 +116,7 @@ def _detect_and_decode(raw_content: bytes, file_path: Path) -> str:
         try:
             txt = raw_content.decode(utf16_guess, errors="strict")
             candidates.append((utf16_guess, txt, 0.5))
+            have_known = True
         except UnicodeDecodeError:
             pass
 
@@ -122,19 +125,22 @@ def _detect_and_decode(raw_content: bytes, file_path: Path) -> str:
         try:
             txt = raw_content.decode(enc, errors="strict")
             candidates.append((enc, txt, 0.0))
+            have_known = True
         except UnicodeDecodeError:
             continue
 
     # 4) charset-normalizer (if available)
-    try:
-        import charset_normalizer
-        result = charset_normalizer.from_bytes(raw_content)
-        if result and result.best():
-            enc = result.best().encoding or "unknown"
-            txt = str(result.best())
-            candidates.append((enc, txt, 0.25))
-    except Exception:
-        pass
+    # Only try charset-normalizer if no known candidates succeeded
+    if not have_known:
+        try:
+            import charset_normalizer
+            result = charset_normalizer.from_bytes(raw_content)
+            if result and result.best():
+                enc = result.best().encoding or "unknown"
+                txt = str(result.best())
+                candidates.append((enc, txt, 0.1))
+        except Exception:
+            pass
 
     if not candidates:
         raise UnicodeDecodeError(
@@ -152,6 +158,8 @@ def _detect_and_decode(raw_content: bytes, file_path: Path) -> str:
         # tie-breakers / preferences
         if enc in ("utf-8", "utf-8-sig"):
             score += 0.05
+        if enc.lower() in ("cp1250", "windows-1250", "iso-8859-2"):
+            score += 0.03
         if q < 0.85 and not sqlish:
             score -= 0.15
         if score > best_score:
