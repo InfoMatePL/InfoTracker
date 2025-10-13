@@ -66,8 +66,13 @@ def _rewrite_case_with_commas_to_iif(sql: str) -> str:
     return sql3
 
 def _strip_udf_options_between_returns_and_as(sql: str) -> str:
-    """Strip options between RETURNS TABLE and AS (for TVFs only)."""
-    pat = re.compile(
+    """Strip UDF options between RETURNS ... and AS.
+
+    - TVF (RETURNS TABLE ... AS): remove options between TABLE and AS
+    - Scalar UDF (RETURNS <type> WITH ... AS): remove WITH ... up to AS
+    """
+    # TVF
+    pat_tvf = re.compile(
         r"""
         (?P<head>\bRETURNS\b\s+TABLE)
         (?P<middle>(?!\s*AS\b)[\s\S]*?)
@@ -75,9 +80,20 @@ def _strip_udf_options_between_returns_and_as(sql: str) -> str:
         """,
         re.IGNORECASE | re.VERBOSE,
     )
-    def _repl(m: re.Match) -> str:
+    def _repl_tvf(m: re.Match) -> str:
         return f"{m.group('head')}\nAS"
-    return pat.sub(_repl, sql or "")
+    out = pat_tvf.sub(_repl_tvf, sql or "")
+    # Scalar UDF
+    pat_scalar = re.compile(
+        r"""(?is)
+        (?P<head>\bRETURNS\b\s+(?!TABLE\b)[\w\[\]]+(?:\s*\([^)]*\))?)
+        \s+(?P<opts>WITH\b[\s\S]*?)
+        \bAS\b
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    )
+    out = pat_scalar.sub(lambda m: f"{m.group('head')}\nAS", out)
+    return out
 
 
 class SqlParser:
@@ -175,11 +191,18 @@ class SqlParser:
         
         # Convert IIF to CASE WHEN (basic conversion for simple cases)
         t = re.sub(r"\bIIF\s*\(", "CASE WHEN ", t, flags=re.I)
+        # Remove zero-width / NBSP that may split tokens
+        try:
+            t = re.sub(r"[\u200B\u200C\u200D\u00A0]", " ", t)
+        except Exception:
+            pass
         
         return t
     
-    def _rewrite_ast(self, root: exp.Expression) -> exp.Expression:
+    def _rewrite_ast(self, root: Optional[exp.Expression]) -> Optional[exp.Expression]:
         """Rewrite AST nodes for better T-SQL compatibility."""
+        if root is None:
+            return None
         for node in list(root.walk()):
             # Convert CONVERT(T, x [, style]) to CAST(x AS T)
             if isinstance(node, exp.Convert):
@@ -1125,10 +1148,13 @@ class SqlParser:
             # Check if this file contains multiple objects and handle accordingly
             sql_upper = sql_content.upper()
             
-            # Count how many CREATE statements we have
-            create_function_count = sql_upper.count('CREATE FUNCTION') + sql_upper.count('CREATE OR ALTER FUNCTION')
-            create_procedure_count = sql_upper.count('CREATE PROCEDURE') + sql_upper.count('CREATE OR ALTER PROCEDURE')
-            create_table_count = sql_upper.count('CREATE TABLE') + sql_upper.count('CREATE OR ALTER TABLE')
+            # Count how many CREATE statements we have (robust to PROC/PROCEDURE)
+            import re as _re
+            def _count(pats: List[str]) -> int:
+                return sum(len(_re.findall(p, sql_upper, flags=_re.I)) for p in pats)
+            create_function_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\b"])
+            create_procedure_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\b", r"\bCREATE\s+(?:OR\s+ALTER\s+)?PROC\b"])
+            create_table_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?TABLE\b"])
 
             if create_table_count == 1 and all(x == 0 for x in [create_function_count, create_procedure_count]):
                 # spróbuj najpierw AST; jeśli SQLGlot zwróci Command albo None — fallback stringowy
@@ -1169,9 +1195,9 @@ class SqlParser:
             # Parse all SQL statements with SQLGlot
             statements = sqlglot.parse(preprocessed_sql, read=self.dialect)
             
-            # Apply AST rewrites to improve parsing
+            # Apply AST rewrites to improve parsing (guard None)
             if statements:
-                statements = [self._rewrite_ast(s) for s in statements]
+                statements = [s for s in (self._rewrite_ast(s) for s in statements) if s]
             if not statements:
                 # If SQLGlot parsing fails completely, try to extract dependencies with string parsing
                 dependencies = self._extract_basic_dependencies(preprocessed_sql)
