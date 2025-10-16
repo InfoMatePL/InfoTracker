@@ -196,6 +196,12 @@ class SqlParser:
             t = re.sub(r"[\u200B\u200C\u200D\u00A0]", " ", t)
         except Exception:
             pass
+
+        # Drop T-SQL-specific XMLNAMESPACES clause which sqlglot doesn't need for lineage
+        try:
+            t = re.sub(r"(?is)\bWITH\s+XMLNAMESPACES\s*\(.*?\)\s*", "", t)
+        except Exception:
+            pass
         
         return t
     
@@ -1851,6 +1857,49 @@ class SqlParser:
         
         # Extract column lineage
         lineage, output_columns = self._extract_column_lineage(select_stmt, view_name)
+
+        # Fallback: if no projections recognized (e.g., due to XMLNAMESPACES or exotic constructs),
+        # try string-based extraction of SELECT body after AS and re-parse.
+        if (not lineage) or (not output_columns):
+            try:
+                sql_text = str(statement)
+                m_as = re.search(r"(?is)\bAS\b\s*(.*)$", sql_text)
+                if m_as:
+                    body = m_as.group(1)
+                    body = self._normalize_tsql(body)
+                    # Remove XMLNAMESPACES at the start if any remained
+                    body = re.sub(r"(?is)^\s*WITH\s+XMLNAMESPACES\s*\(.*?\)\s*", "", body)
+                    parsed_fallback = sqlglot.parse(body, read=self.dialect)
+                    sel = None
+                    if parsed_fallback:
+                        for st in parsed_fallback:
+                            if isinstance(st, exp.Select):
+                                sel = st
+                                break
+                    if sel is not None:
+                        dependencies = self._extract_dependencies(sel) or dependencies
+                        lineage, output_columns = self._extract_column_lineage(sel, view_name)
+                    # Final string-based fallback if AST still yields nothing
+                    if (not lineage) or (not output_columns):
+                        try:
+                            # Try to isolate the first SELECT ... clause for basic parsing
+                            m_sel = re.search(r"(?is)\bSELECT\b(.*)$", body)
+                            if m_sel:
+                                select_sql = "SELECT " + m_sel.group(1)
+                                basic_cols = self._extract_basic_select_columns(select_sql)
+                                basic_lineage = self._extract_basic_lineage_from_select(select_sql, basic_cols, view_name)
+                                if basic_lineage:
+                                    lineage = basic_lineage
+                                if basic_cols:
+                                    output_columns = basic_cols
+                                # Try basic dependencies too
+                                deps_basic = self._extract_basic_dependencies(select_sql)
+                                if deps_basic:
+                                    dependencies = set(deps_basic)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         
         schema = TableSchema(
             namespace=namespace,
@@ -2518,6 +2567,14 @@ class SqlParser:
             
             # Resolve table name from alias
             table_name = self._resolve_table_from_alias(table_alias, context)
+            # Skip noise identifiers (variables, dynamic tokens, bracket-only)
+            if table_name and (table_name.startswith('@') or ('+' in table_name) or (table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name)):
+                return ColumnLineage(
+                    output_column=output_name,
+                    input_fields=[],
+                    transformation_type=TransformationType.EXPRESSION,
+                    transformation_description=f"Expression: {str(expr)}"
+                )
             
             ns, nm = self._ns_and_name(table_name)
             input_fields.append(ColumnReference(
@@ -3456,8 +3513,14 @@ class SqlParser:
         # Collect FROM/JOIN sources and their aliases to resolve refs
         alias_map: Dict[str, str] = {}
         # Patterns like: FROM <tbl> [AS a] JOIN <tbl2> [AS b] ...
+        def _noise_token(tok: str) -> bool:
+            t = (tok or '').strip()
+            return (t.startswith('@') or ('+' in t) or (t.startswith('[') and t.endswith(']') and '.' not in t))
         for m in re.finditer(r'(?is)\bFROM\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_tail):
-            tbl = self._normalize_table_ident(m.group(1))
+            raw_tok = m.group(1)
+            if _noise_token(raw_tok):
+                continue
+            tbl = self._normalize_table_ident(raw_tok)
             al = (m.group(2) or m.group(3) or '').strip()
             if al:
                 alias_map[al.lower()] = tbl
@@ -3465,7 +3528,10 @@ class SqlParser:
                 # derive alias as last identifier
                 alias_map[tbl.split('.')[-1].lower()] = tbl
         for m in re.finditer(r'(?is)\bJOIN\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', from_tail):
-            tbl = self._normalize_table_ident(m.group(1))
+            raw_tok = m.group(1)
+            if _noise_token(raw_tok):
+                continue
+            tbl = self._normalize_table_ident(raw_tok)
             al = (m.group(2) or m.group(3) or '').strip()
             if al:
                 alias_map[al.lower()] = tbl
@@ -3604,15 +3670,24 @@ class SqlParser:
             m_from = re.search(r'(?is)\bFROM\b(.*)$', s)
             if m_from:
                 from_tail = m_from.group(1)
+                def _noise_token(tok: str) -> bool:
+                    t = (tok or '').strip()
+                    return (t.startswith('@') or ('+' in t) or (t.startswith('[') and t.endswith(']') and '.' not in t))
                 for m in re.finditer(r'(?is)\bFROM\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_tail):
-                    tbl = self._normalize_table_ident(m.group(1))
+                    raw_tok = m.group(1)
+                    if _noise_token(raw_tok):
+                        continue
+                    tbl = self._normalize_table_ident(raw_tok)
                     al = (m.group(2) or m.group(3) or '').strip()
                     if al:
                         alias_map[al.lower()] = tbl
                     else:
                         alias_map[tbl.split('.')[-1].lower()] = tbl
                 for m in re.finditer(r'(?is)\bJOIN\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', from_tail):
-                    tbl = self._normalize_table_ident(m.group(1))
+                    raw_tok = m.group(1)
+                    if _noise_token(raw_tok):
+                        continue
+                    tbl = self._normalize_table_ident(raw_tok)
                     al = (m.group(2) or m.group(3) or '').strip()
                     if al:
                         alias_map[al.lower()] = tbl
@@ -4177,6 +4252,14 @@ class SqlParser:
             # Clean brackets and normalize
             table_name = self._normalize_table_ident(table_name)
             
+            # Skip dynamic/variable/bracket-only tokens
+            if table_name.startswith('@'):
+                continue
+            if '+' in table_name:
+                continue
+            if table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name:
+                continue
+
             # Skip temp tables for dependency tracking
             if not table_name.startswith('#') and table_name.lower() not in sql_keywords:
                 # Get full qualified name for consistent dependency tracking
@@ -4465,6 +4548,9 @@ class SqlParser:
                 if len(tables) == 1:
                     table_name = tables[0]
             
+            # Filter out noise identifiers (variables, bracket-only token without dot, dynamic string concatenation)
+            if table_name and (table_name.startswith('@') or ('+' in table_name) or (table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name)):
+                continue
             if table_name != "unknown":
                 ns, nm = self._ns_and_name(table_name)
                 refs.append(ColumnReference(

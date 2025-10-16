@@ -24,6 +24,29 @@ def _strip_db_prefix(name: str) -> str:
     parts = (name or "").split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
+def _is_noise_dep(dep: str) -> bool:
+    """Return True if dependency name looks like a temp table or non-table token.
+
+    Filters out:
+    - temp tables ("#..." or "tempdb..#...")
+    - variable-like tokens ("@...")
+    - dynamic concat artifacts (contains '+')
+    - single bracketed tokens without dot (e.g., "[Name]")
+    """
+    if not dep:
+        return True
+    d = dep.strip()
+    dl = d.lower()
+    if dl.startswith("tempdb..#") or d.startswith("#"):
+        return True
+    if d.startswith("@"):
+        return True
+    if "+" in d:
+        return True
+    if d.startswith("[") and d.endswith("]") and "." not in d:
+        return True
+    return False
+
 
 class OpenLineageGenerator:
     """Generates OpenLineage-compliant JSON from ObjectInfo."""
@@ -68,6 +91,8 @@ class OpenLineageGenerator:
         """Build inputs array from object dependencies."""
         inputs = []
         for dep_name in sorted(obj_info.dependencies):
+             if _is_noise_dep(dep_name):
+                 continue
              # tempdb: stały namespace
              if dep_name.startswith('tempdb..#'):
                  namespace = "mssql://localhost/tempdb"
@@ -182,13 +207,26 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
             if getattr(f, "namespace", None) and getattr(f, "table_name", None)
         }
         if input_pairs:
-            inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(input_pairs)]
+            def _is_noise_name(n: str) -> bool:
+                if not n:
+                    return True
+                if n.startswith('tempdb..#') or n.startswith('#'):
+                    return True
+                if n.startswith('@'):
+                    return True
+                if '+' in n:
+                    return True
+                if n.startswith('[') and n.endswith(']') and '.' not in n:
+                    return True
+                return False
+            filtered = [ (ns2, nm2) for (ns2, nm2) in input_pairs if not _is_noise_name(nm2) ]
+            inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
         else:
             inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
-                      for dep in sorted(obj.dependencies)]
+                      for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)]
     else:
         inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
-                  for dep in sorted(obj.dependencies)]
+                  for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)]
 
     # Build output facets
     facets = {}

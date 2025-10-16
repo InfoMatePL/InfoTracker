@@ -239,6 +239,10 @@ class Engine:
                         # Also register in adapter's parser for lineage generation
                         adapter.parser.schema_registry.register(obj_info.schema)
 
+                    # Skip emitting separate OL events for temp tables; continuity is preserved via inlined lineage
+                    if obj_info.object_type == "temp_table" or (obj_info.schema and str(obj_info.schema.name).startswith('tempdb..#')):
+                        continue
+
                     # Generate OpenLineage directly from resolved ObjectInfo
                     ol_payload = emit_ol_from_object(
                         obj_info,
