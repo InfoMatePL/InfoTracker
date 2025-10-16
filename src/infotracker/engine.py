@@ -358,23 +358,48 @@ class Engine:
 
     def _build_dependency_graph(self, objects: List[ObjectInfo]) -> Dict[str, Set[str]]:
         """Build dependency graph: object_name -> set of dependencies."""
-        dependencies = {}
-        
+        dependencies: Dict[str, Set[str]] = {}
+
+        # Helper: normalize a name to our object key space (schema.table)
+        def _strip_db(name: str) -> str:
+            parts = (name or "").split('.')
+            return '.'.join(parts[-2:]) if len(parts) >= 2 else (name or "")
+
+        def _is_noise(n: str) -> bool:
+            if not n:
+                return True
+            s = n.strip()
+            return s.startswith('#') or s.startswith('@') or ('+' in s) or (s.startswith('[') and s.endswith(']') and '.' not in s)
+
+        # Build case-insensitive key map for objects
+        key_map: Dict[str, str] = {}
+        for obj in objects:
+            k = (obj.schema.name if obj.schema else obj.name)
+            key_map[k.lower()] = k
+
         for obj in objects:
             obj_name = obj.schema.name if obj.schema else obj.name
-            
-            # Use ObjectInfo.dependencies first
-            if obj.dependencies:
-                dependencies[obj_name] = set(obj.dependencies)
-            else:
-                # Fallback to extracting dependencies from lineage.input_fields
-                dependencies[obj_name] = set()
-                for lineage in obj.lineage:
-                    for input_field in lineage.input_fields:
-                        dep_name = input_field.table_name
-                        if dep_name != obj_name:  # Don't depend on self
-                            dependencies[obj_name].add(dep_name)
-        
+            deps: Set[str] = set()
+
+            # Prefer explicit ObjectInfo.dependencies
+            raw_deps = set(obj.dependencies) if obj.dependencies else set()
+            if not raw_deps:
+                # Fallback to lineage input fields
+                for ln in obj.lineage or []:
+                    for f in ln.input_fields or []:
+                        raw_deps.add(f.table_name)
+
+            for d in raw_deps:
+                if _is_noise(d):
+                    continue
+                norm = _strip_db(d).lower()
+                if norm == obj_name.lower():
+                    continue
+                # include only if dependency is among parsed objects
+                if norm in key_map:
+                    deps.add(key_map[norm])
+            dependencies[obj_name] = deps
+
         return dependencies
     
     def _topological_sort(self, dependencies: Dict[str, Set[str]]) -> List[str]:
