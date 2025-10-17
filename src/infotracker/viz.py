@@ -1419,17 +1419,29 @@ document.addEventListener('click', ()=> closeCtx());
 document.addEventListener('keydown', (e)=>{ if (e.key==='Escape'){ closeCtx(); /* keep isolation until explicitly cleared via menu */ } });
 document.getElementById('stage').addEventListener('contextmenu', (e)=>{
   const li = e.target && e.target.closest('li.col-row');
-  if (!li) return;
+  const card = e.target && e.target.closest('article.table-node');
+  if (!li && !card) return;
   e.preventDefault();
-  const key = li.getAttribute('data-key'); if (!key) return;
   const px = e.clientX, py = e.clientY;
-  openCtx(px, py, [
-    { label: 'Show downstream (attribute)', onClick: ()=>{ applyIsolationLayout(key,'down'); } },
-    { label: 'Show upstream (attribute)',   onClick: ()=>{ applyIsolationLayout(key,'up'); } },
-    { label: 'Show both (attribute)',       onClick: ()=>{ applyIsolationLayout(key,'both'); } },
-    'sep',
-    { label: 'Clear filter',                onClick: ()=>{ clearSelection(); drawEdges(); } }
-  ]);
+  if (li){
+    const key = li.getAttribute('data-key'); if (!key) return;
+    openCtx(px, py, [
+      { label: 'Show downstream (attribute)', onClick: ()=>{ applyIsolationLayout(key,'down'); } },
+      { label: 'Show upstream (attribute)',   onClick: ()=>{ applyIsolationLayout(key,'up'); } },
+      { label: 'Show both (attribute)',       onClick: ()=>{ applyIsolationLayout(key,'both'); } },
+      'sep',
+      { label: 'Clear filter',                onClick: ()=>{ clearSelection(); drawEdges(); } }
+    ]);
+  } else if (card){
+    const tid = card.getAttribute('data-id'); if (!tid) return;
+    openCtx(px, py, [
+      { label: 'Show downstream (object)', onClick: ()=>{ applyTableIsolationCollapsed(tid,'down'); } },
+      { label: 'Show upstream (object)',   onClick: ()=>{ applyTableIsolationCollapsed(tid,'up'); } },
+      { label: 'Show both (object)',       onClick: ()=>{ applyTableIsolationCollapsed(tid,'both'); } },
+      'sep',
+      { label: 'Clear filter',             onClick: ()=>{ clearSelection(); drawEdges(); } }
+    ]);
+  }
 });
 
 // ---- Crossing minimization (barycentric) ----
@@ -1600,8 +1612,8 @@ function selectColumnKey(key){
     return;
   }
   clearSelection();
-  SELECTED_COL = key;
-  highlightLineage(key, 'both', ISOLATE);
+  // Use isolation layout by default for attribute click to hide unrelated objects
+  applyIsolationLayout(key, 'both');
 }
 
 function clearSelection(){
@@ -1690,9 +1702,74 @@ function applyIsolationLayout(srcKey, dir){
     return ra - rb;
   });
   TABLES_OVERRIDE = ordered;
-  ISOLATE_ALIGN = true;
+  // Align in a single row only when each rank has ≤ 1 table (prevents overlap)
+  const counts = new Map();
+  subTables.forEach(t=>{ const rv = ranks.get(t.id) || 0; counts.set(rv, (counts.get(rv)||0) + 1); });
+  const canAlign = Array.from(counts.values()).every(c=> c <= 1);
+  ISOLATE_ALIGN = !!canAlign;
   // 4) Apply UI highlight and re-layout
   highlightLineage(srcKey, ISOLATE_DIR, true);
+  layoutTables();
+  drawEdges();
+}
+
+// Object-level isolate in collapsed mode: auto-enable collapsed view and layout only lineage tables
+function applyTableIsolationCollapsed(tableId, dir){
+  // Force collapsed view and persist preference
+  COLLAPSE = true;
+  try{ localStorage.setItem(COLLAPSE_KEY, '1'); }catch(_){ }
+  try{ updateCollapseButton(); }catch(_){ }
+  // Mark isolation active; no column selection in collapsed mode
+  ISOLATE = true; ISOLATE_DIR = dir || 'both'; SELECTED_COL = null;
+  // Build table-level adjacency
+  const out = new Map();
+  const inn = new Map();
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    if (s.tableId === t.tableId) return;
+    if (!out.has(s.tableId)) out.set(s.tableId, new Set());
+    if (!inn.has(t.tableId)) inn.set(t.tableId, new Set());
+    out.get(s.tableId).add(t.tableId);
+    inn.get(t.tableId).add(s.tableId);
+  });
+  // BFS from the selected table, respecting configured depth (0 => unlimited)
+  const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
+  const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw;
+  const base = new Set([tableId]);
+  const active = new Set([tableId]);
+  if (ISOLATE_DIR === 'down' || ISOLATE_DIR === 'both'){
+    let depth = 0, frontier = new Set(base), seen = new Set(base);
+    while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
+      const next = new Set();
+      frontier.forEach(u=>{
+        const ns = out.get(u) || new Set();
+        ns.forEach(v=>{ if (!seen.has(v)){ seen.add(v); active.add(v); next.add(v); } });
+      });
+      frontier = next; depth++;
+    }
+  }
+  if (ISOLATE_DIR === 'up' || ISOLATE_DIR === 'both'){
+    let depth = 0, frontier = new Set(base), seen = new Set(base);
+    while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
+      const next = new Set();
+      frontier.forEach(u=>{
+        const ps = inn.get(u) || new Set();
+        ps.forEach(v=>{ if (!seen.has(v)){ seen.add(v); active.add(v); next.add(v); } });
+      });
+      frontier = next; depth++;
+    }
+  }
+  // Restrict rendering to active tables only
+  const subTables = ALL_TABLES.filter(t=> active.has(t.id));
+  const g = buildGraph(subTables);
+  const ranks = ranksFromGraph(g);
+  const ordered = [...subTables].sort((a,b)=>{
+    const ra = ranks.get(a.id) || 0, rb = ranks.get(b.id) || 0;
+    if (ra === rb) return (a.id||'').localeCompare(b.id||'');
+    return ra - rb;
+  });
+  TABLES_OVERRIDE = ordered;
+  ISOLATE_ALIGN = false;
   layoutTables();
   drawEdges();
 }
