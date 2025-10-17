@@ -386,6 +386,8 @@ function __deriveTablesFromEdges(){
 }
 const ALL_TABLES = (Array.isArray(__ALL_TABLES_RAW__) && __ALL_TABLES_RAW__.length) ? __ALL_TABLES_RAW__ : __deriveTablesFromEdges();
 let TABLES = []; // visible tables: selected + neighbors
+// Optional override for isolate view: when set, layout/render uses only these tables
+let TABLES_OVERRIDE = null; // Array of table objects
 const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 const SIDEBAR_KEY = 'infotracker.sidebar';
 const SIDEBAR_W_KEY = 'infotracker.sidebar.width';
@@ -411,6 +413,7 @@ let SELECTED_COL = null;
 let ISOLATE = false;      // whether isolate-view is on
 let ISOLATE_DIR = 'both'; // 'up' | 'down' | 'both'
 let ISOLATE_SRC = null;   // source column key
+let ISOLATE_ALIGN = false; // align isolate tables in a single row
 // Search hit globals
 let URI_BY_COL = null; // Map colKey -> example URI (from edges)
 
@@ -517,8 +520,8 @@ function parseUri(u){
 }
 
 // Build table graph by table ids
-function buildGraph(){
-  const ids = new Set(TABLES.map(t=>t.id));
+function buildGraph(tablesOverride){
+  const ids = new Set((tablesOverride || TABLES).map(t=>t.id));
   const adj = new Map([...ids].map(id=>[id,new Set()]));
   const indeg = new Map([...ids].map(id=>[id,0]));
   const pred = new Map([...ids].map(id=>[id,new Set()]));
@@ -558,7 +561,8 @@ function layoutTables(){
   // Clear only stage content (wires SVG stays a sibling under #viewport)
   stage.innerHTML = '';
   
-  if (!TABLES || !TABLES.length){
+  const tables = (TABLES_OVERRIDE && TABLES_OVERRIDE.length) ? TABLES_OVERRIDE : TABLES;
+  if (!tables || !tables.length){
     const info = document.createElement('div'); info.className='empty'; info.textContent = 'No tables selected. Use the left panel to choose tables.';
     stage.appendChild(info);
     // also clear wires
@@ -568,7 +572,7 @@ function layoutTables(){
   }
   // compute edge colors once per layout
   buildEdgeColors();
-  const graph = buildGraph();
+  const graph = buildGraph(tables);
   const r = ranksFromGraph(graph);
   const layers = new Map(); r.forEach((rv,id)=>{ if(!layers.has(rv)) layers.set(rv,[]); layers.get(rv).push(id); });
   // crossing minimization: barycentric forward/backward passes
@@ -576,7 +580,7 @@ function layoutTables(){
 
   // Build DOM cards
   const cardById = new Map();
-  TABLES.forEach(t=>{
+  tables.forEach(t=>{
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
     if (NEIGHBOR_IDS && NEIGHBOR_IDS.has(t.id)) art.classList.add('neighbor');
     if (COLLAPSE) art.classList.add('collapsed');
@@ -687,6 +691,17 @@ function layoutTables(){
     });
   }
 
+  // If isolate alignment requested: align all cards in a single horizontal row (same Y)
+  if (ISOLATE && ISOLATE_ALIGN){
+    const y = baseTop;
+    maxBottom = 0;
+    cardById.forEach((card)=>{
+      card.style.top = `${y}px`;
+      const bottomY = y + card.offsetHeight;
+      if (bottomY > maxBottom) maxBottom = bottomY;
+    });
+  }
+
   // Expand stage and SVG to content bounds
   const stageRectW = Math.ceil(maxRight + LEFT);
   const stageRectH = Math.ceil(maxBottom + TOP);
@@ -702,8 +717,8 @@ function layoutTables(){
   stage.onclick = onStageClick;
   stage.onkeydown = onStageKeyDown;
 
-  // Reset selection state when the visible set changes
-  SELECTED_COL = null;
+  // Reset selection state when the visible set changes, but keep selection in isolate mode
+  if (!ISOLATE){ SELECTED_COL = null; }
 
   // auto-fit on first successful layout so users see content immediately
   if (!FIRST_FIT_DONE && TABLES && TABLES.length){
@@ -1306,9 +1321,9 @@ document.getElementById('stage').addEventListener('contextmenu', (e)=>{
   const key = li.getAttribute('data-key'); if (!key) return;
   const px = e.clientX, py = e.clientY;
   openCtx(px, py, [
-    { label: 'Show downstream (attribute)', onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='down'; ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'down',true); drawEdges(); } },
-    { label: 'Show upstream (attribute)',   onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='up';   ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'up',true);   drawEdges(); } },
-    { label: 'Show both (attribute)',       onClick: ()=>{ ISOLATE=true; ISOLATE_DIR='both'; ISOLATE_SRC=key; SELECTED_COL=key; highlightLineage(key,'both',true); drawEdges(); } },
+    { label: 'Show downstream (attribute)', onClick: ()=>{ applyIsolationLayout(key,'down'); } },
+    { label: 'Show upstream (attribute)',   onClick: ()=>{ applyIsolationLayout(key,'up'); } },
+    { label: 'Show both (attribute)',       onClick: ()=>{ applyIsolationLayout(key,'both'); } },
     'sep',
     { label: 'Clear filter',                onClick: ()=>{ clearSelection(); drawEdges(); } }
   ]);
@@ -1488,10 +1503,13 @@ function selectColumnKey(key){
 function clearSelection(){
   SELECTED_COL = null;
   ISOLATE = false; ISOLATE_DIR = 'both'; ISOLATE_SRC = null;
+  ISOLATE_ALIGN = false; TABLES_OVERRIDE = null;
   // remove classes
   document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
     el.classList.remove('dim','active','selected','hidden');
   });
+  // restore full layout according to current selection
+  layoutTables();
 }
 
 function highlightLineage(srcKey, dir='both', isolate=false){
@@ -1524,6 +1542,55 @@ function highlightLineage(srcKey, dir='both', isolate=false){
     }
   }
   applyHighlight(srcKey, activeCols, activeEdges, isolate);
+}
+
+// Compute active tables from a column key and direction, then set override and re-layout
+function applyIsolationLayout(srcKey, dir){
+  ISOLATE = true; ISOLATE_DIR = dir || 'both'; ISOLATE_SRC = srcKey; SELECTED_COL = srcKey;
+  // Ensure column graph maps exist
+  if (!COL_OUT || !COL_IN || !ROW_BY_COL){ try { buildColGraph(); } catch(_){} }
+  // 1) Compute active columns via BFS like highlightLineage
+  const colSet = new Set();
+  if (ISOLATE_DIR==='down' || ISOLATE_DIR==='both'){
+    const q1 = [srcKey]; const seen1 = new Set([srcKey]);
+    while(q1.length){
+      const u = q1.shift(); colSet.add(u);
+      const outs = COL_OUT.get(u) || [];
+      outs.forEach(e=>{
+        const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
+        if (!seen1.has(v)){ seen1.add(v); q1.push(v); }
+      });
+    }
+  }
+  if (ISOLATE_DIR==='up' || ISOLATE_DIR==='both'){
+    const q2 = [srcKey]; const seen2 = new Set([srcKey]);
+    while(q2.length){
+      const u = q2.shift(); colSet.add(u);
+      const ins = COL_IN.get(u) || [];
+      ins.forEach(e=>{
+        const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
+        if (!seen2.has(v)){ seen2.add(v); q2.push(v); }
+      });
+    }
+  }
+  // 2) Derive active table ids
+  const activeIds = new Set();
+  colSet.forEach(k=>{ const p = k.lastIndexOf('.'); if (p>0) activeIds.add(k.slice(0,p)); });
+  // 3) Build ordered list using table graph restricted to active ids
+  const subTables = ALL_TABLES.filter(t=> activeIds.has(t.id));
+  const g = buildGraph(subTables);
+  const ranks = ranksFromGraph(g);
+  const ordered = [...subTables].sort((a,b)=>{
+    const ra = ranks.get(a.id) || 0, rb = ranks.get(b.id) || 0;
+    if (ra === rb) return (a.id||'').localeCompare(b.id||'');
+    return ra - rb;
+  });
+  TABLES_OVERRIDE = ordered;
+  ISOLATE_ALIGN = true;
+  // 4) Apply UI highlight and re-layout
+  highlightLineage(srcKey, ISOLATE_DIR, true);
+  layoutTables();
+  drawEdges();
 }
 
 function applyHighlight(srcKey, colSet, edgeSet, isolate=false){
