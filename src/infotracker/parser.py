@@ -3236,8 +3236,16 @@ class SqlParser:
         """Parse CREATE PROCEDURE using string-based approach."""
         # Znormalizuj nagłówki SET/GO, COLLATE itd.
         sql_content = self._normalize_tsql(sql_content)
+        # Ustal kontekst bazy z USE na początku pliku (ważne przy dwu-członowych nazwach)
+        try:
+            db_from_use = self._extract_database_from_use_statement(sql_content)
+            if db_from_use:
+                self.current_database = db_from_use
+        except Exception:
+            pass
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
-        inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content)
+        # Preferuj bazę z USE; w razie braku spróbuj wywnioskować z treści, a na końcu default
+        inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content) or self.current_database
         namespace = f"mssql://localhost/{inferred_db or self.default_database or 'InfoTrackerDW'}"
 
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
