@@ -1391,8 +1391,9 @@ function makeDraggable(card){
 
 window.addEventListener('mousemove', (e)=>{
   if (!drag) return;
-  const dx = e.clientX - drag.startX;
-  const dy = e.clientY - drag.startY;
+  // Convert pointer delta (screen px) to world units by dividing by SCALE
+  const dx = (e.clientX - drag.startX) / SCALE;
+  const dy = (e.clientY - drag.startY) / SCALE;
   const nl = drag.left + dx;
   const nt = drag.top + dy;
   drag.el.style.left = nl + 'px';
