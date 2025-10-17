@@ -584,12 +584,16 @@ function layoutTables(){
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
     if (NEIGHBOR_IDS && NEIGHBOR_IDS.has(t.id)) art.classList.add('neighbor');
     if (COLLAPSE) art.classList.add('collapsed');
+    // Prepare a display-friendly full name without scheme (e.g., "EDW_CORE.dbo.table")
+    const fullClean = (t.full||'').replace(/^mssql:\/\/[^/]+\/?/, '');
     // Attach searchable metadata
     art.setAttribute('data-id', (t.id||'').toLowerCase());
-    art.setAttribute('data-full', (t.full||'').toLowerCase());
+    art.setAttribute('data-full', (fullClean||'').toLowerCase());
     art.setAttribute('data-label', (t.label||'').toLowerCase());
-    const h = document.createElement('header'); h.title = t.full || t.label;
-    const title = document.createElement('span'); title.className='title'; title.textContent = t.label; h.appendChild(title);
+    const h = document.createElement('header'); h.title = fullClean || t.full || t.label;
+    const title = document.createElement('span'); title.className='title';
+    // Show full name including database and schema in the card header
+    title.textContent = fullClean || t.label; h.appendChild(title);
     const isSel = VISIBLE_IDS && VISIBLE_IDS.has && VISIBLE_IDS.has(t.id);
     if (isSel) art.classList.add('selected');
     const btn = document.createElement('button'); btn.className='sel-btn'; btn.type='button'; btn.textContent = isSel ? '−' : '+'; btn.title = isSel ? 'Unselect' : 'Select'; btn.dataset.tid = t.id;
@@ -957,8 +961,10 @@ function buildSidebar(){
       if (TABLES.length && !FIRST_FIT_DONE){ try{ fitToContent(); }catch(_){} }
       else { drawEdges(); }
     });
-  const name = document.createElement('span'); name.className = 'item-label'; name.textContent = t.label || t.full || t.id;
-    name.title = t.full || t.id;
+  const name = document.createElement('span'); name.className = 'item-label';
+    const fullClean = (t.full||'').replace(/^mssql:\/\/[^/]+\/?/, '');
+    name.textContent = fullClean || t.label || t.full || t.id;
+    name.title = fullClean || t.full || t.id;
     row.appendChild(cb); row.appendChild(name);
     list.appendChild(row);
   });
