@@ -851,22 +851,36 @@ function computeRenderSets(){
     const dir = (CONFIG && CONFIG.direction) ? String(CONFIG.direction).toLowerCase() : 'both';
     const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
     const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw; // 0 => unlimited
-    let depth = 0;
-    let frontier = new Set(base);
+
+    // Straight-line traversal: expand upstream and downstream independently.
     const seen = new Set(base);
-    while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
-      const next = new Set();
-      frontier.forEach(u=>{
-        if (dir === 'down' || dir === 'both'){
+
+    // Downstream chain
+    if (dir === 'down' || dir === 'both'){
+      let depth = 0;
+      let frontier = new Set(base);
+      while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
+        const next = new Set();
+        frontier.forEach(u=>{
           const ns = out.get(u) || new Set();
           ns.forEach(v=>{ if (!seen.has(v)){ seen.add(v); neighbors.add(v); next.add(v); } });
-        }
-        if (dir === 'up' || dir === 'both'){
+        });
+        frontier = next; depth++;
+      }
+    }
+
+    // Upstream chain
+    if (dir === 'up' || dir === 'both'){
+      let depth = 0;
+      let frontier = new Set(base);
+      while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
+        const next = new Set();
+        frontier.forEach(u=>{
           const ps = inn.get(u) || new Set();
           ps.forEach(v=>{ if (!seen.has(v)){ seen.add(v); neighbors.add(v); next.add(v); } });
-        }
-      });
-      frontier = next; depth++;
+        });
+        frontier = next; depth++;
+      }
     }
   }
   NEIGHBOR_IDS = neighbors;
