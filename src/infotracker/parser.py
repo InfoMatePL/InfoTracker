@@ -35,35 +35,51 @@ def _cached_split_fqn_core(fqn: str):
     return None, "dbo", (parts[0] if parts else None)
 
 def _rewrite_case_with_commas_to_iif(sql: str) -> str:
-    """Rewrite non-standard 'CASE WHEN cond, true, false' to IIF(cond, true, false)."""
+    """Rewrite only the non-standard "CASE WHEN cond, true, false END" form to IIF(cond, true, false).
+
+    Safety: do NOT touch standard CASE WHEN ... THEN ... [WHEN ... THEN ...] END blocks.
+    """
+    if not sql:
+        return sql
+
+    # Helper: perform a safe replacement only if the matched CASE ... END block does not contain THEN
+    def _safe_repl(m: re.Match) -> str:
+        whole = m.group(0) or ""
+        # If the block already contains THEN, it's a standard CASE - skip rewrite
+        if re.search(r"(?i)\bTHEN\b", whole):
+            return whole
+        cond = (m.group("cond") or "").strip()
+        t = (m.group("t") or "").strip()
+        f = (m.group("f") or "").strip()
+        return f"IIF({cond}, {t}, {f})"
+
+    # Variant that ends with a closing parenthesis (embedded in another call)
     pat_paren = re.compile(
         r"""
-        CASE\s+WHEN
-        \s+(?P<cond>[^,()]+(?:\([^)]*\)[^,()]*)*)
-        \s*,\s*(?P<t>[^,()]+(?:\([^)]*\)[^,()]*)*)
-        \s*,\s*(?P<f>[^)]+?)
-        \s*\)
+        (?is)
+        CASE\s+WHEN\s+
+        (?P<cond>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
+        (?P<t>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
+        (?P<f>[^)]+?)\s*\)
         """,
-        re.IGNORECASE | re.VERBOSE | re.DOTALL,
+        re.VERBOSE,
     )
+
+    # Variant that ends with END
     pat_end = re.compile(
         r"""
-        CASE\s+WHEN
-        \s+(?P<cond>[^,END]+?)
-        \s*,\s*(?P<t>[^,END]+?)
-        \s*,\s*(?P<f>[^END]+?)
-        \s*END
+        (?is)
+        CASE\s+WHEN\s+
+        (?P<cond>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
+        (?P<t>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
+        (?P<f>[^)]+?)\s*END
         """,
-        re.IGNORECASE | re.VERBOSE | re.DOTALL,
+        re.VERBOSE,
     )
-    def _repl(m: re.Match) -> str:
-        cond = (m.group('cond') or '').strip()
-        t = (m.group('t') or '').strip()
-        f = (m.group('f') or '').strip()
-        return f"IIF({cond}, {t}, {f})"
-    sql2 = pat_paren.sub(_repl, sql or "")
-    sql3 = pat_end.sub(_repl, sql2)
-    return sql3
+
+    out = pat_paren.sub(_safe_repl, sql)
+    out = pat_end.sub(_safe_repl, out)
+    return out
 
 def _strip_udf_options_between_returns_and_as(sql: str) -> str:
     """Strip UDF options between RETURNS ... and AS.

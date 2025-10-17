@@ -69,6 +69,11 @@ class Engine:
         """
         self.config = config
         self._column_graph: Optional[ColumnGraph] = None
+        # Emit minimal OL events for external inputs so they appear in viz
+        try:
+            self._emit_external_sources = bool(getattr(config, 'emit_external_sources', True))
+        except Exception:
+            self._emit_external_sources = True
 
     # ------------------ EXTRACT ------------------
 
@@ -258,6 +263,40 @@ class Engine:
                     )
 
                     outputs.append([str(sql_path), str(target)])
+
+                    # Optionally emit minimal source dataset events for inputs that do not have their own outputs
+                    if self._emit_external_sources:
+                        try:
+                            inputs = ol_payload.get('inputs') or []
+                            if inputs:
+                                src_dir = out_dir / "sources"
+                                src_dir.mkdir(parents=True, exist_ok=True)
+                                for inp in inputs:
+                                    ns_in = inp.get('namespace')
+                                    nm_in = inp.get('name')
+                                    if not nm_in:
+                                        continue
+                                    # Skip temp / variables
+                                    s = str(nm_in)
+                                    if s.startswith('#') or s.startswith('@'):
+                                        continue
+                                    # filename-safe
+                                    safe = s.replace('/', '_').replace('\\', '_').replace(':', '_')
+                                    src_path = src_dir / f"src_{safe}.json"
+                                    if src_path.exists():
+                                        continue
+                                    # Minimal OL event for source dataset
+                                    src_event = {
+                                        "eventType": "COMPLETE",
+                                        "eventTime": datetime.now().isoformat()[:19] + "Z",
+                                        "run": {"runId": "00000000-0000-0000-0000-000000000000"},
+                                        "job": {"namespace": "infotracker/sources", "name": f"source/{s}"},
+                                        "inputs": [],
+                                        "outputs": [{"namespace": ns_in or adapter.parser.schema_registry.get(None, None) or "mssql://localhost/InfoTrackerDW", "name": s, "facets": {}}],
+                                    }
+                                    src_path.write_text(json.dumps(src_event, indent=2, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+                        except Exception:
+                            pass
 
                     # Check for warnings with enhanced diagnostics
                     out0 = (ol_payload.get("outputs") or [])
