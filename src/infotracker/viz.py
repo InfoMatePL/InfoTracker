@@ -247,6 +247,17 @@ HTML_TMPL = """<!doctype html>
     #sidebar::-webkit-scrollbar{ width:10px }
     #sidebar::-webkit-scrollbar-thumb{ background: #cbd5e1; border-radius:10px }
     #sidebar::-webkit-scrollbar-track{ background: transparent }
+  /* Tree view for DB ➜ schema ➜ tables */
+  #sidebar .tree-db, #sidebar .tree-schema{ margin:4px 8px; }
+  #sidebar .tree-head{ display:flex; align-items:center; gap:8px; padding:6px 10px; border-radius:8px; cursor:pointer; user-select:none; color: var(--text); }
+  #sidebar .tree-head:hover{ background: rgba(148,163,184,0.14) }
+  #sidebar .tree-head.db{ font-weight:800; text-transform:uppercase; letter-spacing:.04em; font-size:12px; color: var(--text) }
+  #sidebar .tree-head.schema{ font-weight:700; font-size:12px; color: var(--text) }
+  #sidebar .tree-toggle{ width:14px; text-align:center; opacity:.85; font-size:12px }
+  #sidebar .tree-body{ margin-left:16px; }
+  #sidebar .collapsed > .tree-body{ display:none }
+  /* Improve item label readability */
+  #sidebar .tbl-item .item-label{ color: var(--text); }
   #viewport{position:relative; flex:1 1 auto; min-height:0; overflow:auto}
   #stage{position:relative; min-width:100%; min-height:100%; transform-origin: 0 0;}
   svg.wires{position:absolute; inset:0; pointer-events:none; width:100%; height:100%; z-index:20}
@@ -393,6 +404,9 @@ const SIDEBAR_KEY = 'infotracker.sidebar';
 const SIDEBAR_W_KEY = 'infotracker.sidebar.width';
 const COLLAPSE_KEY = 'infotracker.collapse';
 let COLLAPSE = false;
+// Tree state keys
+const TREE_DB_KEY = 'infotracker.tree.db';
+const TREE_SCHEMA_KEY = 'infotracker.tree.schema';
 
 // Helpers
 const ROW_H = 30, GUTTER_Y = 16, GUTTER_X = 260, LEFT = 60, TOP = 60;
@@ -945,28 +959,111 @@ function buildSidebar(){
     list.appendChild(empty);
     return;
   }
+  // Load persisted collapse states
+  let dbCollapsed = {};
+  let schemaCollapsed = {};
+  try{ dbCollapsed = JSON.parse(localStorage.getItem(TREE_DB_KEY)||'{}') || {}; }catch(_){ dbCollapsed = {}; }
+  try{ schemaCollapsed = JSON.parse(localStorage.getItem(TREE_SCHEMA_KEY)||'{}') || {}; }catch(_){ schemaCollapsed = {}; }
+
+  // Helper to parse full name into db/schema/table
+  function splitFull(full){
+    const clean = (full||'').replace(/^mssql:\/\/[^\/]+\/?/, '');
+    const parts = clean.split('.');
+    const db = parts[0] || '';
+    const schema = parts[1] || '';
+    const table = parts.slice(2).join('.') || '';
+    return { db, schema, table, clean };
+  }
+
+  // Group items by DB -> schema
+  const byDb = new Map();
   items.forEach(t=>{
-    const id = 'chk-' + t.id;
-    const row = document.createElement('label');
-    row.className = 'tbl-item';
-    const cb = document.createElement('input'); cb.type='checkbox'; cb.id=id; cb.dataset.tid = t.id;
-    cb.checked = VISIBLE_IDS.has(t.id);
-    cb.addEventListener('change', (e)=>{
-      const tid = e.currentTarget.dataset.tid;
-      if (e.currentTarget.checked){ VISIBLE_IDS.add(tid); }
-      else { VISIBLE_IDS.delete(tid); }
-      computeRenderSets();
-      layoutTables();
-      // Auto-fit once content appears for the first time
-      if (TABLES.length && !FIRST_FIT_DONE){ try{ fitToContent(); }catch(_){} }
-      else { drawEdges(); }
+    const {db, schema} = splitFull(t.full||'');
+    if (!byDb.has(db)) byDb.set(db, new Map());
+    const bySchema = byDb.get(db);
+    const arr = bySchema.get(schema) || [];
+    arr.push(t);
+    bySchema.set(schema, arr);
+  });
+
+  const filteredMode = !!FILTER_TEXT;
+  // Render DB groups
+  [...byDb.keys()].sort((a,b)=> (a||'').localeCompare(b||'')).forEach(db=>{
+    const dbWrap = document.createElement('div'); dbWrap.className = 'tree-db';
+    const head = document.createElement('div'); head.className = 'tree-head db';
+    const arrow = document.createElement('span'); arrow.className = 'tree-toggle';
+    const body = document.createElement('div'); body.className = 'tree-body';
+    const hasDbState = Object.prototype.hasOwnProperty.call(dbCollapsed, db);
+    const isCollapsed = filteredMode ? false : (hasDbState ? !!dbCollapsed[db] : true);
+    if (isCollapsed) dbWrap.classList.add('collapsed');
+    arrow.textContent = isCollapsed ? '▶' : '▼';
+    const label = document.createElement('span'); label.textContent = db || '(unknown)';
+    head.appendChild(arrow); head.appendChild(label);
+    head.addEventListener('click', ()=>{
+      const newState = !dbWrap.classList.contains('collapsed');
+      dbWrap.classList.toggle('collapsed');
+      arrow.textContent = dbWrap.classList.contains('collapsed') ? '▶' : '▼';
+      dbCollapsed[db] = dbWrap.classList.contains('collapsed') ? 1 : 0;
+      try{ localStorage.setItem(TREE_DB_KEY, JSON.stringify(dbCollapsed)); }catch(_){ }
     });
-  const name = document.createElement('span'); name.className = 'item-label';
-    const fullClean = (t.full||'').replace(/^mssql:\/\/[^/]+\/?/, '');
-    name.textContent = fullClean || t.label || t.full || t.id;
-    name.title = fullClean || t.full || t.id;
-    row.appendChild(cb); row.appendChild(name);
-    list.appendChild(row);
+    dbWrap.appendChild(head);
+
+    // Render schema groups within DB
+    const bySchema = byDb.get(db);
+    [...bySchema.keys()].sort((a,b)=> (a||'').localeCompare(b||'')).forEach(schema=>{
+      const schWrap = document.createElement('div'); schWrap.className = 'tree-schema';
+      const schHead = document.createElement('div'); schHead.className = 'tree-head schema';
+      const schArrow = document.createElement('span'); schArrow.className = 'tree-toggle';
+      const schBody = document.createElement('div'); schBody.className = 'tree-body';
+      const key = db + '|' + schema;
+      const hasSchState = Object.prototype.hasOwnProperty.call(schemaCollapsed, key);
+      const schCollapsed = filteredMode ? false : (hasSchState ? !!schemaCollapsed[key] : true);
+      if (schCollapsed) schWrap.classList.add('collapsed');
+      schArrow.textContent = schCollapsed ? '▶' : '▼';
+      const schLabel = document.createElement('span'); schLabel.textContent = schema || '(schema)';
+      schHead.appendChild(schArrow); schHead.appendChild(schLabel);
+      schHead.addEventListener('click', ()=>{
+        schWrap.classList.toggle('collapsed');
+        schArrow.textContent = schWrap.classList.contains('collapsed') ? '▶' : '▼';
+        schemaCollapsed[key] = schWrap.classList.contains('collapsed') ? 1 : 0;
+        try{ localStorage.setItem(TREE_SCHEMA_KEY, JSON.stringify(schemaCollapsed)); }catch(_){ }
+      });
+      schWrap.appendChild(schHead);
+
+      // Tables list under schema
+      const tables = bySchema.get(schema) || [];
+      tables.sort((a,b)=>{
+        const {table: ta} = splitFull(a.full||'');
+        const {table: tb} = splitFull(b.full||'');
+        return (ta||'').toLowerCase().localeCompare((tb||'').toLowerCase());
+      }).forEach(t=>{
+        const id = 'chk-' + t.id;
+        const row = document.createElement('label'); row.className = 'tbl-item';
+        const cb = document.createElement('input'); cb.type='checkbox'; cb.id=id; cb.dataset.tid = t.id;
+        cb.checked = VISIBLE_IDS.has(t.id);
+        cb.addEventListener('change', (e)=>{
+          const tid = e.currentTarget.dataset.tid;
+          if (e.currentTarget.checked){ VISIBLE_IDS.add(tid); }
+          else { VISIBLE_IDS.delete(tid); }
+          computeRenderSets();
+          layoutTables();
+          if (TABLES.length && !FIRST_FIT_DONE){ try{ fitToContent(); }catch(_){} }
+          else { drawEdges(); }
+        });
+        const name = document.createElement('span'); name.className = 'item-label';
+        const parts = splitFull(t.full||'');
+        name.textContent = parts.table || t.label || t.id;
+        name.title = (parts.clean || t.full || t.id);
+        row.appendChild(cb); row.appendChild(name);
+        schBody.appendChild(row);
+      });
+
+      schWrap.appendChild(schBody);
+      body.appendChild(schWrap);
+    });
+
+    dbWrap.appendChild(body);
+    list.appendChild(dbWrap);
   });
 }
 
