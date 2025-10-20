@@ -282,7 +282,10 @@ HTML_TMPL = """<!doctype html>
   .table-node header .sel-btn:hover{ background:rgba(255,255,255,.25) }
   .table-node.selected{ box-shadow: 0 0 0 2px rgba(99,102,241,.35), 0 6px 18px rgba(0,0,0,.12) }
   .table-node ul{list-style:none; margin:0; padding:6px 10px 10px}
-  .table-node.collapsed ul{ display:none }
+  /* Collapsed cards: hide all rows by default, but allow selected/active rows to show */
+  .table-node.collapsed ul{ padding:6px 10px 10px }
+  .table-node.collapsed li{ display:none }
+  .table-node.collapsed li.selected, .table-node.collapsed li.active{ display:flex }
   .table-node li{display:flex; align-items:center; justify-content:center; gap:8px; margin:4px 0; padding:6px 8px; background:var(--row); border:1px solid var(--row-border); border-radius:8px; white-space:nowrap; font-size:13px}
   .table-node li.alt{ background:var(--row-alt) }
   .table-node li.col-row{ cursor: pointer; }
@@ -423,11 +426,21 @@ let COL_IN = null;  // Map colKey -> Array<edge>
 let ROW_BY_COL = new Map(); // colKey -> <li>
 let PATH_BY_EDGE = new Map(); // edgeKey -> <path>
 let SELECTED_COL = null;
+let SELECTED_KEYS = new Set(); // multi-select: attribute keys
+// Multi-source highlight state for redraw
+let HL_KEYS = null; // Array or Set of keys
+let HL_DIR = 'both';
+let HL_ISOLATE = false;
 // Isolation mode (context menu)
 let ISOLATE = false;      // whether isolate-view is on
 let ISOLATE_DIR = 'both'; // 'up' | 'down' | 'both'
 let ISOLATE_SRC = null;   // source column key
 let ISOLATE_ALIGN = false; // align isolate tables in a single row
+// Collapsed object-isolation seeds (union across multiple chosen objects)
+let OBJ_COLLAPSE_SEEDS = new Set();
+let OBJ_COLLAPSE_DIR = 'both';
+// In collapsed view, draw attribute-level edges instead of table aggregates
+let COLLAPSE_ATTR_EDGES = false;
 // Search hit globals
 let URI_BY_COL = null; // Map colKey -> example URI (from edges)
 
@@ -642,8 +655,13 @@ function layoutTables(){
     makeDraggable(art);
   });
   // Do not move the wires SVG; it remains a sibling of #stage
-  // Rows exist now -> (re)build column graph and mark rows clickable (only when expanded)
-  if (!COLLAPSE){ try { buildColGraph(); } catch(_) {} }
+  // Rows exist now -> (re)build column graph and mark rows clickable
+  // Build even in collapsed mode so we can reapply selected-row styling
+  try { buildColGraph(); } catch(_) {}
+  // Reapply row selection styling after rebuild
+  if (SELECTED_KEYS && SELECTED_KEYS.size){
+    try{ SELECTED_KEYS.forEach(k=>{ const li = ROW_BY_COL.get(k); if (li) li.classList.add('selected'); }); }catch(_){ }
+  }
   // Sizes
   const maxWidth = Math.max(240, ...[...cardById.values()].map(el=>{
     const w = Math.max(el.querySelector('header').offsetWidth, ...Array.from(el.querySelectorAll('li span:nth-child(2)')).map(s=>s.offsetWidth+60));
@@ -787,14 +805,15 @@ function drawEdges(){
   ensureColorMarkers();
 
   PATH_BY_EDGE.clear();
-  // Collapsed mode: draw aggregated table->table edges
+  // Collapsed mode: either draw aggregated edges or attribute-level edges
   if (COLLAPSE){
-    drawEdgesCollapsed();
+    if (COLLAPSE_ATTR_EDGES) drawEdgesAttrCollapsed(); else drawEdgesCollapsed();
     return;
   }
   const selectedIds = new Set(VISIBLE_IDS);
   const neighborIds = new Set(NEIGHBOR_IDS);
-  const visibleIds = new Set(TABLES.map(t=>t.id));
+  const effective = (TABLES_OVERRIDE && TABLES_OVERRIDE.length) ? TABLES_OVERRIDE : TABLES;
+  const visibleIds = new Set(effective.map(t=>t.id));
   EDGES.forEach(e=>{
     const s = parseUri(e.from), t = parseUri(e.to);
     if (!visibleIds.has(s.tableId) || !visibleIds.has(t.tableId)) return;
@@ -828,15 +847,18 @@ function drawEdges(){
     svg.appendChild(p);
     PATH_BY_EDGE.set(ek, p);
   });
-  // Reapply highlight if a column is selected (scroll/resize triggers redraw)
+  // Reapply highlight if selection highlight is active (scroll/resize triggers redraw)
   if (SELECTED_COL){
     try { highlightLineage(SELECTED_COL, ISOLATE_DIR || 'both', ISOLATE || false); } catch(_) {}
+  } else if (HL_KEYS && ((Array.isArray(HL_KEYS) && HL_KEYS.length) || (HL_KEYS.size && HL_KEYS.size>0))){
+    try { highlightLineageMultiple(HL_KEYS, HL_DIR || 'both', HL_ISOLATE || false); } catch(_) {}
   }
 }
 
 function drawEdgesCollapsed(){
   const svg = document.getElementById('wires');
-  const visibleIds = new Set(TABLES.map(t=>t.id));
+  const effective = (TABLES_OVERRIDE && TABLES_OVERRIDE.length) ? TABLES_OVERRIDE : TABLES;
+  const visibleIds = new Set(effective.map(t=>t.id));
   const neighborIds = new Set(NEIGHBOR_IDS);
   const selectedIds = new Set(VISIBLE_IDS);
   const pairs = new Set();
@@ -865,6 +887,55 @@ function drawEdgesCollapsed(){
   });
 }
 
+// In collapsed layout, draw per-attribute edges only for active/selected rows
+function drawEdgesAttrCollapsed(){
+  const svg = document.getElementById('wires');
+  // clear old
+  while(svg.lastChild && svg.lastChild.tagName !== 'defs') svg.removeChild(svg.lastChild);
+  ensureColorMarkers();
+  PATH_BY_EDGE.clear();
+
+  const effective = (TABLES_OVERRIDE && TABLES_OVERRIDE.length) ? TABLES_OVERRIDE : TABLES;
+  const visibleIds = new Set(effective.map(t=>t.id));
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    if (!visibleIds.has(s.tableId) || !visibleIds.has(t.tableId)) return;
+    const sKey = (s.tableId + '.' + s.col).toLowerCase();
+    const tKey = (t.tableId + '.' + t.col).toLowerCase();
+    // Only draw if both endpoints are active/selected (and therefore visible in collapsed)
+    const sRow = document.querySelector(`li.col-row[data-key="${sKey}"]`);
+    const tRow = document.querySelector(`li.col-row[data-key="${tKey}"]`);
+    if (!sRow || !tRow) return;
+    const sOk = sRow.classList.contains('active') || sRow.classList.contains('selected');
+    const tOk = tRow.classList.contains('active') || tRow.classList.contains('selected');
+    if (!sOk || !tOk) return;
+    const sp = sRow.querySelector(`.port.right[data-key="${sKey}"]`);
+    const tp = tRow.querySelector(`.port.left[data-key="${tKey}"]`);
+    if(!sp || !tp) return;
+    const a = centerOf(sp); const b = centerOf(tp);
+    const dx = Math.max(120, Math.abs(b.x - a.x)/2);
+    const d = `M ${a.x} ${a.y} C ${a.x+dx} ${a.y}, ${b.x-dx} ${b.y}, ${b.x} ${b.y}`;
+    const p = document.createElementNS('http://www.w3.org/2000/svg','path');
+    p.setAttribute('d', d);
+    p.setAttribute('class','wire'+(e.transformation && e.transformation!=='IDENTITY' ? ' strong':'') );
+    const ek = edgeKey(e);
+    p.setAttribute('data-edge-key', ek);
+    // colorize by source column only if that column has multiple outgoing edges
+    const sColKey = (s.tableId + '.' + s.col).toLowerCase();
+    const deg = OUT_DEG && OUT_DEG.get(sColKey);
+    if (deg && deg > 1){
+      const idx = (EDGE_COLOR_IDX && EDGE_COLOR_IDX.get(edgeKey(e))) ?? 0;
+      const col = PALETTE[idx % PALETTE.length];
+      p.setAttribute('stroke', col);
+      p.setAttribute('marker-end', `url(#arrow-${idx % PALETTE.length})`);
+    } else {
+      p.setAttribute('marker-end','url(#arrow)');
+    }
+    svg.appendChild(p);
+    PATH_BY_EDGE.set(ek, p);
+  });
+}
+
 // Compute render sets: selected + immediate neighbors for context
 function computeRenderSets(){
   const base = new Set(VISIBLE_IDS);
@@ -885,13 +956,11 @@ function computeRenderSets(){
     const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
     const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw; // 0 => unlimited
 
-    // Straight-line traversal: expand upstream and downstream independently.
-    const seen = new Set(base);
-
     // Downstream chain
     if (dir === 'down' || dir === 'both'){
       let depth = 0;
       let frontier = new Set(base);
+      const seen = new Set(base);
       while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
         const next = new Set();
         frontier.forEach(u=>{
@@ -906,6 +975,7 @@ function computeRenderSets(){
     if (dir === 'up' || dir === 'both'){
       let depth = 0;
       let frontier = new Set(base);
+      const seen = new Set(base);
       while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
         const next = new Set();
         frontier.forEach(u=>{
@@ -924,6 +994,9 @@ function computeRenderSets(){
 // Toggle table selection from canvas or programmatically; updates sidebar + layout
 function toggleTableSelection(tableId){
   if (!tableId) return;
+  // If user switches to manual selection, drop any isolate/override modes
+  TABLES_OVERRIDE = null; ISOLATE = false; ISOLATE_SRC = null; HL_KEYS = null; COLLAPSE_ATTR_EDGES = false;
+  try{ OBJ_COLLAPSE_SEEDS.clear(); }catch(_){ }
   if (VISIBLE_IDS.has(tableId)) VISIBLE_IDS.delete(tableId); else VISIBLE_IDS.add(tableId);
   computeRenderSets();
   layoutTables();
@@ -1042,6 +1115,9 @@ function buildSidebar(){
         const cb = document.createElement('input'); cb.type='checkbox'; cb.id=id; cb.dataset.tid = t.id;
         cb.checked = VISIBLE_IDS.has(t.id);
         cb.addEventListener('change', (e)=>{
+          // Switching selection from sidebar should exit isolate/override modes
+          TABLES_OVERRIDE = null; ISOLATE = false; ISOLATE_SRC = null; HL_KEYS = null; COLLAPSE_ATTR_EDGES = false;
+          try{ OBJ_COLLAPSE_SEEDS.clear(); }catch(_){ }
           const tid = e.currentTarget.dataset.tid;
           if (e.currentTarget.checked){ VISIBLE_IDS.add(tid); }
           else { VISIBLE_IDS.delete(tid); }
@@ -1192,6 +1268,16 @@ if (depthInput){
   depthInput.addEventListener('change', (e)=>{
     const v = parseInt(e.currentTarget.value, 10);
     CONFIG.depth = (isNaN(v) || v < 0) ? 1 : v;
+    // If we are in attribute isolation, recompute with new depth
+    if (ISOLATE && ISOLATE_SRC){
+      try { applyIsolationLayout(ISOLATE_SRC, ISOLATE_DIR || 'both'); } catch(_){ }
+      return;
+    }
+    // If we are in collapsed attribute-edge mode (multi-select), recompute with new depth
+    if (COLLAPSE_ATTR_EDGES && HL_KEYS && ((Array.isArray(HL_KEYS) && HL_KEYS.length) || (HL_KEYS.size && HL_KEYS.size>0))){
+      try { applyAttributesCollapsed(HL_KEYS, HL_DIR || 'both'); } catch(_){ }
+      return;
+    }
     computeRenderSets();
     layoutTables();
   });
@@ -1388,7 +1474,7 @@ function updateCollapseButton(){
 document.getElementById('btnToggleCollapse').addEventListener('click', ()=>{
   COLLAPSE = !COLLAPSE;
   try{ localStorage.setItem(COLLAPSE_KEY, COLLAPSE ? '1' : '0'); }catch(_){ }
-  try{ clearSelection(); }catch(_){ }
+  // Do not call clearSelection here; it would force expand back to false
   updateCollapseButton();
   layoutTables();
 });
@@ -1426,11 +1512,17 @@ document.getElementById('stage').addEventListener('contextmenu', (e)=>{
   if (li){
     const key = li.getAttribute('data-key'); if (!key) return;
     openCtx(px, py, [
-      { label: 'Show downstream (attribute)', onClick: ()=>{ applyIsolationLayout(key,'down'); } },
-      { label: 'Show upstream (attribute)',   onClick: ()=>{ applyIsolationLayout(key,'up'); } },
-      { label: 'Show both (attribute)',       onClick: ()=>{ applyIsolationLayout(key,'both'); } },
+      // Legacy single-attribute isolation (expanded view)
+      { label: 'Show downstream (attribute)', onClick: ()=>{ HL_KEYS=null; applyIsolationLayout(key,'down'); } },
+      { label: 'Show upstream (attribute)',   onClick: ()=>{ HL_KEYS=null; applyIsolationLayout(key,'up'); } },
+      { label: 'Show both (attribute)',       onClick: ()=>{ HL_KEYS=null; applyIsolationLayout(key,'both'); } },
       'sep',
-      { label: 'Clear filter',                onClick: ()=>{ clearSelection(); drawEdges(); } }
+      // New: multi-select collapsed stream (falls back to clicked if none selected)
+      { label: 'Show downstream (selected, collapsed)', onClick: ()=>{ const keys = (SELECTED_KEYS && SELECTED_KEYS.size) ? Array.from(SELECTED_KEYS) : [key]; applyAttributesCollapsed(keys,'down'); } },
+      { label: 'Show upstream (selected, collapsed)',   onClick: ()=>{ const keys = (SELECTED_KEYS && SELECTED_KEYS.size) ? Array.from(SELECTED_KEYS) : [key]; applyAttributesCollapsed(keys,'up'); } },
+      { label: 'Show both (selected, collapsed)',       onClick: ()=>{ const keys = (SELECTED_KEYS && SELECTED_KEYS.size) ? Array.from(SELECTED_KEYS) : [key]; applyAttributesCollapsed(keys,'both'); } },
+      'sep',
+      { label: 'Clear selection',              onClick: ()=>{ clearSelection(); drawEdges(); } }
     ]);
   } else if (card){
     const tid = card.getAttribute('data-id'); if (!tid) return;
@@ -1439,7 +1531,7 @@ document.getElementById('stage').addEventListener('contextmenu', (e)=>{
       { label: 'Show upstream (object)',   onClick: ()=>{ applyTableIsolationCollapsed(tid,'up'); } },
       { label: 'Show both (object)',       onClick: ()=>{ applyTableIsolationCollapsed(tid,'both'); } },
       'sep',
-      { label: 'Clear filter',             onClick: ()=>{ clearSelection(); drawEdges(); } }
+      { label: 'Clear selection',          onClick: ()=>{ clearSelection(); drawEdges(); } }
     ]);
   }
 });
@@ -1605,21 +1697,24 @@ function onRowClick(e){
 }
 
 function selectColumnKey(key){
-  // Always clear previous selection before applying a new one.
-  // If the same row is clicked again, toggle off selection.
-  if (SELECTED_COL === key){
-    clearSelection();
-    return;
-  }
-  clearSelection();
-  // Use isolation layout by default for attribute click to hide unrelated objects
-  applyIsolationLayout(key, 'both');
+  // Toggle multi-select state without isolating or drawing lineage
+  const was = SELECTED_KEYS.has(key);
+  if (was) SELECTED_KEYS.delete(key); else SELECTED_KEYS.add(key);
+  const li = ROW_BY_COL.get(key);
+  if (li){ li.classList.toggle('selected', !was); }
 }
 
 function clearSelection(){
   SELECTED_COL = null;
+  HL_KEYS = null; HL_DIR = 'both'; HL_ISOLATE = false;
   ISOLATE = false; ISOLATE_DIR = 'both'; ISOLATE_SRC = null;
   ISOLATE_ALIGN = false; TABLES_OVERRIDE = null;
+  // Return to expanded mode
+  COLLAPSE = false; try{ localStorage.setItem(COLLAPSE_KEY, '0'); }catch(_){ }
+  try{ updateCollapseButton(); }catch(_){ }
+  COLLAPSE_ATTR_EDGES = false;
+  try{ OBJ_COLLAPSE_SEEDS.clear(); }catch(_){ }
+  try{ SELECTED_KEYS.clear(); }catch(_){ }
   // remove classes
   document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
     el.classList.remove('dim','active','selected','hidden');
@@ -1660,9 +1755,164 @@ function highlightLineage(srcKey, dir='both', isolate=false){
   applyHighlight(srcKey, activeCols, activeEdges, isolate);
 }
 
+// Highlight lineage for multiple selected attributes at once (union of paths)
+function highlightLineageMultiple(keys, dir='both', isolate=false){
+  const arr = Array.isArray(keys) ? keys : Array.from(keys||[]);
+  if (!arr.length) return;
+  const activeCols = new Set();
+  const activeEdges = new Set();
+  function addDown(start){
+    const q = [start]; const seen = new Set([start]);
+    while(q.length){
+      const u = q.shift(); activeCols.add(u);
+      const outs = COL_OUT.get(u) || [];
+      outs.forEach(e=>{
+        const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
+        activeEdges.add(edgeKey(e));
+        if (!seen.has(v)){ seen.add(v); q.push(v); }
+      });
+    }
+  }
+  function addUp(start){
+    const q = [start]; const seen = new Set([start]);
+    while(q.length){
+      const u = q.shift(); activeCols.add(u);
+      const ins = COL_IN.get(u) || [];
+      ins.forEach(e=>{
+        const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
+        activeEdges.add(edgeKey(e));
+        if (!seen.has(v)){ seen.add(v); q.push(v); }
+      });
+    }
+  }
+  arr.forEach(k=>{
+    if (dir==='down' || dir==='both') addDown(k);
+    if (dir==='up' || dir==='both') addUp(k);
+  });
+  applyHighlight(arr, activeCols, activeEdges, isolate);
+}
+
+// Collapse objects and show lineage stream for selected attributes only
+function applyAttributesCollapsed(keys, dir){
+  const arr = Array.isArray(keys) ? keys : Array.from(keys||[]);
+  if (!arr.length) return;
+  // Persist collapsed mode
+  COLLAPSE = true; try{ localStorage.setItem(COLLAPSE_KEY, '1'); }catch(_){ }
+  try{ updateCollapseButton(); }catch(_){ }
+  // Ensure maps exist
+  if (!COL_OUT || !COL_IN || !ROW_BY_COL){ try { buildColGraph(); } catch(_){ } }
+  // Make sure selected rows are styled and remembered
+  arr.forEach(k=>{ SELECTED_KEYS.add(k); const li = ROW_BY_COL.get(k); if (li) li.classList.add('selected'); });
+  // BFS union across all selected attributes
+  const colSet = new Set(arr);
+  const edgeSet = new Set();
+  function addDown(start){
+    const q = [start]; const seen = new Set([start]);
+    while(q.length){
+      const u = q.shift(); colSet.add(u);
+      const outs = COL_OUT.get(u) || [];
+      outs.forEach(e=>{
+        edgeSet.add(edgeKey(e));
+        const t = parseUri(e.to); const v = (t.tableId + '.' + t.col).toLowerCase();
+        if (!seen.has(v)){ seen.add(v); q.push(v); }
+      });
+    }
+  }
+  function addUp(start){
+    const q = [start]; const seen = new Set([start]);
+    while(q.length){
+      const u = q.shift(); colSet.add(u);
+      const ins = COL_IN.get(u) || [];
+      ins.forEach(e=>{
+        edgeSet.add(edgeKey(e));
+        const s = parseUri(e.from); const v = (s.tableId + '.' + s.col).toLowerCase();
+        if (!seen.has(v)){ seen.add(v); q.push(v); }
+      });
+    }
+  }
+  arr.forEach(k=>{
+    if (dir==='down' || dir==='both') addDown(k);
+    if (dir==='up' || dir==='both') addUp(k);
+  });
+  // Derive active tables from colSet
+  const activeIds = new Set();
+  colSet.forEach(k=>{ const p = k.lastIndexOf('.'); if (p>0) activeIds.add(k.slice(0,p)); });
+  // Apply depth limit on table graph starting from each selected key's table
+  const out = new Map();
+  const inn = new Map();
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    if (s.tableId === t.tableId) return;
+    if (!out.has(s.tableId)) out.set(s.tableId, new Set());
+    if (!inn.has(t.tableId)) inn.set(t.tableId, new Set());
+    out.get(s.tableId).add(t.tableId);
+    inn.get(t.tableId).add(s.tableId);
+  });
+  const starts = new Set();
+  arr.forEach(k=>{ const p = k.lastIndexOf('.'); if (p>0) starts.add(k.slice(0,p)); });
+  const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
+  const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw; // 0 => unlimited
+  const limitedIds = new Set();
+  starts.forEach(startTbl=>{
+    if (!startTbl) return;
+    limitedIds.add(startTbl);
+    if (dir==='down' || dir==='both'){
+      let d=0; let frontier=new Set([startTbl]); const seen=new Set([startTbl]);
+      while(frontier.size && (maxDepth===0 || d<maxDepth)){
+        const next=new Set();
+        frontier.forEach(u=>{
+          const ns = out.get(u) || new Set();
+          ns.forEach(v=>{ if (!seen.has(v)){ seen.add(v); if (activeIds.has(v)) limitedIds.add(v); next.add(v); } });
+        });
+        frontier = next; d++;
+      }
+    }
+    if (dir==='up' || dir==='both'){
+      let d=0; let frontier=new Set([startTbl]); const seen=new Set([startTbl]);
+      while(frontier.size && (maxDepth===0 || d<maxDepth)){
+        const next=new Set();
+        frontier.forEach(u=>{
+          const ps = inn.get(u) || new Set();
+          ps.forEach(v=>{ if (!seen.has(v)){ seen.add(v); if (activeIds.has(v)) limitedIds.add(v); next.add(v); } });
+        });
+        frontier = next; d++;
+      }
+    }
+  });
+  const allowedIds = limitedIds.size ? new Set([...limitedIds].filter(id=> activeIds.has(id))) : activeIds;
+  const subTables = ALL_TABLES.filter(t=> allowedIds.has(t.id));
+  const g = buildGraph(subTables);
+  const ranks = ranksFromGraph(g);
+  const ordered = [...subTables].sort((a,b)=>{
+    const ra = ranks.get(a.id) || 0, rb = ranks.get(b.id) || 0;
+    if (ra === rb) return (a.id||'').localeCompare(b.id||'');
+    return ra - rb;
+  });
+  TABLES_OVERRIDE = ordered;
+  ISOLATE_ALIGN = false; // keep layered layout to avoid overlap
+  // Prepare redraw in collapsed attribute-edge mode
+  COLLAPSE_ATTR_EDGES = true;
+  // Re-render: layout first so DOM rows exist, then highlight, then draw edges
+  layoutTables();
+  HL_KEYS = arr; HL_DIR = dir || 'both'; HL_ISOLATE = false;
+  // Filter highlight to depth-limited tables only
+  const colSetLimited = new Set();
+  colSet.forEach(k=>{ const p = k.lastIndexOf('.'); if (p>0 && allowedIds.has(k.slice(0,p))) colSetLimited.add(k); });
+  const edgeSetLimited = new Set();
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    if (allowedIds.has(s.tableId) && allowedIds.has(t.tableId)){
+      const ek = edgeKey(e);
+      if (edgeSet.has(ek)) edgeSetLimited.add(ek);
+    }
+  });
+  applyHighlight(arr, colSetLimited, edgeSetLimited, false);
+  drawEdges();
+}
+
 // Compute active tables from a column key and direction, then set override and re-layout
 function applyIsolationLayout(srcKey, dir){
-  ISOLATE = true; ISOLATE_DIR = dir || 'both'; ISOLATE_SRC = srcKey; SELECTED_COL = srcKey;
+  ISOLATE = true; ISOLATE_DIR = dir || 'both'; ISOLATE_SRC = srcKey; SELECTED_COL = srcKey; COLLAPSE_ATTR_EDGES = false;
   // Ensure column graph maps exist
   if (!COL_OUT || !COL_IN || !ROW_BY_COL){ try { buildColGraph(); } catch(_){} }
   // 1) Compute active columns via BFS like highlightLineage
@@ -1689,11 +1939,52 @@ function applyIsolationLayout(srcKey, dir){
       });
     }
   }
-  // 2) Derive active table ids
+  // 2) Derive active table ids (all tables touched by column-lineage)
   const activeIds = new Set();
   colSet.forEach(k=>{ const p = k.lastIndexOf('.'); if (p>0) activeIds.add(k.slice(0,p)); });
-  // 3) Build ordered list using table graph restricted to active ids
-  const subTables = ALL_TABLES.filter(t=> activeIds.has(t.id));
+  // 3) Apply depth limit on table graph starting from the source table id
+  // Build table-level adjacency (full graph)
+  const out = new Map();
+  const inn = new Map();
+  EDGES.forEach(e=>{
+    const s = parseUri(e.from), t = parseUri(e.to);
+    if (s.tableId === t.tableId) return;
+    if (!out.has(s.tableId)) out.set(s.tableId, new Set());
+    if (!inn.has(t.tableId)) inn.set(t.tableId, new Set());
+    out.get(s.tableId).add(t.tableId);
+    inn.get(t.tableId).add(s.tableId);
+  });
+  const startTbl = (srcKey && srcKey.slice(0, srcKey.lastIndexOf('.'))) || '';
+  const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
+  const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw; // 0 => unlimited
+  const limitedIds = new Set();
+  if (startTbl){
+    limitedIds.add(startTbl);
+    if (ISOLATE_DIR==='down' || ISOLATE_DIR==='both'){
+      let d=0; let frontier=new Set([startTbl]); const seen=new Set([startTbl]);
+      while(frontier.size && (maxDepth===0 || d<maxDepth)){
+        const next=new Set();
+        frontier.forEach(u=>{
+          const ns = out.get(u) || new Set();
+          ns.forEach(v=>{ if (activeIds.has(v) && !seen.has(v)){ seen.add(v); limitedIds.add(v); next.add(v); } });
+        });
+        frontier = next; d++;
+      }
+    }
+    if (ISOLATE_DIR==='up' || ISOLATE_DIR==='both'){
+      let d=0; let frontier=new Set([startTbl]); const seen=new Set([startTbl]);
+      while(frontier.size && (maxDepth===0 || d<maxDepth)){
+        const next=new Set();
+        frontier.forEach(u=>{
+          const ps = inn.get(u) || new Set();
+          ps.forEach(v=>{ if (activeIds.has(v) && !seen.has(v)){ seen.add(v); limitedIds.add(v); next.add(v); } });
+        });
+        frontier = next; d++;
+      }
+    }
+  }
+  // 4) Build ordered list using the table graph restricted to depth-limited active ids
+  const subTables = ALL_TABLES.filter(t=> (limitedIds.size ? limitedIds.has(t.id) : activeIds.has(t.id)));
   const g = buildGraph(subTables);
   const ranks = ranksFromGraph(g);
   const ordered = [...subTables].sort((a,b)=>{
@@ -1707,10 +1998,10 @@ function applyIsolationLayout(srcKey, dir){
   subTables.forEach(t=>{ const rv = ranks.get(t.id) || 0; counts.set(rv, (counts.get(rv)||0) + 1); });
   const canAlign = Array.from(counts.values()).every(c=> c <= 1);
   ISOLATE_ALIGN = !!canAlign;
-  // 4) Apply UI highlight and re-layout
-  highlightLineage(srcKey, ISOLATE_DIR, true);
+  // 5) Layout first, draw edges, then apply highlight so wires exist
   layoutTables();
   drawEdges();
+  highlightLineage(srcKey, ISOLATE_DIR, true);
 }
 
 // Object-level isolate in collapsed mode: auto-enable collapsed view and layout only lineage tables
@@ -1720,7 +2011,9 @@ function applyTableIsolationCollapsed(tableId, dir){
   try{ localStorage.setItem(COLLAPSE_KEY, '1'); }catch(_){ }
   try{ updateCollapseButton(); }catch(_){ }
   // Mark isolation active; no column selection in collapsed mode
-  ISOLATE = true; ISOLATE_DIR = dir || 'both'; SELECTED_COL = null;
+  ISOLATE = true; ISOLATE_DIR = dir || 'both'; SELECTED_COL = null; OBJ_COLLAPSE_DIR = ISOLATE_DIR;
+  // Accumulate seeds across calls (union of selected objects)
+  try { OBJ_COLLAPSE_SEEDS.add(tableId); } catch(_){ OBJ_COLLAPSE_SEEDS = new Set([tableId]); }
   // Build table-level adjacency
   const out = new Map();
   const inn = new Map();
@@ -1735,8 +2028,8 @@ function applyTableIsolationCollapsed(tableId, dir){
   // BFS from the selected table, respecting configured depth (0 => unlimited)
   const maxDepthRaw = (CONFIG && typeof CONFIG.depth !== 'undefined') ? parseInt(CONFIG.depth, 10) : 1;
   const maxDepth = isNaN(maxDepthRaw) ? 1 : maxDepthRaw;
-  const base = new Set([tableId]);
-  const active = new Set([tableId]);
+  const base = new Set(Array.from(OBJ_COLLAPSE_SEEDS || [tableId]));
+  const active = new Set(base);
   if (ISOLATE_DIR === 'down' || ISOLATE_DIR === 'both'){
     let depth = 0, frontier = new Set(base), seen = new Set(base);
     while (frontier.size && (maxDepth === 0 || depth < maxDepth)){
@@ -1770,11 +2063,12 @@ function applyTableIsolationCollapsed(tableId, dir){
   });
   TABLES_OVERRIDE = ordered;
   ISOLATE_ALIGN = false;
+  COLLAPSE_ATTR_EDGES = false; // object-collapsed uses aggregated edges
   layoutTables();
   drawEdges();
 }
 
-function applyHighlight(srcKey, colSet, edgeSet, isolate=false){
+function applyHighlight(srcKeys, colSet, edgeSet, isolate=false){
   // Reset all
   document.querySelectorAll('.table-node, .table-node li, svg .wire').forEach(el=>{
     el.classList.remove('dim','active','selected','hidden');
@@ -1802,9 +2096,9 @@ function applyHighlight(srcKey, colSet, edgeSet, isolate=false){
     if (p){ p.classList.remove('dim'); p.classList.add('active'); }
   });
 
-  // Mark selected row distinctly
-  const sel = ROW_BY_COL.get(srcKey);
-  if (sel){ sel.classList.add('selected'); }
+  // Mark selected rows distinctly
+  const list = Array.isArray(srcKeys) ? srcKeys : [srcKeys];
+  list.forEach(k=>{ const li = ROW_BY_COL.get(k); if (li) li.classList.add('selected'); });
   // Isolation mode: hide non-active instead of dim, hide tables without any active row
   if (isolate){
     document.querySelectorAll('svg .wire.dim').forEach(p=>p.classList.add('hidden'));
