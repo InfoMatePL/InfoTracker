@@ -113,4 +113,4 @@ INSERT INTO #t SELECT 1;
     assert outputs and outputs[0]["name"] == "dbo.no_select"
     # Fallback objects may have empty lineage facet but should exist
     # Namespace should reflect MyDB from dbt_project.yml
-    assert outputs[0]["namespace"].endswith("/MyDB")
+    assert outputs[0]["namespace"].endswith("mssql://localhost/MYDB")
