@@ -18,7 +18,7 @@ def _ns_for_dep(dep: str, default_ns: str) -> str:
         return "mssql://localhost/tempdb"
     parts = d.split(".")
     db = parts[0] if len(parts) >= 3 else None
-    return f"mssql://localhost/{db}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
+    return f"mssql://localhost/{(db or '').upper()}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
 
 def _strip_db_prefix(name: str) -> str:
     parts = (name or "").split(".")

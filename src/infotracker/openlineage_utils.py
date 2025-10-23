@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+import re
 
 from .models import ObjectInfo, ColumnSchema, TableSchema, ColumnLineage, ColumnReference, TransformationType
 
@@ -71,7 +72,7 @@ class OLMapper:
             parts = name.split(".")
             if len(parts) == 3:
                 # Interpret as DB.schema.table
-                namespace = f"mssql://localhost/{parts[0]}"
+                namespace = f"mssql://localhost/{parts[0].upper()}"
                 name = ".".join(parts[1:])
             else:
                 namespace = "mssql://localhost/InfoTrackerDW"
@@ -159,18 +160,20 @@ def qualify_identifier(identifier: str, default_database: Optional[str] = None) 
     if len(parts) == 1:
         # Just table name - add schema and database
         if default_database:
-            return f"{default_database}.dbo.{parts[0]}"
+            return f"{str(default_database).upper()}.dbo.{parts[0]}"
         else:
             return f"dbo.{parts[0]}"
     elif len(parts) == 2:
         # schema.table - add database
         if default_database:
-            return f"{default_database}.{identifier}"
+            return f"{str(default_database).upper()}.{identifier}"
         else:
             return identifier
     else:
         # Already fully qualified
-        return identifier
+        # Normalize DB case for 3-part identifiers
+        p0 = parts[0].upper()
+        return ".".join([p0] + parts[1:])
 
 
 def sanitize_name(name: str) -> str:
@@ -185,5 +188,7 @@ def sanitize_name(name: str) -> str:
     if not name:
         return name
     
-    # Remove trailing semicolons and whitespace
-    return name.rstrip(';').strip()
+    # Remove trailing semicolons and whitespace; strip square brackets
+    s = name.rstrip(';').strip()
+    s = re.sub(r'[\[\]]', '', s)
+    return s

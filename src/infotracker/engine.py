@@ -316,7 +316,11 @@ class Engine:
 
                     if warning_reason:
                         warnings += 1
-                        logger.warning("Object %s: %s", obj_info.name, warning_reason)
+                        try:
+                            disp = f"{obj_info.schema.namespace}.{obj_info.schema.name}" if getattr(obj_info, 'schema', None) else obj_info.name
+                        except Exception:
+                            disp = obj_info.name
+                        logger.warning("Object %s: %s", disp, warning_reason)
 
                 except Exception as e:
                     warnings += 1

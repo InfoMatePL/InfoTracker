@@ -205,8 +205,9 @@ class SqlParser:
         # Normalize T-SQL specific functions to standard equivalents
         t = re.sub(r"\bISNULL\s*\(", "COALESCE(", t, flags=re.I)
         
-        # Convert IIF to CASE WHEN (basic conversion for simple cases)
-        t = re.sub(r"\bIIF\s*\(", "CASE WHEN ", t, flags=re.I)
+        # Do NOT rewrite IIF here. sqlglot can parse it as a function; naive
+        # regex replacement to "CASE WHEN" breaks syntax (missing THEN/ELSE/END)
+        # and causes entire CREATE VIEW statements to fail parsing.
         # Remove zero-width / NBSP that may split tokens
         try:
             t = re.sub(r"[\u200B\u200C\u200D\u00A0]", " ", t)
@@ -330,12 +331,14 @@ class SqlParser:
         pseudo = {"view", "function", "procedure"}
         if len(parts) >= 3 and parts[0].lower() in pseudo:
             parts = parts[1:]
+        # Strip square brackets from all segments for consistent naming
+        parts = [p.strip('[]') for p in parts]
 
         # dbt mode: ignore DB/schema from references, normalize to default namespace+schema
         if self.dbt_mode:
             last = parts[-1] if parts else table_name
             db = self.current_database or self.default_database or "InfoTrackerDW"
-            ns = f"mssql://localhost/{db}"
+            ns = f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}"
             nm = f"{self.default_schema or 'dbo'}.{last}"
             return ns, nm
 
@@ -357,7 +360,7 @@ class SqlParser:
                 db = self.registry.resolve(obj_type_hint or "table", schema_table, fallback=fallback)
             if not db:
                 db = self.current_database or self.default_database or "InfoTrackerDW"
-        ns = f"mssql://localhost/{db}"
+        ns = f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}"
 
         # Compute schema.table from last two real segments
         if len(parts) >= 2:
@@ -450,6 +453,16 @@ class SqlParser:
         db = self._choose_db(c)
         if db:
             return db
+        # Fallback: infer from file path root (e.g., INFO_SALES/Views/...)
+        try:
+            p = getattr(self, "_current_file", None) or ""
+            if p and '/' in str(p):
+                root = str(p).split('/', 1)[0]
+                # Heuristic: directory name that looks like DB and not an object folder
+                if root and ('.' not in root) and root.lower() not in {"views", "functions", "tables", "storedprocedures", "procedures"}:
+                    return root
+        except Exception:
+            pass
         return self.current_database or self.default_database or None
     
     def _qualify_table(self, tbl: exp.Table) -> str:
@@ -529,7 +542,7 @@ class SqlParser:
         except Exception:
             pass
         out_list.append(ColumnReference(
-            namespace=f"mssql://localhost/{db}" if db else "mssql://localhost",
+            namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
             table_name=f"{sch}.{tbl}",  # <== tylko schema.table
             column_name=col_exp.name
         ))
@@ -552,7 +565,7 @@ class SqlParser:
     
     def _get_schema(self, db: str, sch: str, tbl: str):
         """Get schema information for a table."""
-        ns = f"mssql://localhost/{db}" if db else None
+        ns = f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else None
         key = f"{sch}.{tbl}"
         if hasattr(self.schema_registry, "get"):
             return self.schema_registry.get(ns, key)
@@ -827,7 +840,7 @@ class SqlParser:
         exec_match = re.search(insert_exec_pattern, sql_pre)
         
         # Look for INSERT INTO persistent tables (not temp tables)
-        insert_table_pattern = r'(?is)INSERT\s+INTO\s+([^\s#][#\[\]\w.]+)\s*\(([^)]+)\)\s+SELECT'
+        insert_table_pattern = r'(?is)INSERT\s+INTO\s+([^\s#@][#\[\]\w.]+)\s*\(([^)]+)\)\s+SELECT'
         table_match = re.search(insert_table_pattern, sql_pre)
         
         # Always extract all dependencies from the file
@@ -844,7 +857,7 @@ class SqlParser:
         ]
         
         # Prioritize persistent table INSERT over INSERT EXEC
-        if table_match and not table_match.group(1).startswith('#'):
+        if table_match and not table_match.group(1).startswith('#') and not table_match.group(1).lstrip().startswith('@'):
             # Found INSERT INTO persistent table with explicit column list
             raw_table = table_match.group(1)
             raw_columns = table_match.group(2)
@@ -902,7 +915,7 @@ class SqlParser:
             if all_dependencies:
                 table_name = sanitize_name(object_hint or "script_output")
                 db = self.current_database or self.default_database or "InfoTrackerDW"
-                namespace = f"mssql://localhost/{db}"
+                namespace = f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}"
                 object_type = "script"
             else:
                 # No dependencies found at all
@@ -1223,10 +1236,15 @@ class SqlParser:
             if not statements:
                 # If SQLGlot parsing fails completely, try to extract dependencies with string parsing
                 dependencies = self._extract_basic_dependencies(preprocessed_sql)
+                # Normalize name to schema.table (strip accidental DB/catalog prefixes like 'View.')
+                raw_name = (object_hint or self._get_fallback_name(sql_content))
+                nm = self._normalize_table_name_for_output(raw_name)
+                db = self.current_database or self.default_database or "InfoTrackerDW"
+                schema = TableSchema(namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}", name=nm, columns=[])
                 return ObjectInfo(
-                    name=object_hint or self._get_fallback_name(sql_content),
+                    name=nm,
                     object_type="script",
-                    schema=[],
+                    schema=schema,
                     dependencies=dependencies,
                     lineage=[]
                 )
@@ -1390,7 +1408,7 @@ class SqlParser:
                 name=nm,
                 object_type="unknown",
                 schema=TableSchema(
-                    namespace=f"mssql://localhost/{db}",
+                    namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}",
                     name=nm,
                     columns=[]
                 ),
@@ -1692,9 +1710,15 @@ class SqlParser:
         except Exception:
             pass
         if not explicit_db:
-            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
-            if inferred_db:
-                namespace = f"mssql://localhost/{inferred_db}"
+            # Prefer database from explicit USE context for the created object.
+            # Only fall back to inference when no current_database is available.
+            cur_db = getattr(self, "current_database", None) or self.default_database
+            if cur_db:
+                namespace = f"mssql://localhost/{(cur_db or 'InfoTrackerDW').upper()}"
+            else:
+                inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+                if inferred_db:
+                    namespace = f"mssql://localhost/{(inferred_db or 'InfoTrackerDW').upper()}"
         # Learn from CREATE only if raw name had explicit DB
         try:
             # Learn from CREATE only if raw name had explicit DB
@@ -1751,7 +1775,7 @@ class SqlParser:
         if not has_db:
             inferred_db = self._infer_database_for_object(statement=None, sql_text=sql)
             if inferred_db:
-                namespace = f"mssql://localhost/{inferred_db}"
+                namespace = f"mssql://localhost/{(inferred_db or 'InfoTrackerDW').upper()}"
 
         # 2) Wyciągnij definicję kolumn (balansowane nawiasy od pierwszego '(' po nazwie)
         s = self._normalize_tsql(sql)
@@ -1839,9 +1863,13 @@ class SqlParser:
         except Exception:
             pass
         if not explicit_db:
-            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
-            if inferred_db:
-                namespace = f"mssql://localhost/{inferred_db}"
+            cur_db = getattr(self, "current_database", None) or self.default_database
+            if cur_db:
+                namespace = f"mssql://localhost/{(cur_db or 'InfoTrackerDW').upper()}"
+            else:
+                inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+                if inferred_db:
+                    namespace = f"mssql://localhost/{(inferred_db or 'InfoTrackerDW').upper()}"
         # Learn from CREATE only if raw name had explicit DB
         try:
             raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
@@ -1958,9 +1986,13 @@ class SqlParser:
         except Exception:
             pass
         if not explicit_db:
-            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
-            if inferred_db:
-                namespace = f"mssql://localhost/{inferred_db}"
+            cur_db = getattr(self, "current_database", None) or self.default_database
+            if cur_db:
+                namespace = f"mssql://localhost/{(cur_db or 'InfoTrackerDW').upper()}"
+            else:
+                inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+                if inferred_db:
+                    namespace = f"mssql://localhost/{(inferred_db or 'InfoTrackerDW').upper()}"
         # Learn from CREATE only if raw name had explicit DB
         try:
             raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
@@ -1973,25 +2005,27 @@ class SqlParser:
         
         # Check if this is a table-valued function
         if not self._is_table_valued_function(statement):
-            # For scalar functions, create a simple object without lineage
-            return ObjectInfo(
-                name=function_name,
+            # Scalar function — no table schema or column lineage to report.
+            obj = ObjectInfo(
+                name=self._normalize_table_name_for_output(function_name),
                 object_type="function",
                 schema=TableSchema(
                     namespace=namespace,
-                    name=function_name,
+                    name=self._normalize_table_name_for_output(function_name),
                     columns=[]
                 ),
                 lineage=[],
                 dependencies=set()
             )
+            obj.no_output_reason = "SCALAR_FUNCTION"
+            return obj
         
         # Handle table-valued functions
         lineage, output_columns, dependencies = self._extract_tvf_lineage(statement, function_name)
         
         schema = TableSchema(
             namespace=namespace,
-            name=function_name,
+            name=self._normalize_table_name_for_output(function_name),
             columns=output_columns
         )
         
@@ -1999,7 +2033,7 @@ class SqlParser:
         self.schema_registry.register(schema)
         
         return ObjectInfo(
-            name=function_name,
+            name=self._normalize_table_name_for_output(function_name),
             object_type="function",
             schema=schema,
             lineage=lineage,
@@ -2023,9 +2057,13 @@ class SqlParser:
         except Exception:
             pass
         if not explicit_db:
-            inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
-            if inferred_db:
-                namespace = f"mssql://localhost/{inferred_db}"
+            cur_db = getattr(self, "current_database", None) or self.default_database
+            if cur_db:
+                namespace = f"mssql://localhost/{(cur_db or 'InfoTrackerDW').upper()}"
+            else:
+                inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
+                if inferred_db:
+                    namespace = f"mssql://localhost/{(inferred_db or 'InfoTrackerDW').upper()}"
         # Learn from CREATE only if raw name had explicit DB
         try:
             raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
@@ -2122,7 +2160,7 @@ class SqlParser:
                     name=normalized_name,
                     object_type="table",
                     schema=TableSchema(
-                        namespace=f"mssql://localhost/{db}",
+                    namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}",
                         name=normalized_name,
                         columns=[]
                     ),
@@ -3169,28 +3207,36 @@ class SqlParser:
         if table_name.startswith('#') or table_name.startswith('tempdb..#'):
             return "mssql://localhost/tempdb"
         db = self.current_database or self.default_database or "InfoTrackerDW"
-        return f"mssql://localhost/{db}"
+        return f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}"
 
     def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION using string-based approach."""
+        # Respect USE <db> at file start
+        try:
+            db_from_use = self._extract_database_from_use_statement(sql_content)
+            if db_from_use:
+                self.current_database = db_from_use
+        except Exception:
+            pass
         function_name = self._extract_function_name(sql_content) or object_hint or "unknown_function"
-        inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content)
-        namespace = f"mssql://localhost/{inferred_db or self.default_database or 'InfoTrackerDW'}"
+        inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content) or self.current_database
+        namespace = f"mssql://localhost/{(inferred_db or self.default_database or 'InfoTrackerDW').upper()}"
         
         # Check if this is a table-valued function
         if not self._is_table_valued_function_string(sql_content):
             # For scalar functions, create a simple object without lineage
             obj = ObjectInfo(
-                name=function_name,
+                name=self._normalize_table_name_for_output(function_name),
                 object_type="function",
                 schema=TableSchema(
                     namespace=namespace,
-                    name=function_name,
+                    name=self._normalize_table_name_for_output(function_name),
                     columns=[]
                 ),
                 lineage=[],
                 dependencies=set()
             )
+            obj.no_output_reason = "SCALAR_FUNCTION"
             try:
                 # Learn only when string CREATE had explicit DB
                 m = re.search(r'(?is)\bCREATE\s+FUNCTION\s+([^\s(]+)', sql_content)
@@ -3203,7 +3249,13 @@ class SqlParser:
             return obj
         
         # Handle table-valued functions
-        lineage, output_columns, dependencies = self._extract_tvf_lineage_string(sql_content, function_name)
+        # 1) Try robust RETURNS @var TABLE(...) schema extraction first
+        output_columns = self._extract_table_variable_schema_string(sql_content)
+        dependencies = set(self._extract_basic_dependencies(sql_content)) if output_columns else set()
+        lineage = []
+        # 2) Additionally, try to extract lineage/columns from inline RETURN SELECT (if present)
+        if not output_columns:
+            lineage, output_columns, dependencies = self._extract_tvf_lineage_string(sql_content, function_name)
         
         schema = TableSchema(
             namespace=namespace,
@@ -3246,7 +3298,7 @@ class SqlParser:
         procedure_name = self._extract_procedure_name(sql_content) or object_hint or "unknown_procedure"
         # Preferuj bazę z USE; w razie braku spróbuj wywnioskować z treści, a na końcu default
         inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content) or self.current_database
-        namespace = f"mssql://localhost/{inferred_db or self.default_database or 'InfoTrackerDW'}"
+        namespace = f"mssql://localhost/{(inferred_db or self.default_database or 'InfoTrackerDW').upper()}"
 
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
@@ -3378,14 +3430,14 @@ class SqlParser:
 
         schema = TableSchema(
             namespace=namespace,
-            name=procedure_name,
+            name=self._normalize_table_name_for_output(procedure_name),
             columns=output_columns
         )
 
         self.schema_registry.register(schema)
 
         obj = ObjectInfo(
-            name=procedure_name,
+            name=self._normalize_table_name_for_output(procedure_name),
             object_type="procedure",
             schema=schema,
             lineage=lineage,
@@ -3480,7 +3532,7 @@ class SqlParser:
                     sch = "dbo"
                     tbl = parts[0]
                     full_name = f"{db}.{sch}.{tbl}"
-            ns = f"mssql://localhost/{db or (self.current_database or self.default_database or 'InfoTrackerDW')}"
+            ns = f"mssql://localhost/{(db or (self.current_database or self.default_database or 'InfoTrackerDW')).upper()}"
 
             return ObjectInfo(
                 name=full_name,
@@ -3801,12 +3853,20 @@ class SqlParser:
     def _extract_function_name(self, sql_content: str) -> Optional[str]:
         """Extract function name from CREATE FUNCTION statement."""
         match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+([^\s\(]+)', sql_content, re.IGNORECASE)
-        return match.group(1).strip() if match else None
+        if not match:
+            return None
+        name = match.group(1).strip()
+        name = re.sub(r'[\[\]]', '', name)
+        return name
     
     def _extract_procedure_name(self, sql_content: str) -> Optional[str]:
         """Extract procedure name from CREATE PROCEDURE statement."""
         match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([^\s\(]+)', sql_content, re.IGNORECASE)
-        return match.group(1).strip() if match else None
+        if not match:
+            return None
+        name = match.group(1).strip()
+        name = re.sub(r'[\[\]]', '', name)
+        return name
 
     def _is_table_valued_function_string(self, sql_content: str) -> bool:
         """Check if this is a table-valued function (returns TABLE)."""
@@ -3820,9 +3880,14 @@ class SqlParser:
         dependencies = set()
         
         sql_upper = sql_content.upper()
-        
+
+        # Prefer RETURNS @var TABLE (...) path first (multi-statement TVF)
+        cols_try = self._extract_table_variable_schema_string(sql_content)
+        if cols_try:
+            output_columns = cols_try
+            dependencies = self._extract_basic_dependencies(sql_content)
         # Handle inline TVF (RETURN AS SELECT or RETURN (SELECT))
-        if "RETURN" in sql_upper and ("AS" in sql_upper or "(" in sql_upper):
+        elif "RETURN" in sql_upper and ("AS" in sql_upper or "(" in sql_upper):
             select_sql = self._extract_select_from_return_string(sql_content)
             if select_sql:
                 try:
@@ -3834,11 +3899,7 @@ class SqlParser:
                     # Fallback to basic analysis
                     output_columns = self._extract_basic_select_columns(select_sql)
                     dependencies = self._extract_basic_dependencies(select_sql)
-        
-        # Handle multi-statement TVF (RETURNS @table TABLE)
-        elif "RETURNS @" in sql_upper:
-            output_columns = self._extract_table_variable_schema_string(sql_content)
-            dependencies = self._extract_basic_dependencies(sql_content)
+
         
         return lineage, output_columns, dependencies
     
@@ -3983,6 +4044,8 @@ class SqlParser:
             r'AS\s*\n\s*RETURN\s*\n\s*\(\s*(SELECT.*?)(?=\)[\s;]*(?:END|$))',
             # RETURN SELECT (simple case)
             r'RETURN\s+(SELECT.*?)(?=[\s;]*(?:END|$))',
+            # RETURN WITH ... SELECT ... (CTE before SELECT)
+            r'RETURN\s+(WITH\s+.*?SELECT[\s\S]*?)(?=[\s;]*(?:END|$))',
             # Fallback - original pattern with end of string
             r'RETURN\s*\(\s*(SELECT.*?)\s*\)(?:\s*;)?$'
         ]
@@ -3992,35 +4055,63 @@ class SqlParser:
             if match:
                 select_statement = match.group(1).strip()
                 # Check if it looks like a valid SELECT statement
-                if select_statement.upper().strip().startswith('SELECT'):
+                up = select_statement.upper().lstrip()
+                if up.startswith('SELECT') or up.startswith('WITH'):
                     return select_statement
         
         return None
     
     def _extract_table_variable_schema_string(self, sql_content: str) -> List[ColumnSchema]:
-        """Extract column schema from @table TABLE definition using regex."""
-        output_columns = []
-        
-        # Look for @Variable TABLE (column definitions)
-        match = re.search(r'@\w+\s+TABLE\s*\((.*?)\)', sql_content, re.IGNORECASE | re.DOTALL)
-        if match:
-            columns_def = match.group(1)
-            # Simple parsing of column definitions
-            for i, col_def in enumerate(columns_def.split(',')):
-                col_def = col_def.strip()
-                if col_def:
-                    parts = col_def.split()
-                    if len(parts) >= 2:
-                        col_name = parts[0].strip()
-                        col_type = parts[1].strip()
-                        output_columns.append(ColumnSchema(
-                            name=col_name,
-                            data_type=col_type,
-                            nullable=True,
-                            ordinal=i
-                        ))
-        
-        return output_columns
+        """Extract column schema from RETURNS @var TABLE (...) with nested parens support."""
+        s = sql_content
+        # Find the position of "RETURNS @... TABLE ("
+        m = re.search(r'(?is)RETURNS\s+@\w+\s+TABLE\s*\(', s)
+        if not m:
+            return []
+        start = m.end()  # position after the opening parenthesis
+        depth = 1
+        i = start
+        while i < len(s) and depth > 0:
+            ch = s[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            i += 1
+        if depth != 0:
+            return []
+        columns_block = s[start:i-1]
+
+        # Split by commas at top level (ignore commas inside parentheses)
+        defs = []
+        buf = []
+        d = 0
+        for ch in columns_block:
+            if ch == '(':
+                d += 1
+            elif ch == ')':
+                d -= 1
+            if ch == ',' and d == 0:
+                defs.append(''.join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+        if buf:
+            defs.append(''.join(buf))
+
+        cols: List[ColumnSchema] = []
+        for idx, raw in enumerate(defs):
+            col_def = raw.strip()
+            if not col_def:
+                continue
+            # Match: [name] TYPE or name TYPE(args)
+            m2 = re.match(r"\s*(\[[^\]]+\]|[A-Za-z_][\w$#]*)\s+((?:\[[^\]]+\]|[A-Za-z_][\w$]*)\s*(?:\([^)]*\))?)", col_def)
+            if not m2:
+                continue
+            name = m2.group(1).strip('[]')
+            dtype = m2.group(2).strip()
+            cols.append(ColumnSchema(name=name, data_type=dtype, nullable=True, ordinal=idx))
+        return cols
         
 
     
