@@ -276,9 +276,9 @@ class Engine:
                                     nm_in = inp.get('name')
                                     if not nm_in:
                                         continue
-                                    # Skip temp / variables
+                                    # Skip variables only (keep temp datasets visible)
                                     s = str(nm_in)
-                                    if s.startswith('#') or s.startswith('@'):
+                                    if s.startswith('@'):
                                         continue
                                     # filename-safe
                                     safe = s.replace('/', '_').replace('\\', '_').replace(':', '_')
@@ -404,7 +404,15 @@ class Engine:
         dependencies: Dict[str, Set[str]] = {}
 
         # Helper: normalize a name to our object key space (schema.table)
+        def _dequote(s: str) -> str:
+            try:
+                import re
+                return re.sub(r"[\[\]\"'`]", "", s or "").strip()
+            except Exception:
+                return (s or "").strip()
+
         def _strip_db(name: str) -> str:
+            name = _dequote(name or "")
             parts = (name or "").split('.')
             return '.'.join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
@@ -417,11 +425,16 @@ class Engine:
         # Build case-insensitive key map for objects
         key_map: Dict[str, str] = {}
         for obj in objects:
-            k = (obj.schema.name if obj.schema else obj.name)
-            key_map[k.lower()] = k
+            k = _dequote(obj.schema.name if obj.schema else obj.name)
+            # Canonical key: schema.table
+            canon = _strip_db(k)
+            key_map[canon.lower()] = canon
+            # If an object came with DB prefix, also map the 3-part form to canonical
+            if k.count('.') >= 2:
+                key_map[k.lower()] = canon
 
         for obj in objects:
-            obj_name = obj.schema.name if obj.schema else obj.name
+            obj_name = _strip_db(_dequote(obj.schema.name if obj.schema else obj.name))
             deps: Set[str] = set()
 
             # Prefer explicit ObjectInfo.dependencies
@@ -432,6 +445,7 @@ class Engine:
                     for f in ln.input_fields or []:
                         raw_deps.add(f.table_name)
 
+            # Filter raw deps and map to known objects
             for d in raw_deps:
                 if _is_noise(d):
                     continue
@@ -441,6 +455,19 @@ class Engine:
                 # include only if dependency is among parsed objects
                 if norm in key_map:
                     deps.add(key_map[norm])
+
+            # If explicit deps yielded nothing (e.g., only temps), try lineage inputs as a secondary fallback
+            if not deps and obj.lineage:
+                for ln in obj.lineage:
+                    for f in ln.input_fields or []:
+                        nm2 = f.table_name
+                        if _is_noise(nm2):
+                            continue
+                        norm2 = _strip_db(nm2).lower()
+                        if norm2 == obj_name.lower():
+                            continue
+                        if norm2 in key_map:
+                            deps.add(key_map[norm2])
             dependencies[obj_name] = deps
 
         return dependencies

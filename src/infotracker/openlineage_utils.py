@@ -177,18 +177,18 @@ def qualify_identifier(identifier: str, default_database: Optional[str] = None) 
 
 
 def sanitize_name(name: str) -> str:
-    """Sanitize object name by removing trailing semicolons and whitespace.
-    
-    Args:
-        name: Object name to sanitize
-        
-    Returns:
-        Sanitized name
+    """Sanitize object name by removing quotes/brackets, trailing semicolons and whitespace.
+
+    - Strips square brackets, double quotes, single quotes and backticks anywhere in the identifier
+    - Trims whitespace and trailing semicolons
     """
     if not name:
         return name
-    
-    # Remove trailing semicolons and whitespace; strip square brackets
+
+    # Remove trailing semicolons and whitespace
     s = name.rstrip(';').strip()
-    s = re.sub(r'[\[\]]', '', s)
+    # Remove any identifier quoting: [..], "..", '..', `..`
+    s = re.sub(r"[\[\]\"'`]", "", s)
+    # Normalize inner whitespace around dots (e.g., dbo . table -> dbo.table)
+    s = re.sub(r"\s*\.\s*", ".", s)
     return s

@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 # Precompiled regexes for light scans and pre-scan in engine
 RE_SINGLELINE_COMMENT = re.compile(r"--.*?$", re.MULTILINE)
 RE_MULTILINE_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-RE_FQN3 = re.compile(r"(?i)(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
-RE_INSERT_INTO3 = re.compile(r"(?i)\bINSERT\s+INTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
-RE_SELECT_INTO3 = re.compile(r"(?is)\bSELECT\b.*?\bINTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
+RE_FQN3 = re.compile(r"(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)", re.IGNORECASE)
+RE_INSERT_INTO3 = re.compile(r"\bINSERT\s+INTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)", re.IGNORECASE)
+RE_SELECT_INTO3 = re.compile(r"\bSELECT\b.*?\bINTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)", re.IGNORECASE | re.DOTALL)
 
 @lru_cache(maxsize=65536)
 def _cached_split_fqn_core(fqn: str):
@@ -56,25 +56,23 @@ def _rewrite_case_with_commas_to_iif(sql: str) -> str:
     # Variant that ends with a closing parenthesis (embedded in another call)
     pat_paren = re.compile(
         r"""
-        (?is)
         CASE\s+WHEN\s+
         (?P<cond>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
         (?P<t>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
         (?P<f>[^)]+?)\s*\)
         """,
-        re.VERBOSE,
+        re.IGNORECASE | re.DOTALL | re.VERBOSE,
     )
 
     # Variant that ends with END
     pat_end = re.compile(
         r"""
-        (?is)
         CASE\s+WHEN\s+
         (?P<cond>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
         (?P<t>[^,()]+(?:\([^)]*\)[^,()]*)*)\s*,\s*
         (?P<f>[^)]+?)\s*END
         """,
-        re.VERBOSE,
+        re.IGNORECASE | re.DOTALL | re.VERBOSE,
     )
 
     out = pat_paren.sub(_safe_repl, sql)
@@ -101,12 +99,12 @@ def _strip_udf_options_between_returns_and_as(sql: str) -> str:
     out = pat_tvf.sub(_repl_tvf, sql or "")
     # Scalar UDF
     pat_scalar = re.compile(
-        r"""(?is)
+        r"""
         (?P<head>\bRETURNS\b\s+(?!TABLE\b)[\w\[\]]+(?:\s*\([^)]*\))?)
         \s+(?P<opts>WITH\b[\s\S]*?)
         \bAS\b
         """,
-        re.IGNORECASE | re.VERBOSE,
+        re.IGNORECASE | re.DOTALL | re.VERBOSE,
     )
     out = pat_scalar.sub(lambda m: f"{m.group('head')}\nAS", out)
     return out
@@ -130,6 +128,9 @@ class SqlParser:
         self._temp_version: Dict[str, int] = {}
         self.default_database: Optional[str] = None  # Will be set from config
         self.current_database: Optional[str] = None  # Track current database context
+        # Current object context for canonical temp naming: db + schema.object
+        self._ctx_db: Optional[str] = None
+        self._ctx_obj: Optional[str] = None
         # cross-file object→DB registry (optional)
         self.registry = registry
         # dbt specifics
@@ -179,11 +180,68 @@ class SqlParser:
         """Clean procedure name by removing semicolons and parameters."""
         return s.strip().rstrip(';').split('(')[0].strip()
     
+    def _dequote(self, s: Optional[str]) -> str:
+        """Remove identifier quoting characters from a string.
+
+        Strips square brackets, double/single quotes and backticks anywhere in the text
+        and trims surrounding whitespace. Safe for identifier-like tokens.
+        """
+        try:
+            return re.sub(r"[\[\]\"'`]", "", (s or "")).strip()
+        except Exception:
+            return (s or "").strip()
+
     def _normalize_table_ident(self, s: str) -> str:
         """Remove brackets and normalize table identifier."""
-        # Remove brackets, trailing semicolons and whitespace
-        normalized = re.sub(r'[\[\]]', '', s)
+        # Remove quotes/brackets, trailing semicolons and whitespace
+        normalized = re.sub(r"[\[\]\"'`]", "", s or "")
+        normalized = re.sub(r"\s*\.\s*", ".", normalized)
         return normalized.strip().rstrip(';')
+
+    def _clean_output_name(self, s: str) -> str:
+        """Sanitize output column names for readability and stability.
+
+        - Remove block and line comments
+        - Dequote identifiers ([], "', `)
+        - Strip leading underscores and whitespace
+        - Collapse internal whitespace
+        """
+        if s is None:
+            return ""
+        try:
+            # drop comments
+            s2 = re.sub(r"/\*.*?\*/", "", str(s), flags=re.S)
+            s2 = re.sub(r"--.*?$", "", s2, flags=re.M)
+        except Exception:
+            s2 = str(s)
+        s2 = self._dequote(s2)
+        # strip leading underscores
+        s2 = re.sub(r"^_+", "", s2)
+        # collapse spaces
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        return s2
+
+    def _canonical_temp_name(self, temp_name: str) -> str:
+        """Build canonical name for a temp table: DB.schema.object.#temp.
+
+        temp_name: '#tmp' or 'tempdb..#tmp' or just '#tmp@v'
+        Uses current object context if available; otherwise falls back to
+        default schema + file stem.
+        """
+        # Extract simple '#name'
+        t = (temp_name or "").split('.')[-1]
+        if not t.startswith('#'):
+            t = f"#{t}"
+        db = self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW'
+        obj = self._ctx_obj
+        if not obj:
+            # Fallback: derive from file name
+            try:
+                stem = (self._current_file or '').split('/')[-1].rsplit('.', 1)[0]
+            except Exception:
+                stem = (self._current_file or 'unknown').split('/')[-1]
+            obj = f"{self.default_schema or 'dbo'}.{stem or 'unknown'}"
+        return f"{db}.{obj}.{t}"
     
     def _normalize_tsql(self, text: str) -> str:
         """Normalize T-SQL to improve sqlglot parsing compatibility."""
@@ -216,7 +274,7 @@ class SqlParser:
 
         # Drop T-SQL-specific XMLNAMESPACES clause which sqlglot doesn't need for lineage
         try:
-            t = re.sub(r"(?is)\bWITH\s+XMLNAMESPACES\s*\(.*?\)\s*", "", t)
+            t = re.sub(r"\bWITH\s+XMLNAMESPACES\s*\(.*?\)\s*", "", t, flags=re.IGNORECASE | re.DOTALL)
         except Exception:
             pass
         
@@ -302,7 +360,10 @@ class SqlParser:
     
     def _split_fqn(self, fqn: str):
         """Split fully qualified name into database, schema, table components (uses cached core)."""
-        db, sch, tbl = _cached_split_fqn_core(fqn)
+        # Dequote before splitting to avoid quoted duplicates
+        fqn_clean = re.sub(r"[\[\]\"'`]", "", fqn or "")
+        fqn_clean = re.sub(r"\s*\.\s*", ".", fqn_clean)
+        db, sch, tbl = _cached_split_fqn_core(fqn_clean)
         if db is None:
             db = self.current_database or self.default_database
         return db, sch, tbl
@@ -331,8 +392,8 @@ class SqlParser:
         pseudo = {"view", "function", "procedure"}
         if len(parts) >= 3 and parts[0].lower() in pseudo:
             parts = parts[1:]
-        # Strip square brackets from all segments for consistent naming
-        parts = [p.strip('[]') for p in parts]
+        # Strip all identifier quoting from segments for consistent naming
+        parts = [self._dequote(p) for p in parts]
 
         # dbt mode: ignore DB/schema from references, normalize to default namespace+schema
         if self.dbt_mode:
@@ -387,7 +448,7 @@ class SqlParser:
             return c
         # Table references
         for t in node.find_all(exp.Table):
-            cat = (str(t.catalog) if t.catalog else "").strip('[]').strip()
+            cat = self._dequote((str(t.catalog) if t.catalog else ""))
             if not cat:
                 continue
             cl = cat.lower()
@@ -398,7 +459,7 @@ class SqlParser:
         for ins in node.find_all(exp.Insert):
             tbl = ins.this
             if isinstance(tbl, exp.Table) and tbl.catalog:
-                cat = str(tbl.catalog).strip('[]')
+                cat = self._dequote(str(tbl.catalog))
                 if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
                     c[cat] += 3
         return c
@@ -410,20 +471,20 @@ class SqlParser:
             return c
         sql = self._strip_sql_comments(sql_text)
         # Find DB.schema.table
-        for m in re.finditer(r'([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)', sql):
-            db = m.group(1).strip('[]')
+        for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)", sql):
+            db = self._dequote(m.group(1))
             if db.lower() in {"view", "function", "procedure", "tempdb"}:
                 continue
             c[db] += 1
         # INSERT INTO DB.schema.table
-        for m in re.finditer(r'(?i)\bINSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)', sql):
-            db = m.group(1).strip('[]')
+        for m in re.finditer(r"\bINSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)", sql, flags=re.IGNORECASE):
+            db = self._dequote(m.group(1))
             if db.lower() in {"view", "function", "procedure", "tempdb"}:
                 continue
             c[db] += 3
         # SELECT ... INTO DB.schema.table
-        for m in re.finditer(r'(?is)\bSELECT\b.*?\bINTO\s+([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]]*)', sql):
-            db = m.group(1).strip('[]')
+        for m in re.finditer(r"(?is)\bSELECT\b.*?\bINTO\s+([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)\s*\.\s*([A-Za-z_][A-Za-z0-9_\[\]\"'`]*)", sql):
+            db = self._dequote(m.group(1))
             if db.lower() in {"view", "function", "procedure", "tempdb"}:
                 continue
             c[db] += 3
@@ -470,7 +531,8 @@ class SqlParser:
         name = tbl.name
         sch = getattr(tbl, "db", None) or "dbo"
         db = getattr(tbl, "catalog", None) or self.current_database or self.default_database
-        return ".".join([p for p in [db, sch, name] if p])
+        # Dequote all pieces to avoid quoted duplicates
+        return ".".join([self._dequote(p) for p in [db, sch, name] if p])
     
     def _build_alias_maps(self, select_exp: exp.Select):
         """Build maps for table aliases and derived table columns."""
@@ -478,6 +540,7 @@ class SqlParser:
         derived_cols = {}    # (alias_lower, out_col_lower) -> list[exp.Column] (base cols of subquery projection)
 
         # Plain tables
+        base_fqns = []
         for t in select_exp.find_all(exp.Table):
             a = getattr(t, "alias", None) or t.args.get("alias")
             alias = None
@@ -491,6 +554,7 @@ class SqlParser:
             if alias: 
                 alias_map[alias] = fqn
             alias_map[t.name.lower()] = fqn
+            base_fqns.append(fqn)
 
         # Derived tables (subqueries with alias)
         for sq in select_exp.find_all(exp.Subquery):
@@ -517,6 +581,14 @@ class SqlParser:
                 derived_cols[key] = list(target.find_all(exp.Column))
                 idx += 1
 
+        # If there is exactly one base table in FROM, allow resolving unqualified columns to it
+        try:
+            uniq = sorted(set(base_fqns))
+            if len(uniq) == 1 and '' not in alias_map:
+                alias_map[''] = uniq[0]
+        except Exception:
+            pass
+
         return alias_map, derived_cols
     
     def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
@@ -530,7 +602,11 @@ class SqlParser:
         try:
             simple = tbl if tbl else None
             if simple and simple.startswith('#'):
-                # Use versioned lineage if present
+                # Always include the temp itself as an input (canonical name)
+                temp_canon = self._canonical_temp_name(simple)
+                ns_temp = f"mssql://localhost/{(self._ctx_db or db or 'InfoTrackerDW').upper()}"
+                out_list.append(ColumnReference(namespace=ns_temp, table_name=temp_canon, column_name=col_exp.name))
+                # And then, if we know its base lineage, include it as well (inline)
                 ver = self._temp_current(simple)
                 colname = col_exp.name
                 if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
@@ -543,7 +619,7 @@ class SqlParser:
             pass
         out_list.append(ColumnReference(
             namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
-            table_name=f"{sch}.{tbl}",  # <== tylko schema.table
+            table_name=f"{sch}.{tbl}",  # <== tylko schema.table (non-temp)
             column_name=col_exp.name
         ))
     
@@ -662,7 +738,8 @@ class SqlParser:
             return
         projs = list(select_exp.expressions or [])
         for i, _ in enumerate(projs):
-            out_name = header[i] if i < len(header) else f"col_{i+1}"
+            raw_name = header[i] if i < len(header) else f"col_{i+1}"
+            out_name = self._clean_output_name(raw_name) or f"col_{i+1}"
             # Update schema
             if i < len(obj.schema.columns):
                 obj.schema.columns[i].name = out_name
@@ -788,9 +865,10 @@ class SqlParser:
         
         # Join two-line INSERT INTO #temp + EXEC patterns
         processed_sql = re.sub(
-            r'(?i)(INSERT\s+INTO\s+#\w+)\s*\n\s*(EXEC\b)',
+            r'(INSERT\s+INTO\s+#\w+)\s*\n\s*(EXEC\b)',
             r'\1 \2',
-            processed_sql
+            processed_sql,
+            flags=re.IGNORECASE
         )
         
         # Cut to first significant statement
@@ -813,13 +891,13 @@ class SqlParser:
         
         
         pattern = re.compile(
-            r'(?is)'                                # DOTALL + IGNORECASE
             r'(?:'
             r'CREATE\s+(?:OR\s+ALTER\s+)?(?:VIEW|TABLE|FUNCTION|PROCEDURE)\b'
             r'|ALTER\s+(?:VIEW|TABLE|FUNCTION|PROCEDURE)\b'
             r'|SELECT\b.*?\bINTO\b'                # SELECT ... INTO (może być w wielu liniach)
             r'|INSERT\s+INTO\b.*?\bEXEC\b'
-            r')'
+            r')',
+            re.IGNORECASE | re.DOTALL
         )
         m = pattern.search(sql)
         return sql[m.start():] if m else sql
@@ -836,12 +914,12 @@ class SqlParser:
         sql_pre = self._preprocess_sql(sql_content)
         
         # Look for INSERT INTO ... EXEC pattern (both temp and regular tables)
-        insert_exec_pattern = r'(?is)INSERT\s+INTO\s+([#\[\]\w.]+)\s+EXEC\s+([^\s(;]+)'
-        exec_match = re.search(insert_exec_pattern, sql_pre)
+        insert_exec_pattern = r'INSERT\s+INTO\s+([#\[\]\w.]+)\s+EXEC\s+([^\s(;]+)'
+        exec_match = re.search(insert_exec_pattern, sql_pre, flags=re.IGNORECASE | re.DOTALL)
         
         # Look for INSERT INTO persistent tables (not temp tables)
-        insert_table_pattern = r'(?is)INSERT\s+INTO\s+([^\s#@][#\[\]\w.]+)\s*\(([^)]+)\)\s+SELECT'
-        table_match = re.search(insert_table_pattern, sql_pre)
+        insert_table_pattern = r'INSERT\s+INTO\s+([^\s#@][#\[\]\w.]+)\s*\(([^)]+)\)\s+SELECT'
+        table_match = re.search(insert_table_pattern, sql_pre, flags=re.IGNORECASE | re.DOTALL)
         
         # Always extract all dependencies from the file
         all_dependencies = self._extract_basic_dependencies(sql_pre)
@@ -933,8 +1011,8 @@ class SqlParser:
         if table_match and not table_match.group(1).startswith('#') and placeholder_columns:
             # For INSERT INTO table with columns, create intelligent lineage mapping
             # Look for EXEC pattern in the same file to map columns to procedure output
-            proc_pattern = r'(?is)INSERT\s+INTO\s+#\w+\s+EXEC\s+([^\s(;]+)'
-            proc_match = re.search(proc_pattern, sql_pre)
+            proc_pattern = r'INSERT\s+INTO\s+#\w+\s+EXEC\s+([^\s(;]+)'
+            proc_match = re.search(proc_pattern, sql_pre, flags=re.IGNORECASE | re.DOTALL)
             
             if proc_match:
                 proc_name = self._clean_proc_name(proc_match.group(1))
@@ -1084,7 +1162,7 @@ class SqlParser:
         # Diagnostics: log RETURNS...AS window (escaped) after lightweight normalization
         try:
             dbg = self._normalize_tsql(sql_content)
-            m = re.search(r'(?is)\bRETURNS\b(.{0,120}?)\bAS\b', dbg)
+            m = re.search(r'\bRETURNS\b(.{0,120}?)\bAS\b', dbg, flags=re.IGNORECASE | re.DOTALL)
             window = m.group(0) if m else "<no match>"
             self._log_debug("RETURNS-window=%r", window)
         except Exception:
@@ -1559,7 +1637,7 @@ class SqlParser:
                         else:
                             name = str(c)
                         if name:
-                            target_columns.append(ColumnSchema(name=name.strip('[]'), data_type="unknown", ordinal=i, nullable=True))
+                            target_columns.append(ColumnSchema(name=self._dequote(name), data_type="unknown", ordinal=i, nullable=True))
             except Exception:
                 target_columns = []
 
@@ -1631,12 +1709,17 @@ class SqlParser:
             
         # Extract dependencies (tables referenced in FROM/JOIN)
         dependencies = self._extract_dependencies(select_expr)
-        # Expand temp dependencies to their base sources if we have them
+        # Expand temp dependencies to their base sources if we have them, but keep canonical temp as well
         if dependencies:
             expanded: Set[str] = set()
             for d in dependencies:
-                if d.startswith('tempdb..#') or d.startswith('#'):
-                    simple = d.split('.')[-1]
+                # detect temp by presence of a segment starting with '#'
+                parts = (d or '').split('.')
+                is_temp = any(seg.startswith('#') for seg in parts)
+                if is_temp:
+                    # keep canonical temp
+                    expanded.add(d)
+                    simple = next((seg for seg in parts if seg.startswith('#')), parts[-1])
                     bases = self.temp_sources.get(simple)
                     if bases:
                         expanded.update(bases)
@@ -1704,7 +1787,7 @@ class SqlParser:
         try:
             raw_tbl = schema_expr.this
             if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
-                cat = str(raw_tbl.catalog).strip('[]')
+                cat = self._dequote(str(raw_tbl.catalog))
                 if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
                     explicit_db = True
         except Exception:
@@ -1763,7 +1846,7 @@ class SqlParser:
     
     def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None) -> ObjectInfo:
         # 1) Wyciągnij nazwę tabeli
-        m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
+        m = re.search(r'CREATE\s+TABLE\s+([^\s(]+)', sql, flags=re.IGNORECASE | re.DOTALL)
         raw_ident = self._normalize_table_ident(m.group(1)) if m else None
         # Do not add default DB yet; let registry mapping decide the DB first
         name_for_ns = raw_ident or (object_hint or "dbo.unknown_table")
@@ -1779,7 +1862,7 @@ class SqlParser:
 
         # 2) Wyciągnij definicję kolumn (balansowane nawiasy od pierwszego '(' po nazwie)
         s = self._normalize_tsql(sql)
-        m = re.search(r'(?is)\bCREATE\s+TABLE\s+([^\s(]+)', s)
+        m = re.search(r'\bCREATE\s+TABLE\s+([^\s(]+)', s, flags=re.IGNORECASE | re.DOTALL)
         start = s.find('(', m.end()) if m else -1
         if start == -1:
             schema = TableSchema(namespace=namespace, name=table_name, columns=[])
@@ -1816,26 +1899,68 @@ class SqlParser:
         if token:
             lines.append(''.join(token).strip())
         # odfiltruj klauzule constraintów tabelowych
-        col_lines = [ln for ln in lines if not re.match(r'(?i)^(CONSTRAINT|PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK)\b', ln)]
+        col_lines = [ln for ln in lines if not re.match(r'^(CONSTRAINT|PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY|CHECK)\b', ln, flags=re.IGNORECASE)]
+
+        # Sklej wiersze, które rozpoczynają się od typu (np. DECIMAL(38,10)...) bez nazwy kolumny —
+        # to często występuje przy łamaniu linii po nazwie kolumny.
+        merged: List[str] = []
+        name_rest_re = re.compile(r'\s*(?:\[[^\]]+\]|"[^"]+"|[A-Za-z_][\w$#]*)\s+.+')
+        for ln in col_lines:
+            if not merged:
+                merged.append(ln)
+                continue
+            if name_rest_re.match(ln):
+                merged.append(ln)
+            else:
+                # Doklej do poprzedniego wpisu
+                merged[-1] = (merged[-1].rstrip() + ' ' + ln.lstrip()).strip()
+        col_lines = merged
 
         cols: List[ColumnSchema] = []
+
+        def _parse_sql_type(rest: str) -> str:
+            s = rest or ""
+            try:
+                s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+                s = re.sub(r"--.*?$", "", s, flags=re.M)
+            except Exception:
+                pass
+            m = re.match(r"\s*(?:\[(?P<t1>[^\]]+)\]|(?P<t2>[A-Za-z_][\w$]*))\s*(?:\(\s*(?P<args>[^)]*)\s*\))?", s, flags=re.IGNORECASE | re.DOTALL)
+            if not m:
+                return "unknown"
+            tname = (m.group('t1') or m.group('t2') or '').strip()
+            tname_u = tname.upper()
+            args = (m.group('args') or '').strip()
+            arg_out = ''
+            # Allow only well-formed args per type family
+            if tname_u in {"DECIMAL", "NUMERIC"}:
+                if re.match(r"^\d+\s*,\s*\d+$", args):
+                    arg_out = f"({re.sub(r'\s+', '', args)})"
+            elif tname_u in {"CHAR", "NCHAR", "VARCHAR", "NVARCHAR", "BINARY", "VARBINARY"}:
+                if re.match(r"^(MAX|\d+)$", args, flags=re.IGNORECASE):
+                    arg_out = f"({args.upper()})"
+            elif tname_u in {"DATETIME2", "TIME", "DATETIMEOFFSET"}:
+                if re.match(r"^\d+$", args):
+                    arg_out = f"({args})"
+            # TEXT, NTEXT, IMAGE, XML, etc. have no args
+            return (tname_u + arg_out).lower()
         for i, ln in enumerate(col_lines):
+            # Strip inline/block comments for robust parsing
+            try:
+                ln = re.sub(r"/\*.*?\*/", "", ln, flags=re.S)
+                ln = re.sub(r"--.*?$", "", ln, flags=re.M)
+            except Exception:
+                pass
             # nazwa kolumny w nawiasach/[] lub goła
             m = re.match(r'\s*(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_][\w$#]*))\s+(.*)$', ln)
             if not m:
                 continue
-            col_name = next(g for g in m.groups()[:3] if g)
+            col_name = self._dequote(next(g for g in m.groups()[:3] if g))
             rest = m.group(4)
 
             # typ: pierwszy token (może być typu NVARCHAR(100) itp.) — bierz nazwę typu + (opcjonalnie) długość
             # typ:  lub varchar(32)
-            t = re.match(r'(?i)\s*(?:\[(?P<t1>[^\]]+)\]|(?P<t2>[A-Za-z_][\w$]*))\s*(?:\(\s*(?P<args>[^)]*?)\s*\))?', rest)
-            if t:
-                tname = (t.group('t1') or t.group('t2') or '').upper()
-                targs = t.group('args')
-                dtype = f"{tname}({targs})" if targs else tname
-            else:
-                dtype = "UNKNOWN"
+            dtype = _parse_sql_type(rest)
 
             # nullable / not null
             nullable = not re.search(r'(?i)\bNOT\s+NULL\b', rest)
@@ -1857,7 +1982,7 @@ class SqlParser:
         try:
             raw_tbl = getattr(statement.this, 'this', statement.this)
             if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
-                cat = str(raw_tbl.catalog).strip('[]')
+                cat = self._dequote(str(raw_tbl.catalog))
                 if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
                     explicit_db = True
         except Exception:
@@ -1907,12 +2032,12 @@ class SqlParser:
         if (not lineage) or (not output_columns):
             try:
                 sql_text = str(statement)
-                m_as = re.search(r"(?is)\bAS\b\s*(.*)$", sql_text)
+                m_as = re.search(r"\bAS\b\s*(.*)$", sql_text, flags=re.IGNORECASE | re.DOTALL)
                 if m_as:
                     body = m_as.group(1)
                     body = self._normalize_tsql(body)
                     # Remove XMLNAMESPACES at the start if any remained
-                    body = re.sub(r"(?is)^\s*WITH\s+XMLNAMESPACES\s*\(.*?\)\s*", "", body)
+                    body = re.sub(r"^\s*WITH\s+XMLNAMESPACES\s*\(.*?\)\s*", "", body, flags=re.IGNORECASE | re.DOTALL)
                     parsed_fallback = sqlglot.parse(body, read=self.dialect)
                     sel = None
                     if parsed_fallback:
@@ -1927,7 +2052,7 @@ class SqlParser:
                     if (not lineage) or (not output_columns):
                         try:
                             # Try to isolate the first SELECT ... clause for basic parsing
-                            m_sel = re.search(r"(?is)\bSELECT\b(.*)$", body)
+                            m_sel = re.search(r"\bSELECT\b(.*)$", body, flags=re.IGNORECASE | re.DOTALL)
                             if m_sel:
                                 select_sql = "SELECT " + m_sel.group(1)
                                 basic_cols = self._extract_basic_select_columns(select_sql)
@@ -1962,6 +2087,31 @@ class SqlParser:
             lineage=lineage,
             dependencies=dependencies
         )
+        # Fallback: if no per-column lineage was resolved but dependencies exist,
+        # synthesize coarse lineage so object-level edges appear in viz.
+        if (not obj.lineage) and obj.schema and obj.schema.columns and dependencies:
+            syn_refs = []
+            for d in sorted(dependencies):
+                parts = d.split('.')
+                if len(parts) >= 3:
+                    db, sch, tbl = parts[0], parts[-2], parts[-1]
+                elif len(parts) == 2:
+                    db = (self.current_database or self.default_database or 'InfoTrackerDW')
+                    sch, tbl = parts
+                else:
+                    db = (self.current_database or self.default_database or 'InfoTrackerDW')
+                    sch, tbl = 'dbo', parts[0]
+                syn_refs.append((f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}", f"{sch}.{tbl}"))
+            syn_lineage = []
+            for col in obj.schema.columns:
+                inputs = [ColumnReference(namespace=ns, table_name=nm, column_name=col.name) for (ns, nm) in syn_refs]
+                syn_lineage.append(ColumnLineage(
+                    output_column=col.name,
+                    input_fields=inputs,
+                    transformation_type=TransformationType.EXPRESSION,
+                    transformation_description="synthetic dependency fallback"
+                ))
+            obj.lineage = syn_lineage
         
         # Apply header column names if CREATE VIEW (col1, col2, ...) AS pattern
         if isinstance(select_stmt, exp.Select):
@@ -1980,7 +2130,7 @@ class SqlParser:
         try:
             raw_tbl = getattr(statement.this, 'this', statement.this)
             if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
-                cat = str(raw_tbl.catalog).strip('[]')
+                cat = self._dequote(str(raw_tbl.catalog))
                 if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
                     explicit_db = True
         except Exception:
@@ -2046,12 +2196,14 @@ class SqlParser:
         ns, nm = self._ns_and_name(raw_proc, obj_type_hint="procedure")
         namespace = ns
         procedure_name = nm
+        # Establish context for canonical temp naming
+        prev_ctx_db, prev_ctx_obj = self._ctx_db, self._ctx_obj
         # If no explicit DB in object name, try inferring from body
         explicit_db = False
         try:
             raw_tbl = getattr(statement.this, 'this', statement.this)
             if isinstance(raw_tbl, exp.Table) and getattr(raw_tbl, 'catalog', None):
-                cat = str(raw_tbl.catalog).strip('[]')
+                cat = self._dequote(str(raw_tbl.catalog))
                 if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"}:
                     explicit_db = True
         except Exception:
@@ -2074,6 +2226,13 @@ class SqlParser:
             pass
 
         
+        # Update context DB now that namespace may have been adjusted
+        try:
+            self._ctx_db = (namespace.rsplit('/', 1)[-1]) if namespace else (self.current_database or self.default_database)
+        except Exception:
+            self._ctx_db = (self.current_database or self.default_database)
+        self._ctx_obj = procedure_name
+
         # Extract the procedure body and find materialized outputs (SELECT INTO, INSERT INTO)
         materialized_outputs = self._extract_procedure_outputs(statement)
         
@@ -2094,6 +2253,8 @@ class SqlParser:
                     lineage=m_lineage,
                     dependencies=m_deps,
                 )
+                # Restore context before return
+                self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
                 return out_obj
 
         # If we have materialized outputs (SELECT INTO/INSERT INTO), return the last one instead of the procedure
@@ -2115,6 +2276,8 @@ class SqlParser:
                     name=last_output.name,
                     columns=output_columns
                 )
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return last_output
         
         # Fall back to regular procedure parsing if no materialized outputs
@@ -2138,6 +2301,8 @@ class SqlParser:
             dependencies=dependencies
         )
         obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
+        # Restore context before return
+        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return obj
     
     def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
@@ -2146,8 +2311,8 @@ class SqlParser:
         sql_text = str(statement)
         
         # Look for SELECT ... INTO patterns
-        select_into_pattern = r'(?i)SELECT\s+.*?\s+INTO\s+([^\s,]+)'
-        select_into_matches = re.findall(select_into_pattern, sql_text, re.DOTALL)
+        select_into_pattern = r'SELECT\s+.*?\s+INTO\s+([^\s,]+)'
+        select_into_matches = re.findall(select_into_pattern, sql_text, flags=re.IGNORECASE | re.DOTALL)
         
         for table_match in select_into_matches:
             table_name = table_match.strip()
@@ -2169,8 +2334,8 @@ class SqlParser:
                 ))
         
         # Look for INSERT INTO patterns (non-temp tables)
-        insert_into_pattern = r'(?i)INSERT\s+INTO\s+([^\s,\(]+)'
-        insert_into_matches = re.findall(insert_into_pattern, sql_text)
+        insert_into_pattern = r'INSERT\s+INTO\s+([^\s,\(]+)'
+        insert_into_matches = re.findall(insert_into_pattern, sql_text, flags=re.IGNORECASE)
         
         for table_match in insert_into_matches:
             table_name = table_match.strip()
@@ -2271,19 +2436,19 @@ class SqlParser:
             return TransformationType.IDENTITY
 
         # Map UPDATE SET tgt.col = <expr>
-        update_block = re.search(r'(?is)WHEN\s+MATCHED.*?THEN\s+UPDATE\s+SET\s+(.*?)(?:WHEN\s+|;|$)', cleaned)
+        update_block = re.search(r'WHEN\s+MATCHED.*?THEN\s+UPDATE\s+SET\s+(.*?)(?:WHEN\s+|;|$)', cleaned, flags=re.IGNORECASE | re.DOTALL)
         assign_exprs: list[tuple[str, str]] = []  # (target_col, rhs_expr)
         if update_block:
             assigns_raw = update_block.group(1)
             for a in re.split(r',\s*', assigns_raw):
                 left_alias_part = re.escape(tgt_alias) + r'\.|tgt\.|target\.|\w+\.' if tgt_alias else r'tgt\.|target\.|\w+\.'
-                pat = rf"(?is)\b(?:{left_alias_part})?(\w+)\s*=\s*(.+)$"
-                ma = re.search(pat, a.strip())
+                pat = rf"\b(?:{left_alias_part})?(\w+)\s*=\s*(.+)$"
+                ma = re.search(pat, a.strip(), flags=re.IGNORECASE | re.DOTALL)
                 if ma:
                     assign_exprs.append((ma.group(1), ma.group(2)))
 
         # Map INSERT (cols...) VALUES (src.cols...)
-        insert_block = re.search(r'(?is)WHEN\s+NOT\s+MATCHED\s+BY\s+TARGET\s+THEN\s+INSERT\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)', cleaned)
+        insert_block = re.search(r'WHEN\s+NOT\s+MATCHED\s+BY\s+TARGET\s+THEN\s+INSERT\s*\(([^)]*)\)\s*VALUES\s*\(([^)]*)\)', cleaned, flags=re.IGNORECASE | re.DOTALL)
         if insert_block:
             cols = [c.strip() for c in insert_block.group(1).split(',') if c.strip()]
             vals = [v.strip() for v in insert_block.group(2).split(',') if v.strip()]
@@ -2482,10 +2647,10 @@ class SqlParser:
                 # Learn references with explicit DB if available
                 try:
                     if getattr(table, 'catalog', None):
-                        cat = str(table.catalog).strip('[]')
+                        cat = self._dequote(str(table.catalog))
                         if cat and cat.lower() not in {"view", "function", "procedure", "tempdb"} and self.registry:
                             sch = str(table.db) if getattr(table, 'db', None) else 'dbo'
-                            nm = f"{sch}.{table.name}"
+                            nm = f"{self._dequote(sch)}.{self._dequote(table.name)}"
                             self.registry.learn_from_references(nm, cat)
                 except Exception:
                     pass
@@ -2503,7 +2668,11 @@ class SqlParser:
                                 break
                 else:
                     # Regular table dependency
-                    dependencies.add(table_name)
+                    # Canonicalize temp tables to DB.schema.object.#temp so they appear distinctly
+                    if table_name.startswith('tempdb..#') or table_name.startswith('#'):
+                        dependencies.add(self._canonical_temp_name(table_name))
+                    else:
+                        dependencies.add(table_name)
         
         # Also check for subqueries and CTEs
         for subquery in select_stmt.find_all(exp.Subquery):
@@ -2569,8 +2738,42 @@ class SqlParser:
                     out_name = "calc_expr"
                 inner = proj
 
+            # Clean output name (remove comments/quotes, leading underscores)
+            out_name = self._clean_output_name(out_name) or f"col_{ordinal+1}"
+
             # Collect input fields using enhanced resolution
             inputs = self._collect_inputs_for_expr(inner, alias_map, derived_cols)
+            # Fallback: unqualified column with a single base table
+            if not inputs and isinstance(inner, exp.Column):
+                try:
+                    base_fqn = alias_map.get('')
+                    if base_fqn:
+                        db, sch, tbl = self._split_fqn(base_fqn)
+                        inputs = [
+                            ColumnReference(
+                                namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
+                                table_name=f"{sch}.{tbl}",
+                                column_name=inner.name,
+                            )
+                        ]
+                except Exception:
+                    pass
+            # Fallback 2: simple identifier (e.g., [col]) with a single base table
+            if not inputs and isinstance(inner, exp.Identifier):
+                try:
+                    base_fqn = alias_map.get('')
+                    if base_fqn:
+                        db, sch, tbl = self._split_fqn(base_fqn)
+                        src_col = self._dequote(str(inner))
+                        inputs = [
+                            ColumnReference(
+                                namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
+                                table_name=f"{sch}.{tbl}",
+                                column_name=src_col,
+                            )
+                        ]
+                except Exception:
+                    pass
             
             # Infer output type using enhanced type system
             out_type = self._infer_type(inner, alias_map)
@@ -2605,7 +2808,38 @@ class SqlParser:
                 ordinal=ordinal
             ))
             ordinal += 1
-        
+        # Synthetic fallback: if no inputs were resolved but we have output columns and dependencies,
+        # create coarse lineage by linking each output column to each dependency table.
+        if not lineage and output_columns:
+            try:
+                deps = self._extract_dependencies(select_stmt) or set()
+            except Exception:
+                deps = set()
+            if deps:
+                refs_cache = []
+                for d in sorted(deps):
+                    parts = d.split('.')
+                    if len(parts) >= 3:
+                        db, sch, tbl = parts[0], parts[-2], parts[-1]
+                    elif len(parts) == 2:
+                        db = (self.current_database or self.default_database or 'InfoTrackerDW')
+                        sch, tbl = parts
+                    else:
+                        db = (self.current_database or self.default_database or 'InfoTrackerDW')
+                        sch, tbl = 'dbo', parts[0]
+                    refs_cache.append((f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}", f"{sch}.{tbl}"))
+
+                new_lineage = []
+                for col in output_columns:
+                    inputs = [ColumnReference(namespace=ns, table_name=nm, column_name=col.name) for (ns, nm) in refs_cache]
+                    new_lineage.append(ColumnLineage(
+                        output_column=col.name,
+                        input_fields=inputs,
+                        transformation_type=TransformationType.EXPRESSION,
+                        transformation_description="synthetic dependency fallback"
+                    ))
+                lineage = new_lineage
+
         return lineage, output_columns
     
     def _analyze_expression_lineage(self, output_name: str, expr: exp.Expression, context: exp.Select) -> ColumnLineage:
@@ -3153,26 +3387,88 @@ class SqlParser:
         first_select = union_selects[0]
         if isinstance(first_select, exp.Select):
             first_lineage, first_columns = self._extract_column_lineage(first_select, view_name)
-            
-            # For each output column, collect input fields from all UNION branches
-            for i, col_lineage in enumerate(first_lineage):
-                all_input_fields = list(col_lineage.input_fields)
-                
-                # Add input fields from other UNION branches
-                for other_select in union_selects[1:]:
-                    if isinstance(other_select, exp.Select):
-                        other_lineage, _ = self._extract_column_lineage(other_select, view_name)
-                        if i < len(other_lineage):
-                            all_input_fields.extend(other_lineage[i].input_fields)
-                
-                lineage.append(ColumnLineage(
-                    output_column=col_lineage.output_column,
-                    input_fields=all_input_fields,
-                    transformation_type=TransformationType.UNION,
-                    transformation_description="UNION operation"
-                ))
-            
-            output_columns = first_columns
+            if first_lineage:
+                # Normal path: merge inputs per position across branches
+                for i, col_lineage in enumerate(first_lineage):
+                    all_input_fields = list(col_lineage.input_fields)
+                    for other_select in union_selects[1:]:
+                        if isinstance(other_select, exp.Select):
+                            other_lineage, _ = self._extract_column_lineage(other_select, view_name)
+                            if i < len(other_lineage):
+                                all_input_fields.extend(other_lineage[i].input_fields)
+                    lineage.append(ColumnLineage(
+                        output_column=col_lineage.output_column,
+                        input_fields=all_input_fields,
+                        transformation_type=TransformationType.UNION,
+                        transformation_description="UNION operation"
+                    ))
+                output_columns = first_columns
+            else:
+                # Fallback: if inner SELECTs yield no per-column inputs (e.g., unqualified bracketed columns),
+                # synthesize lineage by linking each output column to the single base table per branch.
+                def proj_names(sel: exp.Select):
+                    names = []
+                    for proj in (sel.expressions or []):
+                        if isinstance(proj, exp.Alias):
+                            names.append(proj.alias or proj.alias_or_name)
+                        elif isinstance(proj, exp.Column):
+                            names.append(proj.name)
+                        else:
+                            names.append(str(proj)[:32] or f"expr_{len(names)+1}")
+                    return names
+                # Determine base table per branch (use first plain table if present)
+                def base_fqn(sel: exp.Select):
+                    t = next(sel.find_all(exp.Table), None)
+                    if not t:
+                        return None
+                    return self._qualify_table(t)
+                # Try to extract mapping src->alias via regex from SQL text for better column names
+                def src_alias_pairs(sel: exp.Select):
+                    try:
+                        txt = sel.sql(self.dialect)
+                    except Exception:
+                        txt = str(sel)
+                    pairs = []
+                    import re as _re
+                    for m in _re.finditer(r"\[([^\]]+)\]\s+AS\s+\[([^\]]+)\]", txt, _re.IGNORECASE):
+                        pairs.append((m.group(1), m.group(2)))
+                    return pairs
+
+                pairs = src_alias_pairs(first_select)
+                if pairs:
+                    out_names = [alias for (_src, alias) in pairs]
+                else:
+                    out_names = proj_names(first_select)
+                output_columns = [ColumnSchema(name=n, data_type="unknown", nullable=True, ordinal=i)
+                                  for i, n in enumerate(out_names)]
+                # For each output position, collect synthetic refs from each branch base table
+                for i, n in enumerate(out_names):
+                    refs = []
+                    for br in union_selects:
+                        if not isinstance(br, exp.Select):
+                            continue
+                        fqn = base_fqn(br)
+                        if not fqn:
+                            continue
+                        db, sch, tbl = self._split_fqn(fqn)
+                        src_col = None
+                        try:
+                            pr = src_alias_pairs(br)
+                            if pr and i < len(pr):
+                                src_col = pr[i][0]
+                        except Exception:
+                            src_col = None
+                        refs.append(ColumnReference(
+                            namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
+                            table_name=f"{sch}.{tbl}",
+                            column_name=src_col or n,
+                        ))
+                    lineage.append(ColumnLineage(
+                        output_column=n,
+                        input_fields=refs,
+                        transformation_type=TransformationType.UNION,
+                        transformation_description="UNION operation (fallback)"
+                    ))
         
         return lineage, output_columns
     
@@ -3221,6 +3517,10 @@ class SqlParser:
         function_name = self._extract_function_name(sql_content) or object_hint or "unknown_function"
         inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content) or self.current_database
         namespace = f"mssql://localhost/{(inferred_db or self.default_database or 'InfoTrackerDW').upper()}"
+        # Establish context for canonical temp naming within this function
+        prev_ctx_db, prev_ctx_obj = self._ctx_db, self._ctx_obj
+        self._ctx_db = (inferred_db or self.current_database or self.default_database)
+        self._ctx_obj = self._normalize_table_name_for_output(function_name)
         
         # Check if this is a table-valued function
         if not self._is_table_valued_function_string(sql_content):
@@ -3246,6 +3546,8 @@ class SqlParser:
                     self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
             except Exception:
                 pass
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return obj
         
         # Handle table-valued functions
@@ -3282,6 +3584,8 @@ class SqlParser:
                 self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
+        # Restore context before return
+        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return obj
     
     def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -3299,6 +3603,32 @@ class SqlParser:
         # Preferuj bazę z USE; w razie braku spróbuj wywnioskować z treści, a na końcu default
         inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content) or self.current_database
         namespace = f"mssql://localhost/{(inferred_db or self.default_database or 'InfoTrackerDW').upper()}"
+        # Establish context for canonical temp naming within this procedure
+        prev_ctx_db, prev_ctx_obj = self._ctx_db, self._ctx_obj
+        self._ctx_db = (inferred_db or self.current_database or self.default_database)
+        self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
+
+        # Pre-scan ciała procedury AST-em, aby zarejestrować lineage dla tempów (SELECT INTO #tmp),
+        # również gdy SELECT znajduje się wewnątrz CREATE PROCEDURE.
+        try:
+            stmts = sqlglot.parse(self._normalize_tsql(sql_content), read=self.dialect) or []
+            for st in stmts:
+                # top-level SELECT ... INTO (rzadko w procedurach)
+                if isinstance(st, exp.Select) and self._is_select_into(st):
+                    try:
+                        self._parse_select_into(st, object_hint)
+                    except Exception:
+                        pass
+                # SELECT ... INTO zagnieżdżone w CREATE PROCEDURE
+                if isinstance(st, exp.Create):
+                    for node in st.walk():
+                        if isinstance(node, exp.Select) and self._is_select_into(node):
+                            try:
+                                self._parse_select_into(node, object_hint)
+                            except Exception:
+                                pass
+        except Exception:
+            pass
 
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
@@ -3362,6 +3692,8 @@ class SqlParser:
                     self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
             except Exception:
                 pass
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return materialized_output
 
         # 2) Spróbuj MERGE INTO ... USING ... jako materializację celu
@@ -3389,6 +3721,10 @@ class SqlParser:
                     self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
             except Exception:
                 pass
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return out_obj
 
         # 2b) Spróbuj UPDATE ... FROM t JOIN s ...
@@ -3406,6 +3742,8 @@ class SqlParser:
                 lineage=u_lineage,
                 dependencies=u_deps,
             )
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return out_obj
 
         # 2c) Spróbuj DML z OUTPUT INTO
@@ -3423,6 +3761,8 @@ class SqlParser:
                 lineage=o_lineage,
                 dependencies=o_deps,
             )
+            # Restore context before return
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return out_obj
 
         # 3) Jeśli nie materializuje — standard: ostatni SELECT jako „wirtualny” dataset procedury
@@ -3453,6 +3793,8 @@ class SqlParser:
         except Exception:
             pass
         obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
+        # Restore context before return
+        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return obj
 
     def _extract_insert_select_lineage_string(self, sql_content: str, object_name: str) -> tuple[List[ColumnLineage], Set[str]]:
@@ -3465,10 +3807,10 @@ class SqlParser:
 
         s = self._strip_sql_comments(self._normalize_tsql(sql_content))
         # Try to capture the SELECT payload for INSERT INTO ... SELECT ... ;
-        m = re.search(r'(?is)INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?);', s)
+        m = re.search(r'INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?);', s, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             # Looser fallback: up to next GO/COMMIT/RETURN/END or end of string
-            m = re.search(r'(?is)INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?)(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b|$)', s)
+            m = re.search(r'INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?)(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b|$)', s, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             return lineage, dependencies
 
@@ -3480,12 +3822,26 @@ class SqlParser:
             if parsed and isinstance(parsed[0], exp.Select):
                 lineage, _out_cols = self._extract_column_lineage(parsed[0], object_name)
                 deps = self._extract_dependencies(parsed[0])
-                dependencies.update(deps)
             else:
-                # Fallback to basic dependency extraction
-                dependencies.update(self._extract_basic_dependencies(select_sql))
+                deps = self._extract_basic_dependencies(select_sql)
         except Exception:
-            dependencies.update(self._extract_basic_dependencies(select_sql))
+            deps = self._extract_basic_dependencies(select_sql)
+
+        # Merge canonical temps and base sources
+        expanded: Set[str] = set()
+        for d in deps:
+            parts = (d or '').split('.')
+            is_temp = any(seg.startswith('#') for seg in parts)
+            if is_temp:
+                # keep canonical temp
+                expanded.add(d)
+                simple = next((seg for seg in parts if seg.startswith('#')), parts[-1])
+                bases = self.temp_sources.get(simple)
+                if bases:
+                    expanded.update(bases)
+            else:
+                expanded.add(d)
+        dependencies.update(expanded)
 
         return lineage, dependencies
 
@@ -3533,24 +3889,26 @@ class SqlParser:
                     tbl = parts[0]
                     full_name = f"{db}.{sch}.{tbl}"
             ns = f"mssql://localhost/{(db or (self.current_database or self.default_database or 'InfoTrackerDW')).upper()}"
+            # Normalize object key to schema.table for engine graph consistency
+            nm = self._normalize_table_name_for_output(full_name)
 
             return ObjectInfo(
-                name=full_name,
+                name=nm,
                 object_type="table",
-                schema=TableSchema(namespace=ns, name=full_name, columns=[]),
+                schema=TableSchema(namespace=ns, name=nm, columns=[]),
                 lineage=[],
                 dependencies=set()
             )
 
         # 2) SELECT ... INTO <table>
         #    (łapiemy pierwszy „persistent” match)
-        for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
+        for m in re.finditer(r'\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s, flags=re.IGNORECASE | re.DOTALL):
             obj = _to_obj(m.group(1))
             if obj:
                 return obj
 
         # 3) INSERT INTO <table> [ (cols...) ] SELECT ...
-        for m in re.finditer(r'(?is)\bINSERT\s+INTO\s+([^\s,()\r\n;]+)', s):
+        for m in re.finditer(r'\bINSERT\s+INTO\s+([^\s,()\r\n;]+)', s, flags=re.IGNORECASE | re.DOTALL):
             obj = _to_obj(m.group(1))
             if obj:
                 return obj
@@ -3569,7 +3927,7 @@ class SqlParser:
 
         s = self._strip_sql_comments(self._normalize_tsql(sql_content))
         # Match UPDATE <target> [AS tgt]
-        m_upd = re.search(r'(?is)\bUPDATE\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?\s+SET\s+(.*?)\bFROM\b(.*)$', s)
+        m_upd = re.search(r'\bUPDATE\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?\s+SET\s+(.*?)\bFROM\b(.*)$', s, flags=re.IGNORECASE | re.DOTALL)
         if not m_upd:
             return lineage, output_columns, dependencies, None
         target_raw = self._normalize_table_ident(m_upd.group(1))
@@ -3707,7 +4065,7 @@ class SqlParser:
             return f"dbo.{name}"
 
         # Try UPDATE ... OUTPUT ... INTO
-        m_upd = re.search(r'(?is)\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+        m_upd = re.search(r'\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s, flags=re.IGNORECASE | re.DOTALL)
         dml_type = None
         dml_target = None
         out_exprs = None
@@ -3718,7 +4076,7 @@ class SqlParser:
             target_output = _st(m_upd.group(3))
         else:
             # Try INSERT ... OUTPUT ... INTO
-            m_ins = re.search(r'(?is)\bINSERT\s+INTO\s+([^\s(,;]+)[^;]*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+            m_ins = re.search(r'\bINSERT\s+INTO\s+([^\s(,;]+)[^;]*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s, flags=re.IGNORECASE | re.DOTALL)
             if m_ins:
                 dml_type = 'INSERT'
                 dml_target = _st(m_ins.group(1))
@@ -3726,7 +4084,7 @@ class SqlParser:
                 target_output = _st(m_ins.group(3))
             else:
                 # Try DELETE ... OUTPUT ... INTO
-                m_del = re.search(r'(?is)\bDELETE\s+FROM\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+                m_del = re.search(r'\bDELETE\s+FROM\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s, flags=re.IGNORECASE | re.DOTALL)
                 if m_del:
                     dml_type = 'DELETE'
                     dml_target = _st(m_del.group(1))
@@ -3743,13 +4101,13 @@ class SqlParser:
         alias_map: Dict[str, str] = {}
         if dml_type == 'UPDATE':
             # Capture FROM tail for aliases
-            m_from = re.search(r'(?is)\bFROM\b(.*)$', s)
+            m_from = re.search(r'\bFROM\b(.*)$', s, flags=re.IGNORECASE | re.DOTALL)
             if m_from:
                 from_tail = m_from.group(1)
                 def _noise_token(tok: str) -> bool:
                     t = (tok or '').strip()
                     return (t.startswith('@') or ('+' in t) or (t.startswith('[') and t.endswith(']') and '.' not in t))
-                for m in re.finditer(r'(?is)\bFROM\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_tail):
+                for m in re.finditer(r'\bFROM\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_tail, flags=re.IGNORECASE | re.DOTALL):
                     raw_tok = m.group(1)
                     if _noise_token(raw_tok):
                         continue
@@ -3759,7 +4117,7 @@ class SqlParser:
                         alias_map[al.lower()] = tbl
                     else:
                         alias_map[tbl.split('.')[-1].lower()] = tbl
-                for m in re.finditer(r'(?is)\bJOIN\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', from_tail):
+                for m in re.finditer(r'\bJOIN\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', from_tail, flags=re.IGNORECASE | re.DOTALL):
                     raw_tok = m.group(1)
                     if _noise_token(raw_tok):
                         continue
@@ -3798,10 +4156,10 @@ class SqlParser:
         for idx, e in enumerate(exprs):
             expr = e
             # Optional AS alias for output column name
-            m_as = re.search(r'(?is)^(.*?)\s+AS\s+([\w\[\]]+)$', expr)
+            m_as = re.search(r"(?is)^(.*?)\s+AS\s+([\w\[\]\"'`]+)$", expr)
             if m_as:
                 expr_core = m_as.group(1).strip()
-                out_name = m_as.group(2).strip('[]')
+                out_name = self._clean_output_name(m_as.group(2))
             else:
                 expr_core = expr
                 # Try derive from inserted/deleted.col
@@ -3908,7 +4266,7 @@ class SqlParser:
         lineage = []
         output_columns = []
         dependencies = set()
-        m = re.search(r'(?is)INSERT\s+INTO\s+[^\s(]+(?:\s*\([^)]*\))?\s+SELECT\b(.*)$', sql_content)
+        m = re.search(r'INSERT\s+INTO\s+[^\s(]+(?:\s*\([^)]*\))?\s+SELECT\b(.*)$', sql_content, flags=re.IGNORECASE | re.DOTALL)
         if m:
             select_sql = "SELECT " + m.group(1)
             try:
@@ -3945,7 +4303,7 @@ class SqlParser:
         return lineage, output_columns, dependencies
     
     def _extract_insert_into_columns(self, sql_content: str) -> list[str]:
-        m = re.search(r'(?is)INSERT\s+INTO\s+[^\s(]+\s*\((.*?)\)', sql_content)
+        m = re.search(r'INSERT\s+INTO\s+[^\s(]+\s*\((.*?)\)', sql_content, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             return []
         inner = m.group(1)
@@ -3954,6 +4312,14 @@ class SqlParser:
             col = raw.strip()
             # zbij aliasy i nawiasy, zostaw samą nazwę
             col = col.split('.')[-1]
+            # remove comments, quotes and leading underscores
+            try:
+                col = re.sub(r"/\*.*?\*/", "", col, flags=re.S)
+                col = re.sub(r"--.*?$", "", col, flags=re.M)
+            except Exception:
+                pass
+            col = self._dequote(col)
+            col = re.sub(r'^_+', '', col)
             col = re.sub(r'[^\w]', '', col)
             if col:
                 cols.append(col)
@@ -4065,7 +4431,7 @@ class SqlParser:
         """Extract column schema from RETURNS @var TABLE (...) with nested parens support."""
         s = sql_content
         # Find the position of "RETURNS @... TABLE ("
-        m = re.search(r'(?is)RETURNS\s+@\w+\s+TABLE\s*\(', s)
+        m = re.search(r'RETURNS\s+@\w+\s+TABLE\s*\(', s, flags=re.IGNORECASE | re.DOTALL)
         if not m:
             return []
         start = m.end()  # position after the opening parenthesis
@@ -4108,7 +4474,7 @@ class SqlParser:
             m2 = re.match(r"\s*(\[[^\]]+\]|[A-Za-z_][\w$#]*)\s+((?:\[[^\]]+\]|[A-Za-z_][\w$]*)\s*(?:\([^)]*\))?)", col_def)
             if not m2:
                 continue
-            name = m2.group(1).strip('[]')
+            name = self._dequote(m2.group(1))
             dtype = m2.group(2).strip()
             cols.append(ColumnSchema(name=name, data_type=dtype, nullable=True, ordinal=idx))
         return cols
@@ -4123,6 +4489,12 @@ class SqlParser:
         match = re.search(r'SELECT\s+(.*?)\s+FROM', select_sql, re.IGNORECASE | re.DOTALL)
         if match:
             select_list = match.group(1)
+            # Remove comments to avoid leakage into names
+            try:
+                select_list = re.sub(r"/\*.*?\*/", "", select_list, flags=re.S)
+                select_list = re.sub(r"--.*?$", "", select_list, flags=re.M)
+            except Exception:
+                pass
             columns = [col.strip() for col in select_list.split(',')]
             
             for i, col in enumerate(columns):
@@ -4136,6 +4508,8 @@ class SqlParser:
                     # Extract the base column name
                     col_name = col.split('.')[-1] if '.' in col else col
                     col_name = re.sub(r'[^\w]', '', col_name)  # Remove non-alphanumeric
+                # Clean: dequote, strip leading underscores, trim
+                col_name = self._clean_output_name(col_name) or f"col_{i+1}"
                 
                 if col_name:
                     output_columns.append(ColumnSchema(
@@ -4187,8 +4561,8 @@ class SqlParser:
         aliases = {}
         
         # Find FROM clause and all JOIN clauses
-        from_join_pattern = r'(?i)\b(?:FROM|JOIN)\s+([^\s]+)(?:\s+AS\s+)?(\w+)?'
-        matches = re.findall(from_join_pattern, select_sql)
+        from_join_pattern = r'\b(?:FROM|JOIN)\s+([^\s]+)(?:\s+AS\s+)?(\w+)?'
+        matches = re.findall(from_join_pattern, select_sql, flags=re.IGNORECASE)
         
         for table_name, alias in matches:
             clean_table = table_name.strip()
@@ -4336,7 +4710,7 @@ class SqlParser:
                     simplified = f"{parts[-2]}.{parts[-1]}"
                     insert_targets.add(simplified)
         
-        # Process tables, functions, and procedures
+        # Process tables, functions, and procedures (limit to core sources for performance)
         all_matches = from_matches + join_matches + update_matches + delete_matches + merge_matches + exec_matches
         for match in all_matches:
             table_name = match.strip()
@@ -4375,27 +4749,29 @@ class SqlParser:
             if table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name:
                 continue
 
-            # Skip temp tables for dependency tracking
-            if not table_name.startswith('#') and table_name.lower() not in sql_keywords:
-                # Get full qualified name for consistent dependency tracking
-                full_name = self._get_full_table_name(table_name)
-                from .openlineage_utils import sanitize_name
-                full_name = sanitize_name(full_name)
-                
-                # Always use fully qualified format: database.schema.table
-                # This ensures consistent topological sorting
-                parts = full_name.split('.')
-                if len(parts) >= 3:
-                    qualified_name = full_name  # Already has database.schema.table
-                elif len(parts) == 2:
-                    # schema.table -> add default database
-                    db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
-                    qualified_name = f"{db_to_use}.{full_name}"
+            # Include temp tables; canonicalize them to DB.schema.object.#temp
+            if table_name.lower() not in sql_keywords:
+                if table_name.startswith('#') or table_name.lower().startswith('tempdb..#'):
+                    qualified_name = self._canonical_temp_name(table_name)
                 else:
-                    # just table -> add default database and schema
-                    db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
-                    qualified_name = f"{db_to_use}.dbo.{table_name}"
-                    
+                    # Get full qualified name for consistent dependency tracking
+                    full_name = self._get_full_table_name(table_name)
+                    from .openlineage_utils import sanitize_name
+                    full_name = sanitize_name(full_name)
+
+                    # Always use fully qualified format: database.schema.table
+                    parts = full_name.split('.')
+                    if len(parts) >= 3:
+                        qualified_name = full_name  # Already has database.schema.table
+                    elif len(parts) == 2:
+                        # schema.table -> add database
+                        db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
+                        qualified_name = f"{db_to_use}.{full_name}"
+                    else:
+                        # just table -> add default database and schema
+                        db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
+                        qualified_name = f"{db_to_use}.dbo.{table_name}"
+
                 # Check if this is an output table (exclude from dependencies)
                 output_check_parts = qualified_name.split('.')
                 if len(output_check_parts) >= 2:

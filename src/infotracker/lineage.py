@@ -10,9 +10,20 @@ from typing import Dict, List, Any, Optional
 from .models import ObjectInfo, ColumnLineage, TransformationType
 
 
+def _dequote(s: str) -> str:
+    try:
+        import re
+        return re.sub(r"[\[\]\"'`]", "", s or "").strip()
+    except Exception:
+        return (s or "").strip()
+
+
 def _ns_for_dep(dep: str, default_ns: str) -> str:
-    """Determine namespace for a dependency based on its database context."""
-    d = (dep or "").strip()
+    """Determine namespace for a dependency based on its database context.
+
+    Strips quotes/brackets from identifiers to avoid duplicates.
+    """
+    d = _dequote(dep or "")
     dl = d.lower()
     if dl.startswith("tempdb..#") or dl.startswith("#"):
         return "mssql://localhost/tempdb"
@@ -21,6 +32,7 @@ def _ns_for_dep(dep: str, default_ns: str) -> str:
     return f"mssql://localhost/{(db or '').upper()}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
 
 def _strip_db_prefix(name: str) -> str:
+    name = _dequote(name or "")
     parts = (name or "").split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
@@ -37,8 +49,7 @@ def _is_noise_dep(dep: str) -> bool:
         return True
     d = dep.strip()
     dl = d.lower()
-    if dl.startswith("tempdb..#") or d.startswith("#"):
-        return True
+    # keep temp tables visible in upstream/lineage
     if d.startswith("@"):
         return True
     if "+" in d:
@@ -210,8 +221,7 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
             def _is_noise_name(n: str) -> bool:
                 if not n:
                     return True
-                if n.startswith('tempdb..#') or n.startswith('#'):
-                    return True
+                # keep temp tables visible
                 if n.startswith('@'):
                     return True
                 if '+' in n:
