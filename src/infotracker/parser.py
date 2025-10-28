@@ -3839,9 +3839,57 @@ class SqlParser:
                 bases = self.temp_sources.get(simple)
                 if bases:
                     expanded.update(bases)
+                else:
+                    # As a last resort, try to discover bases for this temp via a local string scan of SELECT ... INTO #temp
+                    try:
+                        patt = re.compile(r"(?is)SELECT\b.*?\bINTO\s+" + re.escape(simple) + r"\b(.*?)(?=;|\b(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|END|GO)\b|$)")
+                        mm = patt.search(s)
+                        if mm:
+                            sel_into_sql = "SELECT " + mm.group(1)
+                            try:
+                                parsed_b = sqlglot.parse(sel_into_sql, read=self.dialect)
+                                if parsed_b and isinstance(parsed_b[0], exp.Select):
+                                    bases2 = self._extract_dependencies(parsed_b[0])
+                                else:
+                                    bases2 = self._extract_basic_dependencies(sel_into_sql)
+                            except Exception:
+                                bases2 = self._extract_basic_dependencies(sel_into_sql)
+                            for b in (bases2 or []):
+                                expanded.add(b)
+                    except Exception:
+                        pass
             else:
                 expanded.add(d)
         dependencies.update(expanded)
+
+        # If AST-based lineage failed but we have dependencies and INSERT column list,
+        # synthesize coarse column-level lineage so upstream appears in the graph.
+        if not lineage and dependencies:
+            try:
+                out_cols = self._extract_insert_into_columns(sql_content)
+            except Exception:
+                out_cols = []
+            if out_cols:
+                refs_cache = []
+                for d in sorted(dependencies):
+                    parts = (d or '').split('.')
+                    if len(parts) >= 3:
+                        db, sch, tbl = parts[0], parts[-2], parts[-1]
+                    elif len(parts) == 2:
+                        db = (self.current_database or self.default_database or 'InfoTrackerDW')
+                        sch, tbl = parts
+                    else:
+                        db = (self.current_database or self.default_database or 'InfoTrackerDW')
+                        sch, tbl = 'dbo', parts[0]
+                    refs_cache.append((f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}", f"{sch}.{tbl}"))
+                for c in out_cols:
+                    inputs = [ColumnReference(namespace=ns, table_name=nm, column_name=c) for (ns, nm) in refs_cache]
+                    lineage.append(ColumnLineage(
+                        output_column=c,
+                        input_fields=inputs,
+                        transformation_type=TransformationType.EXPRESSION,
+                        transformation_description="synthetic dependency fallback from INSERT SELECT"
+                    ))
 
         return lineage, dependencies
 
@@ -3935,15 +3983,6 @@ class SqlParser:
         set_block = m_upd.group(4) or ''
         from_tail = m_upd.group(5) or ''
 
-        # Normalize target to schema.table
-        parts = target_raw.split('.')
-        if len(parts) >= 3:
-            target_table = f"{parts[-2]}.{parts[-1]}"
-        elif len(parts) == 2:
-            target_table = target_raw
-        else:
-            target_table = f"dbo.{target_raw}"
-
         # Collect FROM/JOIN sources and their aliases to resolve refs
         alias_map: Dict[str, str] = {}
         # Patterns like: FROM <tbl> [AS a] JOIN <tbl2> [AS b] ...
@@ -3971,6 +4010,22 @@ class SqlParser:
                 alias_map[al.lower()] = tbl
             else:
                 alias_map[tbl.split('.')[-1].lower()] = tbl
+
+        # Normalize target to schema.table; if UPDATE used an alias, resolve it using alias_map
+        parts = target_raw.split('.')
+        if len(parts) >= 3:
+            target_table = f"{parts[-2]}.{parts[-1]}"
+        elif len(parts) == 2:
+            target_table = target_raw
+        else:
+            # If UPDATE used alias (e.g., UPDATE tgt), try to map it to real table from FROM/JOIN
+            guess = target_raw.lower()
+            real = alias_map.get(guess)
+            if real:
+                rparts = real.split('.')
+                target_table = f"{rparts[-2]}.{rparts[-1]}" if len(rparts) >= 2 else f"dbo.{real}"
+            else:
+                target_table = f"dbo.{target_raw}"
 
         # Resolve default source for bare columns: prefer first non-target source
         default_src = None
@@ -4495,7 +4550,22 @@ class SqlParser:
                 select_list = re.sub(r"--.*?$", "", select_list, flags=re.M)
             except Exception:
                 pass
-            columns = [col.strip() for col in select_list.split(',')]
+            # Depth-aware split on commas to avoid breaking inside functions/CASE
+            columns = []
+            buf = []
+            depth = 0
+            for ch in select_list:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth = max(0, depth - 1)
+                if ch == ',' and depth == 0:
+                    columns.append(''.join(buf).strip())
+                    buf = []
+                else:
+                    buf.append(ch)
+            if buf:
+                columns.append(''.join(buf).strip())
             
             for i, col in enumerate(columns):
                 # Handle aliases (column AS alias or column alias)
