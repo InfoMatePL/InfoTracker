@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from fnmatch import fnmatch
@@ -21,6 +22,8 @@ from .models import (
     TableSchema,
     ColumnGraph,
     ColumnEdge,
+    ColumnLineage,
+    ColumnReference,
     TransformationType,
 )
 
@@ -434,7 +437,10 @@ class Engine:
             pass
 
     def _build_dependency_graph(self, objects: List[ObjectInfo]) -> Dict[str, Set[str]]:
-        """Build dependency graph: object_name -> set of dependencies."""
+        """Build dependency graph: object_name -> set of dependencies.
+        
+        Temp tables are now included as normal nodes in the graph with their canonical names (dbo.#name).
+        """
         dependencies: Dict[str, Set[str]] = {}
 
         # Helper: normalize a name to our object key space (schema.table)
@@ -451,16 +457,27 @@ class Engine:
             return '.'.join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
         def _is_noise(n: str) -> bool:
+            """Check if a name is noise (variables, dynamic tokens, but NOT temp tables)."""
             if not n:
                 return True
             s = n.strip()
-            return s.startswith('#') or s.startswith('@') or ('+' in s) or (s.startswith('[') and s.endswith(']') and '.' not in s)
+            # Variables (@@, @var)
+            if s.startswith('@'):
+                return True
+            # Dynamic string concatenation
+            if '+' in s:
+                return True
+            # Bracket-only tokens without dot (malformed identifiers)
+            if s.startswith('[') and s.endswith(']') and '.' not in s:
+                return True
+            # Temp tables are NOT noise - they're legitimate dependencies
+            return False
 
         # Build case-insensitive key map for objects
         key_map: Dict[str, str] = {}
         for obj in objects:
             k = _dequote(obj.schema.name if obj.schema else obj.name)
-            # Canonical key: schema.table
+            # Canonical key: schema.table (including dbo.#temp for temp tables)
             canon = _strip_db(k)
             key_map[canon.lower()] = canon
             # If an object came with DB prefix, also map the 3-part form to canonical

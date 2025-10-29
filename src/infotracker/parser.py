@@ -375,27 +375,18 @@ class SqlParser:
           current_database or default_database.
         - Table name is always normalized to the last two segments (schema.table)
           when possible, to avoid repeating DB in the table part.
-        - Temp tables keep temp namespace; name is passed through as-is to preserve
-          existing matching semantics (e.g. "tempdb..#name").
+        - Temp tables ZAWSZE zwracają (namespace=tempdb, name=dbo.#nazwa) niezależnie od formatu wejściowego
         - Ignore pseudo-catalogs like "View", "Function", "Procedure" if present
           as the first segment produced by the parser.
         """
         # Temp tables (any identifier that contains a '#' segment)
         if table_name and ('#' in table_name):
-            # Canonicalize to DB.schema.object.#temp using current context
-            # Extract simple '#name'
-            try:
-                simple = next((seg for seg in (table_name or '').split('.') if seg.startswith('#')), None)
-            except Exception:
-                simple = None
-            if not simple and str(table_name).startswith('#'):
-                simple = str(table_name)
-            if not simple:
-                # As a last resort, assume whole token is the temp name
-                simple = f"#{self._dequote(str(table_name))}"
-            canon = self._canonical_temp_name(simple)
-            db_ctx = self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW'
-            return f"mssql://localhost/{str(db_ctx).upper()}", canon
+            # Extract just the temp table name (part after last #)
+            temp_name = table_name.split('#')[-1]  # Get part after last #
+            # Always normalize to dbo.#nazwa format
+            normalized_temp_name = f"dbo.#{temp_name}"
+            # Always use tempdb namespace for temp tables
+            return "mssql://localhost/TEMPDB", normalized_temp_name
 
         # Split and normalize parts
         raw_parts = (table_name or "").split('.')
@@ -1306,16 +1297,36 @@ class SqlParser:
             create_table_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?TABLE\b"])
 
             if create_table_count == 1 and all(x == 0 for x in [create_function_count, create_procedure_count]):
-                # spróbuj najpierw AST; jeśli SQLGlot zwróci Command albo None — fallback stringowy
+                # Najpierw spróbuj AST
+                ast_parsed = False
                 try:
                     normalized_sql = self._normalize_tsql(sql_content)
                     statements = sqlglot.parse(self._preprocess_sql(normalized_sql), read=self.dialect) or []
                     st = statements[0] if statements else None
                     if st and isinstance(st, exp.Create) and (getattr(st, "kind", "") or "").upper() == "TABLE":
-                        return self._parse_create_table(st, object_hint)
+                        obj = self._parse_create_table(st, object_hint)
+                        # Jeśli to temp table i dostaliśmy pełny schemat (kolumny), zwróć to
+                        is_temp = bool(obj.name and ('#' in obj.name or 'tempdb' in obj.name.lower()))
+                        if is_temp and obj.schema and obj.schema.columns:
+                            return obj
+                        # Dla zwykłych tabel zwróć jeśli mamy pełny schemat
+                        if not is_temp and obj.schema and obj.schema.columns:
+                            return obj
+                        # Oznacz, że próbowaliśmy AST (ale nie było pełnego schematu)
+                        ast_parsed = True
                 except Exception:
                     pass
-                return self._parse_create_table_string(sql_content, object_hint)
+                
+                # String fallback TYLKO jeśli AST nie dało wyniku lub nie było temp table
+                if not ast_parsed:
+                    obj = self._parse_create_table_string(sql_content, object_hint)
+                    # Sprawdź czy to temp table - jeśli tak, NIE używaj string fallback jeśli AST już parsował
+                    is_temp = bool(obj.name and ('#' in obj.name or 'tempdb' in obj.name.lower()))
+                    if not is_temp or not ast_parsed:
+                        return obj
+                # Jeśli dotarliśmy tutaj, znaczy że AST parsował temp ale bez pełnego schematu
+                # Zwróć to co mamy (lepsze niż duplikat)
+                return obj
             # If it's a single function or procedure, use string-based approach
             if create_function_count == 1 and create_procedure_count == 0:
                 return self._parse_function_string(sql_content, object_hint)
@@ -1583,14 +1594,12 @@ class SqlParser:
         
         # Register temp table metadata if this is a temp table
         if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
-            # Canonicalize temp output name to DB.schema.object.#temp using current context
-            simple_key = (raw_target.split('.')[-1] if '.' in raw_target else raw_target)
+            # Canonicalize temp output name using _ns_and_name (teraz już zwraca dbo.#nazwa)
+            simple_key = raw_target.split('#')[-1]  # Extract name after last #
             if not simple_key.startswith('#'):
                 simple_key = f"#{simple_key}"
-            canonical_name = self._canonical_temp_name(simple_key)
-            db_ctx = (self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW')
-            namespace = f"mssql://localhost/{str(db_ctx).upper()}"
-            table_name = canonical_name
+            # Use _ns_and_name to get canonical namespace and name
+            namespace, table_name = self._ns_and_name(simple_key, obj_type_hint="temp_table")
 
             temp_cols = [col.name for col in output_columns]
             # Version the temp so multiple INTOs don't mix lineages
@@ -1598,8 +1607,27 @@ class SqlParser:
             # Store current version columns and also expose simple name to latest version cols
             self.temp_registry[ver_key] = temp_cols
             self.temp_registry[simple_key] = temp_cols
-            # Remember base sources (normalized deps already from _extract_dependencies flow)
-            self.temp_sources[simple_key] = set(dependencies)
+            
+            # Remember base sources (filter out temp dependencies - store only base tables)
+            base_sources: Set[str] = set()
+            for d in dependencies:
+                is_dep_temp = ('#' in d or 'tempdb' in d.lower())
+                if not is_dep_temp:
+                    base_sources.add(d)
+                else:
+                    # Try to expand temp dependency to its bases
+                    dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                    if not dep_simple.startswith('#'):
+                        dep_simple = f"#{dep_simple}"
+                    dep_bases = self.temp_sources.get(dep_simple, set())
+                    if dep_bases:
+                        base_sources.update(dep_bases)
+                    else:
+                        # Fallback: keep the temp itself
+                        base_sources.add(d)
+            
+            self.temp_sources[simple_key] = base_sources
+            
             # Save per-column lineage of the temp so later reads can inline sources
             try:
                 col_map: Dict[str, List[ColumnReference]] = {}
@@ -1609,6 +1637,23 @@ class SqlParser:
                 self.temp_lineage[simple_key] = col_map  # latest active version
             except Exception:
                 pass
+        
+        # Expand temp dependencies for the returned ObjectInfo
+        final_dependencies: Set[str] = set()
+        for d in dependencies:
+            is_dep_temp = ('#' in d or 'tempdb' in d.lower())
+            if not is_dep_temp:
+                final_dependencies.add(d)
+            else:
+                # Include the temp itself
+                final_dependencies.add(d)
+                # Also include its base sources if we know them
+                dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                if not dep_simple.startswith('#'):
+                    dep_simple = f"#{dep_simple}"
+                dep_bases = self.temp_sources.get(dep_simple, set())
+                if dep_bases:
+                    final_dependencies.update(dep_bases)
         
         schema = TableSchema(
             namespace=namespace,
@@ -1624,7 +1669,7 @@ class SqlParser:
             object_type="temp_table" if (raw_target and (raw_target.startswith('#') or 'tempdb..#' in raw_target)) else "table",
             schema=schema,
             lineage=lineage,
-            dependencies=dependencies
+            dependencies=final_dependencies
         )
     
     def _parse_insert_exec(self, statement: exp.Insert, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -1762,23 +1807,6 @@ class SqlParser:
             
         # Extract dependencies (tables referenced in FROM/JOIN)
         dependencies = self._extract_dependencies(select_expr)
-        # Expand temp dependencies to their base sources if we have them, but keep canonical temp as well
-        if dependencies:
-            expanded: Set[str] = set()
-            for d in dependencies:
-                # detect temp by presence of a segment starting with '#'
-                parts = (d or '').split('.')
-                is_temp = any(seg.startswith('#') for seg in parts)
-                if is_temp:
-                    # keep canonical temp
-                    expanded.add(d)
-                    simple = next((seg for seg in parts if seg.startswith('#')), parts[-1])
-                    bases = self.temp_sources.get(simple)
-                    if bases:
-                        expanded.update(bases)
-                else:
-                    expanded.add(d)
-            dependencies = expanded
         
         # Extract column lineage
         lineage, output_columns = self._extract_column_lineage(select_expr, table_name)
@@ -1789,23 +1817,42 @@ class SqlParser:
         # Register temp table columns if this is a temp table
         raw_is_temp = bool(raw_target and (str(raw_target).startswith('#') or 'tempdb' in str(raw_target)))
         if raw_is_temp:
-            # Canonicalize the temp table name and namespace to DB.schema.object.#temp
-            simple_name = (str(raw_target).split('.')[-1] if '.' in str(raw_target) else str(raw_target))
+            # Canonicalize the temp table name and namespace using _ns_and_name (teraz już zwraca dbo.#nazwa)
+            simple_name = (str(raw_target).split('#')[-1])  # Extract name after last #
             if not simple_name.startswith('#'):
                 simple_name = f"#{simple_name}"
-            canonical_name = self._canonical_temp_name(simple_name)
-            db_ctx = (self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW')
-            namespace = f"mssql://localhost/{str(db_ctx).upper()}"
-            table_name = canonical_name
+            # Use _ns_and_name to get canonical namespace and name
+            namespace, table_name = self._ns_and_name(simple_name, obj_type_hint="temp_table")
+            
             # Persist temp metadata for engine to emit a standalone temp dataset event
             # 1) Register discovered column names (latest version under simple key)
             temp_cols = [col.name for col in output_columns]
             self.temp_registry[simple_name] = temp_cols
-            # 2) Record base sources used to populate the temp (expanded deps above)
-            try:
-                self.temp_sources[simple_name] = set(dependencies)
-            except Exception:
-                pass
+            
+            # 2) Record base sources used to populate the temp (filter out temp dependencies)
+            # For temp tables, we want to store ONLY base (non-temp) tables as sources
+            base_sources: Set[str] = set()
+            for d in dependencies:
+                # detect temp by checking if it starts with # or contains tempdb
+                is_dep_temp = ('#' in d or 'tempdb' in d.lower())
+                if not is_dep_temp:
+                    # Regular table - add directly
+                    base_sources.add(d)
+                else:
+                    # This dependency is itself a temp table - try to expand it to its bases
+                    dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                    if not dep_simple.startswith('#'):
+                        dep_simple = f"#{dep_simple}"
+                    # Check if we have base sources for this temp
+                    dep_bases = self.temp_sources.get(dep_simple, set())
+                    if dep_bases:
+                        base_sources.update(dep_bases)
+                    else:
+                        # Fallback: keep the temp itself as dependency if we don't know its bases yet
+                        base_sources.add(d)
+            
+            self.temp_sources[simple_name] = base_sources
+            
             # 3) Capture per-column lineage so the temp dataset can have parents in the graph
             try:
                 col_map: Dict[str, List[ColumnReference]] = {}
@@ -1825,12 +1872,29 @@ class SqlParser:
         # Register schema for future reference
         self.schema_registry.register(schema)
         
+        # For dependencies, expand temp tables to their base sources
+        final_dependencies: Set[str] = set()
+        for d in dependencies:
+            is_dep_temp = ('#' in d or 'tempdb' in d.lower())
+            if not is_dep_temp:
+                final_dependencies.add(d)
+            else:
+                # Include the temp itself
+                final_dependencies.add(d)
+                # Also include its base sources if we know them
+                dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                if not dep_simple.startswith('#'):
+                    dep_simple = f"#{dep_simple}"
+                dep_bases = self.temp_sources.get(dep_simple, set())
+                if dep_bases:
+                    final_dependencies.update(dep_bases)
+        
         return ObjectInfo(
             name=table_name,
             object_type="temp_table" if raw_is_temp else "table",
             schema=schema,
             lineage=lineage,
-            dependencies=dependencies
+            dependencies=final_dependencies
         )
     
     def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -2857,22 +2921,30 @@ class SqlParser:
                 out_name = proj.alias or proj.alias_or_name
                 inner = proj.this
             else:
-                # Generate smart fallback names based on expression type
-                s = str(proj).upper()
-                if "HASHBYTES(" in s or "MD5(" in s: 
-                    out_name = "hash_expr"
-                elif isinstance(proj, exp.Coalesce): 
-                    out_name = "coalesce_expr"
-                elif isinstance(proj, (exp.Trim, exp.Upper, exp.Lower)): 
-                    col = proj.find(exp.Column)
-                    out_name = (col.name if col else "text_expr")
-                elif isinstance(proj, (exp.Cast, exp.Convert)): 
-                    out_name = "cast_expr"
-                elif isinstance(proj, exp.Column): 
-                    out_name = proj.name
-                else: 
-                    out_name = "calc_expr"
-                inner = proj
+                # No explicit alias - try to get implicit name from SQLGlot
+                implicit_name = getattr(proj, 'alias_or_name', None)
+                if implicit_name and isinstance(implicit_name, str):
+                    out_name = implicit_name
+                    inner = proj
+                else:
+                    # Generate smart fallback names based on expression type
+                    s = str(proj).upper()
+                    if "HASHBYTES(" in s or "MD5(" in s: 
+                        out_name = "hash_expr"
+                    elif isinstance(proj, exp.Coalesce): 
+                        out_name = "coalesce_expr"
+                    elif isinstance(proj, (exp.Trim, exp.Upper, exp.Lower)): 
+                        col = proj.find(exp.Column)
+                        out_name = (col.name if col else "text_expr")
+                    elif isinstance(proj, (exp.Cast, exp.Convert)): 
+                        # For CAST, try to extract the source column name
+                        col = proj.find(exp.Column)
+                        out_name = (col.name if col else "cast_expr")
+                    elif isinstance(proj, exp.Column): 
+                        out_name = proj.name
+                    else: 
+                        out_name = "calc_expr"
+                    inner = proj
 
             # Clean output name (remove comments/quotes, leading underscores)
             out_name = self._clean_output_name(out_name) or f"col_{ordinal+1}"
@@ -3746,6 +3818,7 @@ class SqlParser:
 
         # Pre-scan ciała procedury AST-em, aby zarejestrować lineage dla tempów (SELECT INTO #tmp),
         # również gdy SELECT znajduje się wewnątrz CREATE PROCEDURE.
+        ast_prescan_success = False
         try:
             stmts = sqlglot.parse(self._normalize_tsql(sql_content), read=self.dialect) or []
             for st in stmts:
@@ -3753,6 +3826,7 @@ class SqlParser:
                 if isinstance(st, exp.Select) and self._is_select_into(st):
                     try:
                         self._parse_select_into(st, object_hint)
+                        ast_prescan_success = True
                     except Exception:
                         pass
                 # SELECT ... INTO zagnieżdżone w CREATE PROCEDURE
@@ -3761,10 +3835,18 @@ class SqlParser:
                         if isinstance(node, exp.Select) and self._is_select_into(node):
                             try:
                                 self._parse_select_into(node, object_hint)
+                                ast_prescan_success = True
                             except Exception:
                                 pass
         except Exception:
             pass
+        
+        # String-based fallback: jeśli AST nie zadziałał, szukaj SELECT INTO #temp regex
+        if not ast_prescan_success:
+            try:
+                self._prescan_temp_tables_string(sql_content)
+            except Exception:
+                pass
 
         # 1) Najpierw sprawdź, czy SP materializuje (SELECT INTO / INSERT INTO ... SELECT)
         materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
@@ -5141,6 +5223,116 @@ class SqlParser:
                     continue
         
         return lineage, dependencies
+    
+    def _prescan_temp_tables_string(self, sql_content: str) -> None:
+        """String-based pre-scan dla SELECT INTO #temp w procedurach.
+        
+        Rejestruje temp tables w temp_registry, temp_sources i temp_lineage
+        aby mogły być później wyemitowane jako osobne obiekty.
+        """
+        # Znajdź wszystkie SELECT INTO #temp patterns
+        pattern = r'SELECT\s+(.*?)\s+INTO\s+(#\w+)\s+FROM\s+(.*?)(?:WHERE|GROUP|ORDER|;|\n\s*(?:SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP|EXEC|IF|WHILE|BEGIN|END))'
+        matches = re.finditer(pattern, sql_content, re.IGNORECASE | re.DOTALL)
+        
+        for match in matches:
+            try:
+                select_list = match.group(1).strip()
+                temp_name = match.group(2).strip()
+                from_clause = match.group(3).strip()
+                
+                # Normalize temp name
+                simple_name = temp_name if temp_name.startswith('#') else f"#{temp_name}"
+                
+                # Extract column names from SELECT list
+                col_names = []
+                
+                # Try to parse SELECT list with SQLGlot
+                try:
+                    fake_select = f"SELECT {select_list} FROM dummy"
+                    parsed = sqlglot.parse_one(fake_select, dialect='tsql')
+                    if isinstance(parsed, exp.Select):
+                        projections = list(getattr(parsed, 'expressions', None) or [])
+                        for idx, proj in enumerate(projections):
+                            if isinstance(proj, exp.Alias):
+                                col_name = proj.alias or proj.alias_or_name
+                            elif isinstance(proj, exp.Column):
+                                col_name = proj.name
+                            elif hasattr(proj, 'alias_or_name'):
+                                col_name = proj.alias_or_name
+                            else:
+                                col_name = f"col_{idx+1}"
+                            
+                            col_names.append(self._dequote(str(col_name)))
+                except Exception:
+                    # Fallback to regex-based parsing
+                    # Split by comma, but respect parentheses
+                    parts = []
+                    current = []
+                    depth = 0
+                    for char in select_list + ',':
+                        if char == '(':
+                            depth += 1
+                        elif char == ')':
+                            depth -= 1
+                        elif char == ',' and depth == 0:
+                            parts.append(''.join(current).strip())
+                            current = []
+                            continue
+                        current.append(char)
+                    
+                    for idx, part in enumerate(parts):
+                        if not part:
+                            continue
+                        
+                        # Clean up the part: collapse whitespace
+                        part_clean = ' '.join(part.split())
+                        
+                        # Extract alias (after AS or last word)
+                        if ' AS ' in part_clean.upper():
+                            alias_part = part_clean.upper().split(' AS ')[-1].strip()
+                            # Take first word of alias (in case there's more text after)
+                            col_name = self._dequote(alias_part.split()[0] if alias_part.split() else f"col_{idx+1}")
+                        else:
+                            # No explicit alias - take last word if not too complex
+                            # If expression contains SQL keywords, use generic name
+                            if any(kw in part_clean.upper() for kw in [' FROM ', ' WHERE ', ' CASE ', ' WHEN ', ' EXEC ', ' BEGIN ']):
+                                col_name = f"col_{idx+1}"
+                            else:
+                                # Take last word
+                                words = part_clean.split()
+                                if words and len(words[-1]) < 60:
+                                    col_name = self._dequote(words[-1])
+                                else:
+                                    col_name = f"col_{idx+1}"
+                        
+                        col_names.append(col_name)
+                
+                if not col_names:
+                    col_names = ['col_1', 'col_2', 'col_3']  # Fallback
+                
+                # Register in temp_registry
+                self.temp_registry[simple_name] = col_names
+                
+                # Extract source tables from FROM clause
+                base_tables = self._extract_basic_dependencies(f"SELECT * FROM {from_clause}")
+                self.temp_sources[simple_name] = set(base_tables)
+                
+                # Create basic lineage (column -> same column from source tables)
+                col_map = {}
+                for col_name in col_names:
+                    refs = []
+                    for tbl in base_tables:
+                        ns, nm = self._ns_and_name(tbl)
+                        refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=col_name))
+                    col_map[col_name] = refs
+                
+                self.temp_lineage[simple_name] = col_map
+                
+                self._log_debug(f"Pre-scanned temp table {simple_name}: {len(col_names)} columns, {len(base_tables)} sources")
+                
+            except Exception as e:
+                self._log_debug(f"Failed to pre-scan temp table: {e}")
+                continue
     
     def _expand_dependency_to_base_tables(self, dep_name: str, context_stmt: exp.Expression) -> Set[str]:
         """Expand dependency to base tables, resolving CTEs and temp tables."""
