@@ -380,9 +380,22 @@ class SqlParser:
         - Ignore pseudo-catalogs like "View", "Function", "Procedure" if present
           as the first segment produced by the parser.
         """
-        # Temp tables
-        if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name):
-            return "mssql://localhost/tempdb", table_name
+        # Temp tables (any identifier that contains a '#' segment)
+        if table_name and ('#' in table_name):
+            # Canonicalize to DB.schema.object.#temp using current context
+            # Extract simple '#name'
+            try:
+                simple = next((seg for seg in (table_name or '').split('.') if seg.startswith('#')), None)
+            except Exception:
+                simple = None
+            if not simple and str(table_name).startswith('#'):
+                simple = str(table_name)
+            if not simple:
+                # As a last resort, assume whole token is the temp name
+                simple = f"#{self._dequote(str(table_name))}"
+            canon = self._canonical_temp_name(simple)
+            db_ctx = self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW'
+            return f"mssql://localhost/{str(db_ctx).upper()}", canon
 
         # Split and normalize parts
         raw_parts = (table_name or "").split('.')
@@ -527,12 +540,20 @@ class SqlParser:
         return self.current_database or self.default_database or None
     
     def _qualify_table(self, tbl: exp.Table) -> str:
-        """Get fully qualified table name from Table expression."""
-        name = tbl.name
+        """Get fully qualified table name from Table expression.
+
+        If the name refers to a temp table, keep the '#' segment and return a
+        DB-qualified identifier so downstream logic can canonicalize it.
+        """
+        try:
+            raw_name = str(tbl.name)
+        except Exception:
+            raw_name = None
         sch = getattr(tbl, "db", None) or "dbo"
         db = getattr(tbl, "catalog", None) or self.current_database or self.default_database
-        # Dequote all pieces to avoid quoted duplicates
-        return ".".join([self._dequote(p) for p in [db, sch, name] if p])
+        # If this looks like a temp (raw name with '#'), include it verbatim in the last segment
+        last = raw_name if (raw_name and '#' in raw_name) else (str(tbl.name) if getattr(tbl, 'name', None) else None)
+        return ".".join([self._dequote(p) for p in [db, sch, last] if p])
     
     def _build_alias_maps(self, select_exp: exp.Select):
         """Build maps for table aliases and derived table columns."""
@@ -551,6 +572,14 @@ class SqlParser:
                 else:
                     alias = str(a).lower()
             fqn = self._qualify_table(t)
+            # If this table corresponds to a known temp by simple name, canonicalize mapping to the temp
+            try:
+                parts_tmp = (fqn or '').split('.')
+                simple = parts_tmp[-1] if parts_tmp else None
+                if simple and not str(simple).startswith('#') and (f"#{simple}" in self.temp_registry):
+                    fqn = self._canonical_temp_name(f"#{simple}")
+            except Exception:
+                pass
             if alias: 
                 alias_map[alias] = fqn
             alias_map[t.name.lower()] = fqn
@@ -600,20 +629,25 @@ class SqlParser:
         db, sch, tbl = self._split_fqn(table_fqn)
         # Expand temp table column refs to their base lineage if known
         try:
-            simple = tbl if tbl else None
-            if simple and simple.startswith('#'):
+            # temp detection: any segment with '#'
+            temp_seg = None
+            for seg in (table_fqn or '').split('.'):
+                if str(seg).startswith('#'):
+                    temp_seg = seg
+                    break
+            if temp_seg:
                 # Always include the temp itself as an input (canonical name)
-                temp_canon = self._canonical_temp_name(simple)
+                temp_canon = self._canonical_temp_name(temp_seg)
                 ns_temp = f"mssql://localhost/{(self._ctx_db or db or 'InfoTrackerDW').upper()}"
                 out_list.append(ColumnReference(namespace=ns_temp, table_name=temp_canon, column_name=col_exp.name))
                 # And then, if we know its base lineage, include it as well (inline)
-                ver = self._temp_current(simple)
+                ver = self._temp_current(temp_seg)
                 colname = col_exp.name
                 if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
                     out_list.extend(self.temp_lineage[ver][colname])
                     return
-                if simple in self.temp_lineage and colname in self.temp_lineage[simple]:
-                    out_list.extend(self.temp_lineage[simple][colname])
+                if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
+                    out_list.extend(self.temp_lineage[temp_seg][colname])
                     return
         except Exception:
             pass
@@ -968,10 +1002,12 @@ class SqlParser:
             
             # Apply consistent temp table namespace handling
             if table_name.startswith('#'):
-                # Temp table - use consistent naming and namespace
-                temp_name = table_name.lstrip('#')
-                table_name = f"tempdb..#{temp_name}"
-                namespace = "mssql://localhost/tempdb"
+                # Temp table - canonicalize to DB.schema.object.#temp using current context
+                simple = table_name if table_name.startswith('#') else f"#{table_name}"
+                canonical_name = self._canonical_temp_name(simple)
+                db_ctx = (self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW')
+                namespace = f"mssql://localhost/{str(db_ctx).upper()}"
+                table_name = canonical_name
                 object_type = "temp_table"
             else:
                 # Regular table - qualify and derive ns/name from FQN
@@ -1546,10 +1582,17 @@ class SqlParser:
         lineage, output_columns = self._extract_column_lineage(statement, table_name)
         
         # Register temp table metadata if this is a temp table
-        if table_name.startswith('#') or 'tempdb..#' in str(table_name):
+        if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
+            # Canonicalize temp output name to DB.schema.object.#temp using current context
+            simple_key = (raw_target.split('.')[-1] if '.' in raw_target else raw_target)
+            if not simple_key.startswith('#'):
+                simple_key = f"#{simple_key}"
+            canonical_name = self._canonical_temp_name(simple_key)
+            db_ctx = (self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW')
+            namespace = f"mssql://localhost/{str(db_ctx).upper()}"
+            table_name = canonical_name
+
             temp_cols = [col.name for col in output_columns]
-            # Resolve a simple key like "#tmp"
-            simple_key = table_name.split('.')[-1]
             # Version the temp so multiple INTOs don't mix lineages
             ver_key = self._temp_next(simple_key)
             # Store current version columns and also expose simple name to latest version cols
@@ -1578,7 +1621,7 @@ class SqlParser:
         
         return ObjectInfo(
             name=table_name,
-            object_type="temp_table" if table_name.startswith('#') else "table",
+            object_type="temp_table" if (raw_target and (raw_target.startswith('#') or 'tempdb..#' in raw_target)) else "table",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
@@ -1648,6 +1691,16 @@ class SqlParser:
                 ColumnSchema(name="output_col_2", data_type="unknown", ordinal=1, nullable=True),
             ]
             
+            # If target is a temp table, canonicalize its name to DB.schema.object.#temp
+            if raw_target and (str(raw_target).startswith('#') or 'tempdb..#' in str(raw_target)):
+                simple_key = (str(raw_target).split('.')[-1] if '.' in str(raw_target) else str(raw_target))
+                if not simple_key.startswith('#'):
+                    simple_key = f"#{simple_key}"
+                canonical_name = self._canonical_temp_name(simple_key)
+                db_ctx = (self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW')
+                namespace = f"mssql://localhost/{str(db_ctx).upper()}"
+                table_name = canonical_name
+
             # Create placeholder lineage pointing to the procedure
             lineage = []
             if procedure_name:
@@ -1672,7 +1725,7 @@ class SqlParser:
             
             return ObjectInfo(
                 name=table_name,
-                object_type="temp_table" if table_name.startswith('#') else "table",
+                object_type="temp_table" if (raw_target and (str(raw_target).startswith('#') or 'tempdb..#' in str(raw_target))) else "table",
                 schema=schema,
                 lineage=lineage,
                 dependencies=dependencies
@@ -1734,10 +1787,34 @@ class SqlParser:
         table_name = sanitize_name(table_name)
         
         # Register temp table columns if this is a temp table
-        if table_name.startswith('#') or 'tempdb' in table_name:
+        raw_is_temp = bool(raw_target and (str(raw_target).startswith('#') or 'tempdb' in str(raw_target)))
+        if raw_is_temp:
+            # Canonicalize the temp table name and namespace to DB.schema.object.#temp
+            simple_name = (str(raw_target).split('.')[-1] if '.' in str(raw_target) else str(raw_target))
+            if not simple_name.startswith('#'):
+                simple_name = f"#{simple_name}"
+            canonical_name = self._canonical_temp_name(simple_name)
+            db_ctx = (self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW')
+            namespace = f"mssql://localhost/{str(db_ctx).upper()}"
+            table_name = canonical_name
+            # Persist temp metadata for engine to emit a standalone temp dataset event
+            # 1) Register discovered column names (latest version under simple key)
             temp_cols = [col.name for col in output_columns]
-            simple_name = table_name.split('.')[-1]
             self.temp_registry[simple_name] = temp_cols
+            # 2) Record base sources used to populate the temp (expanded deps above)
+            try:
+                self.temp_sources[simple_name] = set(dependencies)
+            except Exception:
+                pass
+            # 3) Capture per-column lineage so the temp dataset can have parents in the graph
+            try:
+                col_map: Dict[str, List[ColumnReference]] = {}
+                for lin in (lineage or []):
+                    col_map[lin.output_column] = list(lin.input_fields or [])
+                # Keep only the latest version under the simple name (no @versioning here)
+                self.temp_lineage[simple_name] = col_map
+            except Exception:
+                pass
         
         schema = TableSchema(
             namespace=namespace,
@@ -1750,7 +1827,7 @@ class SqlParser:
         
         return ObjectInfo(
             name=table_name,
-            object_type="temp_table" if (table_name.startswith('#') or 'tempdb' in table_name) else "table",
+            object_type="temp_table" if raw_is_temp else "table",
             schema=schema,
             lineage=lineage,
             dependencies=dependencies
@@ -2260,12 +2337,24 @@ class SqlParser:
         # If we have materialized outputs (SELECT INTO/INSERT INTO), return the last one instead of the procedure
         if materialized_outputs:
             last_output = materialized_outputs[-1]
-            # Extract lineage for the materialized output
+            # For temp table outputs, preserve the dependencies/lineage discovered from the
+            # specific SELECT/INSERT that materialized them. Only adjust namespace when needed.
+            if getattr(last_output, "object_type", None) == "temp_table":
+                if last_output.schema and not (last_output.schema.namespace or "").lower().endswith("/tempdb"):
+                    last_output.schema.namespace = "mssql://localhost/tempdb"
+                # Do not normalize name for temp tables (keep e.g. "tempdb..#tmp")
+                # Restore context before return
+                self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+                return last_output
+
+            # Non-temp outputs: enrich with lineage/dependencies from the last SELECT in body
             lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
-            
-            # Update the output object with proper lineage and dependencies
-            last_output.lineage = lineage
-            last_output.dependencies = dependencies
+
+            # Update the output object
+            if lineage:
+                last_output.lineage = lineage
+            if dependencies:
+                last_output.dependencies = dependencies
             if last_output.schema:
                 last_output.schema.namespace = namespace
                 last_output.schema.name = self._normalize_table_name_for_output(last_output.schema.name)
@@ -2306,57 +2395,92 @@ class SqlParser:
         return obj
     
     def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
-        """Extract materialized outputs (SELECT INTO, INSERT INTO) from procedure body."""
-        outputs = []
+        """Extract materialized outputs (SELECT INTO, INSERT INTO) from procedure body.
+
+        Prefer AST-based detection to capture both persistent and temp outputs with
+        correct lineage/dependencies. Falls back to light regex only if AST walk
+        fails, preserving previous behavior.
+        """
+        outputs: List[ObjectInfo] = []
+
+        # First try AST walk to find SELECT ... INTO and INSERT ... (SELECT|EXEC)
+        try:
+            for node in statement.walk():
+                # SELECT ... INTO ...
+                if isinstance(node, exp.Select) and self._is_select_into(node):
+                    try:
+                        obj = self._parse_select_into(node)
+                        if obj:
+                            outputs.append(obj)
+                    except Exception:
+                        pass
+                # INSERT ... (SELECT | EXEC)
+                elif isinstance(node, exp.Insert):
+                    try:
+                        if self._is_insert_exec(node):
+                            obj = self._parse_insert_exec(node)
+                        else:
+                            obj = self._parse_insert_select(node)
+                        if obj:
+                            outputs.append(obj)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if outputs:
+            return outputs
+
+        # Fallback to previous regex-based heuristic (persistent tables only)
         sql_text = str(statement)
-        
-        # Look for SELECT ... INTO patterns
-        select_into_pattern = r'SELECT\s+.*?\s+INTO\s+([^\s,]+)'
-        select_into_matches = re.findall(select_into_pattern, sql_text, flags=re.IGNORECASE | re.DOTALL)
-        
-        for table_match in select_into_matches:
-            table_name = table_match.strip()
-            # Skip temp tables
-            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-                # Normalize table name - remove database prefix for output
-                normalized_name = self._normalize_table_name_for_output(table_name)
-                db = self.current_database or self.default_database or "InfoTrackerDW"
-                outputs.append(ObjectInfo(
-                    name=normalized_name,
-                    object_type="table",
-                    schema=TableSchema(
-                    namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}",
-                        name=normalized_name,
-                        columns=[]
-                    ),
-                    lineage=[],
-                    dependencies=set()
-                ))
-        
-        # Look for INSERT INTO patterns (non-temp tables)
-        insert_into_pattern = r'INSERT\s+INTO\s+([^\s,\(]+)'
-        insert_into_matches = re.findall(insert_into_pattern, sql_text, flags=re.IGNORECASE)
-        
-        for table_match in insert_into_matches:
-            table_name = table_match.strip()
-            # Skip temp tables
-            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-                normalized_name = self._normalize_table_name_for_output(table_name)
-                # Check if we already have this table from SELECT INTO
-                if not any(output.name == normalized_name for output in outputs):
+
+        try:
+            # Look for SELECT ... INTO patterns
+            select_into_pattern = r'SELECT\s+.*?\s+INTO\s+([^\s,]+)'
+            select_into_matches = re.findall(select_into_pattern, sql_text, flags=re.IGNORECASE | re.DOTALL)
+            for table_match in select_into_matches:
+                table_name = table_match.strip()
+                # Skip temp tables in fallback
+                if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                    normalized_name = self._normalize_table_name_for_output(table_name)
                     db = self.current_database or self.default_database or "InfoTrackerDW"
                     outputs.append(ObjectInfo(
                         name=normalized_name,
                         object_type="table",
                         schema=TableSchema(
-                            namespace=f"mssql://localhost/{db}",
+                            namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}",
                             name=normalized_name,
                             columns=[]
                         ),
                         lineage=[],
                         dependencies=set()
                     ))
-        
+
+            # Look for INSERT INTO patterns (non-temp tables)
+            insert_into_pattern = r'INSERT\s+INTO\s+([^\s,\(]+)'
+            insert_into_matches = re.findall(insert_into_pattern, sql_text, flags=re.IGNORECASE)
+            for table_match in insert_into_matches:
+                table_name = table_match.strip()
+                # Skip temp tables in fallback
+                if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                    normalized_name = self._normalize_table_name_for_output(table_name)
+                    # Avoid duplicates from SELECT INTO detection
+                    if not any(output.name == normalized_name for output in outputs):
+                        db = self.current_database or self.default_database or "InfoTrackerDW"
+                        outputs.append(ObjectInfo(
+                            name=normalized_name,
+                            object_type="table",
+                            schema=TableSchema(
+                                namespace=f"mssql://localhost/{db}",
+                                name=normalized_name,
+                                columns=[]
+                            ),
+                            lineage=[],
+                            dependencies=set()
+                        ))
+        except Exception:
+            pass
+
         return outputs
 
     def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str], Optional[str]]:
@@ -2545,6 +2669,14 @@ class SqlParser:
         database_to_use = self.current_database or self.default_database
         
         if isinstance(table_expr, exp.Table):
+            # Early detect temp tables by their raw name (before qualification)
+            try:
+                raw_name = str(table_expr.name)
+                if raw_name and raw_name.startswith('#'):
+                    temp_name = raw_name.lstrip('#')
+                    return f"tempdb..#{temp_name}"
+            except Exception:
+                pass
             catalog = str(table_expr.catalog) if table_expr.catalog else None
             # sqlglot-quirk: w CREATE ... 'catalog' potrafi być rodzajem obiektu
             if catalog and catalog.lower() in {"view", "function", "procedure"}:
@@ -2561,6 +2693,10 @@ class SqlParser:
                 full_name = qualify_identifier(table_name, database_to_use)
         elif isinstance(table_expr, exp.Identifier):
             table_name = str(table_expr.this)
+            # Early detect temp tables for identifiers
+            if table_name and table_name.startswith('#'):
+                temp_name = table_name.lstrip('#')
+                return f"tempdb..#{temp_name}"
             full_name = qualify_identifier(table_name, database_to_use)
         else:
             full_name = hint or "unknown"

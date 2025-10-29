@@ -244,11 +244,7 @@ class Engine:
                         # Also register in adapter's parser for lineage generation
                         adapter.parser.schema_registry.register(obj_info.schema)
 
-                    # Skip emitting separate OL events for temp tables; continuity is preserved via inlined lineage
-                    if obj_info.object_type == "temp_table" or (obj_info.schema and str(obj_info.schema.name).startswith('tempdb..#')):
-                        continue
-
-                    # Generate OpenLineage directly from resolved ObjectInfo
+                    # Generate OpenLineage directly from resolved ObjectInfo (including temp tables)
                     ol_payload = emit_ol_from_object(
                         obj_info,
                         quality_metrics=True,
@@ -263,6 +259,44 @@ class Engine:
                     )
 
                     outputs.append([str(sql_path), str(target)])
+
+                    # Additionally, emit separate OL events for temp tables created in this file
+                    try:
+                        temp_keys = [k for k in (parser.temp_registry.keys()) if isinstance(k, str) and k.startswith('#') and '@' not in k]
+                    except Exception:
+                        temp_keys = []
+                    for tmp in temp_keys:
+                        try:
+                            # Canonicalize temp name and derive ns
+                            canonical = parser._canonical_temp_name(tmp)
+                            db_ctx = getattr(parser, '_ctx_db', None) or getattr(parser, 'current_database', None) or getattr(parser, 'default_database', None) or 'InfoTrackerDW'
+                            ns_tmp = f"mssql://localhost/{str(db_ctx).upper()}"
+                            # Build schema
+                            schema = parser.schema_registry.get(ns_tmp, canonical)
+                            if not schema:
+                                cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(parser.temp_registry.get(tmp, []) or [])]
+                                schema = TableSchema(namespace=ns_tmp, name=canonical, columns=cols)
+                            # Build lineage
+                            lin_list = []
+                            col_map = parser.temp_lineage.get(tmp) or {}
+                            for i, col in enumerate(schema.columns or []):
+                                refs = list(col_map.get(col.name, []))
+                                if refs:
+                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
+                                else:
+                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
+                            deps = set(parser.temp_sources.get(tmp, set()) or set())
+                            temp_obj = ObjectInfo(name=canonical, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
+                            # Include in graph
+                            resolved_objects.append(temp_obj)
+                            # Write OL JSON
+                            safe = canonical.replace('/', '_').replace('\\', '_').replace(':', '_').replace('#', 'hash')
+                            tpath = out_dir / f"{sql_path.stem}__temp__{safe}.json"
+                            tpayload = emit_ol_from_object(temp_obj, quality_metrics=True, virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True))
+                            tpath.write_text(json.dumps(tpayload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+                            outputs.append([str(sql_path), str(tpath)])
+                        except Exception:
+                            pass
 
                     # Optionally emit minimal source dataset events for inputs that do not have their own outputs
                     if self._emit_external_sources:

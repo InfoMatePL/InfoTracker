@@ -102,18 +102,23 @@ class OpenLineageGenerator:
         """Build inputs array from object dependencies."""
         inputs = []
         for dep_name in sorted(obj_info.dependencies):
-             if _is_noise_dep(dep_name):
-                 continue
-             # tempdb: stały namespace
-             if dep_name.startswith('tempdb..#'):
-                 namespace = "mssql://localhost/tempdb"
-             else:
-                 parts = dep_name.split('.')
-                 db = parts[0] if len(parts) >= 3 else None
-                 namespace = f"mssql://localhost/{db}" if db else self.namespace
-             # w name trzymaj schema.table (bez prefiksu DB)
-             name = ".".join(dep_name.split(".")[-2:]) if "." in dep_name else dep_name
-             inputs.append({"namespace": namespace, "name": name})
+            if _is_noise_dep(dep_name):
+                continue
+            d = _dequote(dep_name)
+            # tempdb legacy pattern
+            if d.startswith('tempdb..#'):
+                namespace = "mssql://localhost/tempdb"
+                name = d
+            else:
+                parts = d.split('.')
+                db = parts[0] if len(parts) >= 3 else None
+                namespace = f"mssql://localhost/{db}" if db else self.namespace
+                # Preserve DB for temp canonical names (contain '#')
+                if '#' in d:
+                    name = d
+                else:
+                    name = ".".join(parts[-2:]) if len(parts) >= 2 else d
+            inputs.append({"namespace": namespace, "name": name})
 
         
         return inputs
