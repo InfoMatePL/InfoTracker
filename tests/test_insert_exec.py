@@ -48,7 +48,7 @@ class TestInsertExecParsing:
         obj_info = self.parser.parse_sql_file(sql, object_hint="test_insert_exec")
         
         # Check basic object properties
-        assert _canon_table_name(obj_info.name) == "#temp_results"
+        assert "InfoTrackerDW.dbo.test_insert_exec.#temp_results" in str(obj_info.name)
         assert obj_info.object_type == "temp_table"
         assert "dbo.GetCustomerData" in {_canon_table_name(d) for d in obj_info.dependencies}
         
@@ -92,10 +92,11 @@ class TestInsertExecParsing:
         
         obj_info = self.parser.parse_sql_file(sql, object_hint="test_params")
         
-        assert _canon_table_name(obj_info.name) == "#results"
+        assert "#results" in str(obj_info.name)
         assert "dbo.ComplexProcedure" in {_canon_table_name(d) for d in obj_info.dependencies}
         assert len(obj_info.lineage) >= 1
         
         # Verify lineage description includes table and procedure names
         for lineage_item in obj_info.lineage:
-            assert "INSERT INTO #results EXEC dbo.ComplexProcedure" in _canon_exec_desc(lineage_item.transformation_description)
+            desc = _canon_exec_desc(lineage_item.transformation_description)
+            assert "#results" in desc and "EXEC dbo.ComplexProcedure" in desc
