@@ -1095,7 +1095,8 @@ class SqlParser:
                         )
                     ],
                     transformation_type=TransformationType.EXEC,
-                    transformation_description=f"INSERT INTO {table_name} EXEC {proc_full_name}"
+                    # For readability and to match tests, show EXEC with schema.proc only
+                    transformation_description=f"INSERT INTO {table_name} EXEC {nm}"
                 ))
         
         # Register schema in registry
