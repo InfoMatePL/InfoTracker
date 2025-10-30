@@ -277,15 +277,21 @@ HTML_TMPL = """<!doctype html>
   .table-node{ cursor: grab; user-select: none; }
   .table-node.dragging{ box-shadow:0 6px 24px rgba(0,0,0,.18); cursor: grabbing; }
   .table-node header{position:relative; padding:8px 10px; font-weight:600; color:var(--header-text); background:var(--header); border-bottom:1px solid var(--border); border-radius:10px 10px 0 0; text-align:center}
-  .table-node header .title{ display:inline-block; pointer-events:none }
+  .table-node header .title{ display:inline-flex; flex-direction:column; align-items:center; line-height:1.2; pointer-events:none }
+  .table-node header .title .title-ns{ font-size:12px; opacity:.95 }
+  .table-node header .title .title-obj{ font-size:14px; font-weight:700 }
   .table-node header .sel-btn{ position:absolute; right:8px; top:6px; height:24px; padding:2px 8px; border:1px solid rgba(255,255,255,.6); border-radius:6px; background:rgba(255,255,255,.15); color:#fff; font-weight:700; cursor:pointer }
   .table-node header .sel-btn:hover{ background:rgba(255,255,255,.25) }
+  .table-node header .exp-btn{ position:absolute; left:8px; top:6px; height:24px; width:28px; padding:2px 6px; border:1px solid rgba(255,255,255,.6); border-radius:6px; background:rgba(255,255,255,.15); color:#fff; font-weight:700; cursor:pointer; line-height:18px }
+  .table-node header .exp-btn:hover{ background:rgba(255,255,255,.25) }
   .table-node.selected{ box-shadow: 0 0 0 2px rgba(99,102,241,.35), 0 6px 18px rgba(0,0,0,.12) }
   .table-node ul{list-style:none; margin:0; padding:6px 10px 10px}
   /* Collapsed cards: hide all rows by default, but allow selected/active rows to show */
   .table-node.collapsed ul{ padding:6px 10px 10px }
   .table-node.collapsed li{ display:none }
   .table-node.collapsed li.selected, .table-node.collapsed li.active{ display:flex }
+  /* Allow expanding a single object while global COLLAPSE is on */
+  .table-node.collapsed.expanded li{ display:flex }
   .table-node li{display:flex; align-items:center; justify-content:center; gap:8px; margin:4px 0; padding:6px 8px; background:var(--row); border:1px solid var(--row-border); border-radius:8px; white-space:nowrap; font-size:13px}
   .table-node li.alt{ background:var(--row-alt) }
   .table-node li.col-row{ cursor: pointer; }
@@ -406,7 +412,34 @@ const CONFIG = { focus: __FOCUS__, depth: __DEPTH__, direction: __DIRECTION__ };
 const SIDEBAR_KEY = 'infotracker.sidebar';
 const SIDEBAR_W_KEY = 'infotracker.sidebar.width';
 const COLLAPSE_KEY = 'infotracker.collapse';
-let COLLAPSE = false;
+// Default to collapsed view unless user saved a preference
+let COLLAPSE = true;
+// Per-object expanded overrides when COLLAPSE is on
+let EXPANDED_IDS = new Set();
+// Snapshot of the baseline view before isolation/streams, so we can restore on Clear
+let __PREV_VIEW_STATE__ = null; // { collapse:boolean, expanded:string[] }
+
+function snapshotViewState(){
+  if (__PREV_VIEW_STATE__) return; // already captured
+  try{
+    __PREV_VIEW_STATE__ = {
+      collapse: !!COLLAPSE,
+      expanded: Array.from(EXPANDED_IDS || new Set())
+    };
+  }catch(_){ __PREV_VIEW_STATE__ = { collapse: !!COLLAPSE, expanded: [] }; }
+}
+
+function restoreViewState(){
+  if (!__PREV_VIEW_STATE__) return false;
+  try{
+    COLLAPSE = !!__PREV_VIEW_STATE__.collapse;
+    try{ localStorage.setItem(COLLAPSE_KEY, COLLAPSE ? '1' : '0'); }catch(_){ }
+    EXPANDED_IDS = new Set(Array.from(__PREV_VIEW_STATE__.expanded || []));
+  }catch(_){ }
+  __PREV_VIEW_STATE__ = null;
+  try{ updateCollapseButton(); }catch(_){ }
+  return true;
+}
 // Tree state keys
 const TREE_DB_KEY = 'infotracker.tree.db';
 const TREE_SCHEMA_KEY = 'infotracker.tree.schema';
@@ -610,7 +643,10 @@ function layoutTables(){
   tables.forEach(t=>{
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
     if (NEIGHBOR_IDS && NEIGHBOR_IDS.has(t.id)) art.classList.add('neighbor');
-    if (COLLAPSE) art.classList.add('collapsed');
+    if (COLLAPSE){
+      art.classList.add('collapsed');
+      if (EXPANDED_IDS && EXPANDED_IDS.has && EXPANDED_IDS.has(t.id)) art.classList.add('expanded');
+    }
     // Prepare a display-friendly full name without scheme (e.g., "EDW_CORE.dbo.table")
     const fullClean = (t.full||'').replace(/^mssql:\/\/[^/]+\/?/, '');
     // Attach searchable metadata
@@ -619,9 +655,36 @@ function layoutTables(){
     art.setAttribute('data-label', (t.label||'').toLowerCase());
     const h = document.createElement('header'); h.title = fullClean || t.full || t.label;
     const title = document.createElement('span'); title.className='title';
-    // Show full name including database and schema in the card header
-    title.textContent = fullClean || t.label; h.appendChild(title);
+    // Two-line header: top = db.schema, bottom = object name
+    const clean = fullClean || t.full || '';
+    const segs = (clean||'').split('.');
+    let top = '', bottom = '';
+    if (segs.length >= 3){
+      top = (segs[0]||'') + (segs[1] ? ('.' + segs[1]) : '');
+      bottom = segs.slice(2).join('.') || (t.label || '');
+    } else if (segs.length === 2){
+      top = segs[0] || '';
+      bottom = segs[1] || (t.label || '');
+    } else {
+      bottom = t.label || clean;
+    }
+    if (top){ const nsEl = document.createElement('span'); nsEl.className = 'title-ns'; nsEl.textContent = top; title.appendChild(nsEl); }
+    const objEl = document.createElement('span'); objEl.className = 'title-obj'; objEl.textContent = bottom; title.appendChild(objEl);
+    h.appendChild(title);
     const isSel = VISIBLE_IDS && VISIBLE_IDS.has && VISIBLE_IDS.has(t.id);
+    // Per-object expand/collapse button (triangle)
+    const exp = document.createElement('button'); exp.className='exp-btn'; exp.type='button';
+    const isExpanded = EXPANDED_IDS && EXPANDED_IDS.has && EXPANDED_IDS.has(t.id);
+    exp.textContent = isExpanded ? '▼' : '▶';
+    exp.title = isExpanded ? 'Collapse object' : 'Expand object';
+    exp.dataset.tid = t.id;
+    exp.addEventListener('click', (ev)=>{
+      ev.stopPropagation(); ev.preventDefault();
+      const tid = ev.currentTarget.dataset.tid;
+      if (EXPANDED_IDS.has(tid)) EXPANDED_IDS.delete(tid); else EXPANDED_IDS.add(tid);
+      layoutTables();
+    });
+    h.appendChild(exp);
     if (isSel) art.classList.add('selected');
     const btn = document.createElement('button'); btn.className='sel-btn'; btn.type='button'; btn.textContent = isSel ? '−' : '+'; btn.title = isSel ? 'Unselect' : 'Select'; btn.dataset.tid = t.id;
     btn.addEventListener('click', (ev)=>{ ev.stopPropagation(); ev.preventDefault(); toggleTableSelection(ev.currentTarget.dataset.tid); });
@@ -1160,6 +1223,7 @@ try{
   // Load saved collapse-columns preference
   const savedCollapse = localStorage.getItem(COLLAPSE_KEY);
   if (savedCollapse === '1' || savedCollapse === 'true') COLLAPSE = true;
+  else if (savedCollapse === '0' || savedCollapse === 'false') COLLAPSE = false;
 }catch(_){}
 
 buildSidebar();
@@ -1709,9 +1773,8 @@ function clearSelection(){
   HL_KEYS = null; HL_DIR = 'both'; HL_ISOLATE = false;
   ISOLATE = false; ISOLATE_DIR = 'both'; ISOLATE_SRC = null;
   ISOLATE_ALIGN = false; TABLES_OVERRIDE = null;
-  // Return to expanded mode
-  COLLAPSE = false; try{ localStorage.setItem(COLLAPSE_KEY, '0'); }catch(_){ }
-  try{ updateCollapseButton(); }catch(_){ }
+  // Restore baseline view state if we took a snapshot before isolation/stream
+  restoreViewState();
   COLLAPSE_ATTR_EDGES = false;
   try{ OBJ_COLLAPSE_SEEDS.clear(); }catch(_){ }
   try{ SELECTED_KEYS.clear(); }catch(_){ }
@@ -1794,6 +1857,7 @@ function highlightLineageMultiple(keys, dir='both', isolate=false){
 
 // Collapse objects and show lineage stream for selected attributes only
 function applyAttributesCollapsed(keys, dir){
+  snapshotViewState();
   const arr = Array.isArray(keys) ? keys : Array.from(keys||[]);
   if (!arr.length) return;
   // Persist collapsed mode
@@ -1912,6 +1976,7 @@ function applyAttributesCollapsed(keys, dir){
 
 // Compute active tables from a column key and direction, then set override and re-layout
 function applyIsolationLayout(srcKey, dir){
+  snapshotViewState();
   ISOLATE = true; ISOLATE_DIR = dir || 'both'; ISOLATE_SRC = srcKey; SELECTED_COL = srcKey; COLLAPSE_ATTR_EDGES = false;
   // Ensure column graph maps exist
   if (!COL_OUT || !COL_IN || !ROW_BY_COL){ try { buildColGraph(); } catch(_){} }
@@ -2006,6 +2071,7 @@ function applyIsolationLayout(srcKey, dir){
 
 // Object-level isolate in collapsed mode: auto-enable collapsed view and layout only lineage tables
 function applyTableIsolationCollapsed(tableId, dir){
+  snapshotViewState();
   // Force collapsed view and persist preference
   COLLAPSE = true;
   try{ localStorage.setItem(COLLAPSE_KEY, '1'); }catch(_){ }
