@@ -2916,6 +2916,14 @@ class SqlParser:
         # Enhanced column-by-column processing
         ordinal = 0
         for proj in projections:
+            # Skip variable assignments (@var = expression) in T-SQL
+            if isinstance(proj, exp.EQ):
+                # Check if left side is a variable
+                left = proj.this if hasattr(proj, 'this') else None
+                if left and str(left).startswith('@'):
+                    # This is a variable assignment, not a column projection
+                    continue
+            
             # Decide output name using enhanced logic
             if isinstance(proj, exp.Alias):
                 out_name = proj.alias or proj.alias_or_name
@@ -5253,14 +5261,30 @@ class SqlParser:
                     if isinstance(parsed, exp.Select):
                         projections = list(getattr(parsed, 'expressions', None) or [])
                         for idx, proj in enumerate(projections):
+                            # Skip variable assignments (@var = expression) in T-SQL
+                            if isinstance(proj, exp.EQ):
+                                left = proj.this if hasattr(proj, 'this') else None
+                                if left and str(left).startswith('@'):
+                                    # Variable assignment - skip
+                                    continue
+                            
                             if isinstance(proj, exp.Alias):
-                                col_name = proj.alias or proj.alias_or_name
+                                col_name = proj.alias or proj.alias_or_name or f"col_{idx+1}"
                             elif isinstance(proj, exp.Column):
                                 col_name = proj.name
-                            elif hasattr(proj, 'alias_or_name'):
+                            elif hasattr(proj, 'alias_or_name') and proj.alias_or_name:
+                                # alias_or_name exists and is non-empty
                                 col_name = proj.alias_or_name
                             else:
-                                col_name = f"col_{idx+1}"
+                                # No alias - generate smart name based on expression type
+                                if isinstance(proj, exp.Coalesce):
+                                    col_name = f"coalesce_{idx+1}"
+                                elif isinstance(proj, (exp.Cast, exp.Convert)):
+                                    col_name = f"cast_{idx+1}"
+                                elif isinstance(proj, exp.Case):
+                                    col_name = f"case_{idx+1}"
+                                else:
+                                    col_name = f"col_{idx+1}"
                             
                             col_names.append(self._dequote(str(col_name)))
                 except Exception:
