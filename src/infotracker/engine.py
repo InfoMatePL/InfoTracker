@@ -293,7 +293,17 @@ class Engine:
                             # Include in graph
                             resolved_objects.append(temp_obj)
                             # Write OL JSON
-                            safe = canonical.replace('/', '_').replace('\\', '_').replace(':', '_').replace('#', 'hash')
+                            # Extract just db.schema.#temp for filename (skip middle object context)
+                            parts = canonical.split('.')
+                            if len(parts) >= 3 and parts[-1].startswith('#'):
+                                # Format: DB.schema.object.#temp or longer -> use DB.schema.#temp
+                                db_part = parts[0]
+                                schema_part = parts[1] if len(parts) > 1 else 'dbo'
+                                temp_part = parts[-1]
+                                safe_name = f"{db_part}.{schema_part}.{temp_part}"
+                            else:
+                                safe_name = canonical
+                            safe = safe_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('#', 'hash')
                             tpath = out_dir / f"{sql_path.stem}__temp__{safe}.json"
                             tpayload = emit_ol_from_object(temp_obj, quality_metrics=True, virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True))
                             tpath.write_text(json.dumps(tpayload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")

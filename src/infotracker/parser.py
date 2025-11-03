@@ -25,6 +25,16 @@ RE_FQN3 = re.compile(r"(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)", re
 RE_INSERT_INTO3 = re.compile(r"\bINSERT\s+INTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)", re.IGNORECASE)
 RE_SELECT_INTO3 = re.compile(r"\bSELECT\b.*?\bINTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)", re.IGNORECASE | re.DOTALL)
 
+# Strip accidental trailing function-call tails glued to identifiers, e.g.
+# "EDW.dbo.Table.COALESCE(MAX(x),-1)" -> "EDW.dbo.Table"
+_FUNC_TAIL_RE = re.compile(r"\.\s*[A-Za-z_]\w*\s*\(.*$", re.IGNORECASE)
+
+def _strip_expr_tail(name: str) -> str:
+    try:
+        return _FUNC_TAIL_RE.sub('', name or '')
+    except Exception:
+        return name
+
 @lru_cache(maxsize=65536)
 def _cached_split_fqn_core(fqn: str):
     parts = (fqn or "").split(".")
@@ -198,6 +208,28 @@ class SqlParser:
         normalized = re.sub(r"\s*\.\s*", ".", normalized)
         return normalized.strip().rstrip(';')
 
+    def _extract_temp_name(self, raw_name: str) -> str:
+        """Extract clean temp table name from raw identifier.
+        
+        Handles cases like:
+        - '#tmp' → 'tmp'
+        - 'dbo.#tmp' → 'tmp'  
+        - '#tmp INTO' → 'tmp'
+        - '#tmp (' → 'tmp'
+        - '#tmp_COALESCE(x,y)' → 'tmp'
+        
+        Returns only valid identifier characters (alphanumeric + underscore).
+        """
+        if not raw_name or '#' not in raw_name:
+            return raw_name
+        
+        # Get part after last #
+        after_hash = raw_name.split('#')[-1]
+        
+        # Extract only valid identifier chars (stop at first non-identifier char)
+        match = re.match(r'([a-zA-Z0-9_]+)', after_hash)
+        return match.group(1) if match else after_hash
+
     def _clean_output_name(self, s: str) -> str:
         """Sanitize output column names for readability and stability.
 
@@ -228,8 +260,9 @@ class SqlParser:
         Uses current object context if available; otherwise falls back to
         default schema + file stem.
         """
-        # Extract simple '#name'
-        t = (temp_name or "").split('.')[-1]
+        # Extract simple '#name' using _extract_temp_name to clean it
+        raw_t = (temp_name or "").split('.')[-1]
+        t = self._extract_temp_name(raw_t) if '#' in raw_t else raw_t
         if not t.startswith('#'):
             t = f"#{t}"
         db = self._ctx_db or self.current_database or self.default_database or 'InfoTrackerDW'
@@ -381,8 +414,8 @@ class SqlParser:
         """
         # Temp tables (any identifier that contains a '#' segment)
         if table_name and ('#' in table_name):
-            # Extract just the temp table name (part after last #)
-            temp_name = table_name.split('#')[-1]  # Get part after last #
+            # Extract clean temp table name
+            temp_name = self._extract_temp_name(table_name)
             # Always normalize to dbo.#nazwa format
             normalized_temp_name = f"dbo.#{temp_name}"
             # Always use tempdb namespace for temp tables
@@ -524,7 +557,7 @@ class SqlParser:
             if p and '/' in str(p):
                 root = str(p).split('/', 1)[0]
                 # Heuristic: directory name that looks like DB and not an object folder
-                if root and ('.' not in root) and root.lower() not in {"views", "functions", "tables", "storedprocedures", "procedures"}:
+                if root and ('.' not in root) and root.lower() not in {"views", "functions", "tables", "storedprocedure","storedprocedures", "procedures"}:
                     return root
         except Exception:
             pass
@@ -1595,8 +1628,8 @@ class SqlParser:
         
         # Register temp table metadata if this is a temp table
         if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
-            # Canonicalize temp output name using _ns_and_name (teraz już zwraca dbo.#nazwa)
-            simple_key = raw_target.split('#')[-1]  # Extract name after last #
+            # Canonicalize temp output name using _extract_temp_name
+            simple_key = self._extract_temp_name(raw_target)
             if not simple_key.startswith('#'):
                 simple_key = f"#{simple_key}"
             # Use _ns_and_name to get canonical namespace and name
@@ -1617,7 +1650,7 @@ class SqlParser:
                     base_sources.add(d)
                 else:
                     # Try to expand temp dependency to its bases
-                    dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                    dep_simple = self._extract_temp_name(d) if '#' in d else d.split('.')[-1]
                     if not dep_simple.startswith('#'):
                         dep_simple = f"#{dep_simple}"
                     dep_bases = self.temp_sources.get(dep_simple, set())
@@ -1649,7 +1682,7 @@ class SqlParser:
                 # Include the temp itself
                 final_dependencies.add(d)
                 # Also include its base sources if we know them
-                dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                dep_simple = self._extract_temp_name(d) if '#' in d else d.split('.')[-1]
                 if not dep_simple.startswith('#'):
                     dep_simple = f"#{dep_simple}"
                 dep_bases = self.temp_sources.get(dep_simple, set())
@@ -1818,8 +1851,8 @@ class SqlParser:
         # Register temp table columns if this is a temp table
         raw_is_temp = bool(raw_target and (str(raw_target).startswith('#') or 'tempdb' in str(raw_target)))
         if raw_is_temp:
-            # Canonicalize the temp table name and namespace using _ns_and_name (teraz już zwraca dbo.#nazwa)
-            simple_name = (str(raw_target).split('#')[-1])  # Extract name after last #
+            # Canonicalize the temp table name using _extract_temp_name
+            simple_name = self._extract_temp_name(str(raw_target))
             if not simple_name.startswith('#'):
                 simple_name = f"#{simple_name}"
             # Use _ns_and_name to get canonical namespace and name
@@ -1841,7 +1874,7 @@ class SqlParser:
                     base_sources.add(d)
                 else:
                     # This dependency is itself a temp table - try to expand it to its bases
-                    dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                    dep_simple = self._extract_temp_name(d) if '#' in d else d.split('.')[-1]
                     if not dep_simple.startswith('#'):
                         dep_simple = f"#{dep_simple}"
                     # Check if we have base sources for this temp
@@ -1883,7 +1916,7 @@ class SqlParser:
                 # Include the temp itself
                 final_dependencies.add(d)
                 # Also include its base sources if we know them
-                dep_simple = d.split('#')[-1] if '#' in d else d.split('.')[-1]
+                dep_simple = self._extract_temp_name(d) if '#' in d else d.split('.')[-1]
                 if not dep_simple.startswith('#'):
                     dep_simple = f"#{dep_simple}"
                 dep_bases = self.temp_sources.get(dep_simple, set())
@@ -4981,7 +5014,7 @@ class SqlParser:
         
         insert_targets = set()
         for match in re.findall(insert_pattern, cleaned_sql, re.IGNORECASE):
-            table_name = self._normalize_table_ident(match.strip())
+            table_name = self._normalize_table_ident(_strip_expr_tail(match.strip()))
             if not table_name.startswith('#'):
                 full_name = self._get_full_table_name(table_name)
                 parts = full_name.split('.')
@@ -4990,7 +5023,7 @@ class SqlParser:
                     insert_targets.add(simplified)
         
         for match in re.findall(create_pattern, cleaned_sql, re.IGNORECASE):
-            table_name = self._normalize_table_ident(match.strip())
+            table_name = self._normalize_table_ident(_strip_expr_tail(match.strip()))
             if not table_name.startswith('#'):
                 full_name = self._get_full_table_name(table_name)
                 parts = full_name.split('.')
@@ -4999,7 +5032,7 @@ class SqlParser:
                     insert_targets.add(simplified)
         
         for match in re.findall(select_into_pattern, cleaned_sql, re.IGNORECASE):
-            table_name = self._normalize_table_ident(match.strip())
+            table_name = self._normalize_table_ident(_strip_expr_tail(match.strip()))
             if not table_name.startswith('#'):
                 full_name = self._get_full_table_name(table_name)
                 parts = full_name.split('.')
@@ -5010,7 +5043,7 @@ class SqlParser:
         # Process tables, functions, and procedures (limit to core sources for performance)
         all_matches = from_matches + join_matches + update_matches + delete_matches + merge_matches + exec_matches
         for match in all_matches:
-            table_name = match.strip()
+            table_name = _strip_expr_tail(match.strip())
 
             # jeżeli to wzorzec funkcji: "NAME(...)" – pomiń
             if re.search(r'\w+\s*\(', table_name):
@@ -5331,6 +5364,10 @@ class SqlParser:
                                     col_name = f"col_{idx+1}"
                         
                         col_names.append(col_name)
+                
+                # Skip if no valid columns found (all were variable assignments)
+                if not col_names:
+                    continue
                 
                 if not col_names:
                     col_names = ['col_1', 'col_2', 'col_3']  # Fallback
