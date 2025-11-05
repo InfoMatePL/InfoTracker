@@ -208,6 +208,49 @@ def _extract_view_header_cols(self, create_exp) -> list[str]:
     return out
 
 
+def _extract_column_alias(self, select_expr: exp.Expression) -> Optional[str]:
+    """Extract column alias or name from a SELECT expression."""
+    if hasattr(select_expr, 'alias') and select_expr.alias:
+        return str(select_expr.alias)
+    if isinstance(select_expr, exp.Alias):
+        return str(select_expr.alias)
+    if isinstance(select_expr, exp.Column):
+        return str(select_expr.this)
+    expr_str = str(select_expr)
+    up = expr_str.upper()
+    if ' AS ' in up:
+        parts = expr_str.split()
+        as_idx = -1
+        for i, part in enumerate(parts):
+            if part.upper() == 'AS':
+                as_idx = i
+                break
+        if as_idx >= 0 and as_idx + 1 < len(parts):
+            return parts[as_idx + 1].strip("'\"")
+    return None
+
+
+def _extract_column_references(self, select_expr: exp.Expression, select_stmt: exp.Select) -> List[ColumnReference]:
+    """Extract table-qualified column references used by a SELECT expression."""
+    refs: List[ColumnReference] = []
+    for column_expr in select_expr.find_all(exp.Column):
+        table_name = "unknown"
+        column_name = str(column_expr.this)
+        if hasattr(column_expr, 'table') and column_expr.table:
+            table_alias = str(column_expr.table)
+            table_name = self._resolve_table_from_alias(table_alias, select_stmt)
+        else:
+            tables = [self._get_table_name(t) for t in select_stmt.find_all(exp.Table)]
+            if len(tables) == 1:
+                table_name = tables[0]
+        if table_name and (table_name.startswith('@') or ('+' in table_name) or (table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name)):
+            continue
+        if table_name != "unknown":
+            ns, nm = self._ns_and_name(table_name)
+            refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=column_name))
+    return refs
+
+
 def _is_string_function(self, expr: exp.Expression) -> bool:
     string_functions = ['RIGHT', 'LEFT', 'SUBSTRING', 'CHARINDEX', 'LEN', 'CONCAT']
     expr_str = str(expr).upper()

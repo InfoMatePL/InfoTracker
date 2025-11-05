@@ -109,6 +109,82 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
     return None
 
 
+def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
+    """Best-effort fallback for INSERT EXEC and INSERT INTO table patterns when AST parsing fails."""
+    from ..openlineage_utils import sanitize_name
+
+    sql_pre = self._preprocess_sql(sql_content)
+    insert_exec_pattern = r'(?is)INSERT\s+INTO\s+([#\[\]\w.]+)\s+EXEC\s+([^\s(;]+)'
+    exec_match = re.search(insert_exec_pattern, sql_pre)
+    insert_table_pattern = r'(?is)INSERT\s+INTO\s+([^\s#][#\[\]\w.]+)\s*\(([^)]+)\)\s+SELECT'
+    table_match = re.search(insert_table_pattern, sql_pre)
+    all_dependencies = self._extract_basic_dependencies(sql_pre)
+
+    placeholder_columns = [ColumnSchema(name="output_col_1", data_type="unknown", nullable=True, ordinal=0)]
+    namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
+    table_name = sanitize_name(object_hint or "script_output")
+    object_type = "script"
+
+    if table_match and not table_match.group(1).startswith('#'):
+        raw_table = table_match.group(1)
+        raw_columns = table_match.group(2)
+        table_name_norm = self._normalize_table_ident(raw_table)
+        ns, nm = self._ns_and_name(table_name_norm)
+        namespace, table_name, object_type = ns, nm, "table"
+        placeholder_columns = [ColumnSchema(name=col.strip(), data_type="unknown", nullable=True, ordinal=i) for i, col in enumerate(raw_columns.split(','))]
+    elif exec_match:
+        raw_table = exec_match.group(1)
+        raw_proc = exec_match.group(2)
+        table_name_norm = self._normalize_table_ident(raw_table)
+        proc_name = self._clean_proc_name(raw_proc)
+        if table_name_norm.startswith('#'):
+            temp_name = table_name_norm.lstrip('#')
+            table_name = f"tempdb..#{temp_name}"
+            namespace = "mssql://localhost/tempdb"
+            object_type = "temp_table"
+        else:
+            table_name = self._get_full_table_name(table_name_norm)
+            ns, nm = self._ns_and_name(table_name)
+            namespace, table_name, object_type = ns, nm, "table"
+        proc_full_name = sanitize_name(self._get_full_table_name(proc_name))
+        all_dependencies.add(proc_full_name)
+    else:
+        if not all_dependencies:
+            return None
+
+    schema = TableSchema(namespace=namespace, name=table_name, columns=placeholder_columns)
+    lineage: List[ColumnLineage] = []
+
+    if table_match and not table_match.group(1).startswith('#') and placeholder_columns:
+        proc_pattern = r'(?is)INSERT\s+INTO\s+#\w+\s+EXEC\s+([^\s(;]+)'
+        proc_match = re.search(proc_pattern, sql_pre)
+        if proc_match:
+            proc_full_name = sanitize_name(self._get_full_table_name(self._clean_proc_name(proc_match.group(1))))
+            ns_p, nm_p = self._ns_and_name(proc_full_name)
+            for col in placeholder_columns:
+                if col.name.lower() in ['archivedate', 'createdate', 'insertdate'] and 'getdate' in sql_pre.lower():
+                    lineage.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.CONSTANT, transformation_description="GETDATE() constant value for archiving"))
+                else:
+                    lineage.append(ColumnLineage(output_column=col.name, input_fields=[ColumnReference(namespace=ns_p, table_name=nm_p, column_name=col.name)], transformation_type=TransformationType.IDENTITY, transformation_description=f"{col.name} from procedure output via temp table"))
+        else:
+            for col in placeholder_columns:
+                lineage.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description=f"Column {col.name} from complex transformation"))
+    elif exec_match:
+        proc_full_name = sanitize_name(self._get_full_table_name(self._clean_proc_name(exec_match.group(2))))
+        ns_p, nm_p = self._ns_and_name(proc_full_name)
+        for col in placeholder_columns:
+            lineage.append(ColumnLineage(output_column=col.name, input_fields=[ColumnReference(namespace=ns_p, table_name=nm_p, column_name="*")], transformation_type=TransformationType.EXEC, transformation_description=f"INSERT INTO {table_name} EXEC {proc_full_name}"))
+
+    self.schema_registry.register(schema)
+    obj = ObjectInfo(name=table_name, object_type=object_type, schema=schema, lineage=lineage, dependencies=all_dependencies, is_fallback=True)
+    try:
+        if getattr(self, 'dbt_mode', False) and object_hint:
+            obj.job_name = f"dbt/models/{object_hint}.sql"
+    except Exception:
+        pass
+    return obj
+
+
 def _extract_table_variable_schema_string(self, sql_content: str) -> List[ColumnSchema]:
     """Extract column schema from @table TABLE definition using regex (string fallback)."""
     output_columns: List[ColumnSchema] = []

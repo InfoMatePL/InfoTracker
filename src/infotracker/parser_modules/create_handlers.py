@@ -6,7 +6,7 @@ from typing import Optional, List, Set
 import sqlglot
 from sqlglot import expressions as exp
 
-from ..models import TableSchema, ColumnSchema, ObjectInfo, ColumnLineage
+from ..models import TableSchema, ColumnSchema, ObjectInfo, ColumnLineage, TransformationType
 
 
 def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -57,8 +57,8 @@ def _parse_create_table(self, statement: exp.Create, object_hint: Optional[str] 
         for i, column_def in enumerate(schema_expr.expressions):
             if isinstance(column_def, exp.ColumnDef):
                 col_name = str(column_def.this)
-                col_type = self._extract_column_type(column_def)
-                nullable = not self._has_not_null_constraint(column_def)
+                col_type = _extract_column_type(self, column_def)
+                nullable = not _has_not_null_constraint(self, column_def)
                 columns.append(ColumnSchema(name=col_name, data_type=col_type, nullable=nullable, ordinal=i))
 
     schema = TableSchema(namespace=namespace, name=table_name, columns=columns)
@@ -104,6 +104,43 @@ def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None
     schema = TableSchema(namespace=namespace, name=table_name, columns=cols)
     self.schema_registry.register(schema)
     return ObjectInfo(name=table_name, object_type="table", schema=schema, lineage=[], dependencies=set())
+
+
+def _extract_column_type(self, column_def: exp.ColumnDef) -> str:
+    """Extract column type from column definition (normalized)."""
+    if column_def.kind:
+        data_type = str(column_def.kind)
+        TYPE_MAPPINGS = {
+            'VARCHAR': 'nvarchar',
+            'INT': 'int',
+            'DATE': 'date',
+        }
+        data_type_upper = data_type.upper()
+        for old_type, new_type in TYPE_MAPPINGS.items():
+            if data_type_upper.startswith(old_type):
+                data_type = data_type.replace(old_type, new_type)
+                break
+            elif data_type_upper == old_type:
+                data_type = new_type
+                break
+        if 'DECIMAL' in data_type_upper:
+            data_type = data_type.replace(' ', '').lower()
+        return data_type.lower()
+    return "unknown"
+
+
+def _has_not_null_constraint(self, column_def: exp.ColumnDef) -> bool:
+    """Check if column has NOT NULL/PK constraints (PK implies NOT NULL)."""
+    if column_def.constraints:
+        for constraint in column_def.constraints:
+            if isinstance(constraint, exp.ColumnConstraint):
+                if isinstance(constraint.kind, exp.PrimaryKeyColumnConstraint):
+                    return True
+                elif isinstance(constraint.kind, exp.NotNullColumnConstraint):
+                    constraint_str = str(constraint).upper()
+                    if constraint_str == "NOT NULL":
+                        return True
+    return False
 
 
 def _parse_create_view(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -187,7 +224,7 @@ def _parse_create_view(self, statement: exp.Create, object_hint: Optional[str] =
     self.schema_registry.register(schema)
     obj = ObjectInfo(name=view_name, object_type="view", schema=schema, lineage=lineage, dependencies=dependencies)
     if isinstance(select_stmt, exp.Select):
-        self._apply_view_header_names(statement, select_stmt, obj)
+        _apply_view_header_names(self, statement, select_stmt, obj)
     return obj
 
 
@@ -291,6 +328,35 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     return obj
 
 
+def _apply_view_header_names(self, create_exp: exp.Create, select_exp: exp.Select, obj: ObjectInfo):
+    """Apply header column names to view schema and lineage by position."""
+    header = self._extract_view_header_cols(create_exp)
+    if not header:
+        return
+    projs = list(select_exp.expressions or [])
+    for i, _ in enumerate(projs):
+        out_name = header[i] if i < len(header) else f"col_{i+1}"
+        if i < len(obj.schema.columns):
+            obj.schema.columns[i].name = out_name
+            obj.schema.columns[i].ordinal = i
+        else:
+            obj.schema.columns.append(ColumnSchema(
+                name=out_name,
+                data_type="unknown",
+                nullable=True,
+                ordinal=i
+            ))
+        if i < len(obj.lineage):
+            obj.lineage[i].output_column = out_name
+        else:
+            obj.lineage.append(ColumnLineage(
+                output_column=out_name,
+                input_fields=[],
+                transformation_type=TransformationType.EXPRESSION,
+                transformation_description=""
+            ))
+
+
 def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
     """Extract materialized outputs (SELECT INTO, INSERT INTO) from procedure body."""
     outputs: List[ObjectInfo] = []
@@ -384,7 +450,7 @@ def _extract_procedure_lineage(self, statement: exp.Create, procedure_name: str)
     output_columns: List[ColumnSchema] = []
     dependencies: Set[str] = set()
 
-    last_select = self._find_last_select_in_procedure(statement)
+    last_select = _find_last_select_in_procedure(self, statement)
     if last_select:
         lineage, output_columns = self._extract_column_lineage(last_select, procedure_name)
         dependencies = self._extract_dependencies(last_select)
@@ -426,3 +492,69 @@ def _extract_table_variable_schema(self, statement: exp.Create) -> List[ColumnSc
                 ordinal=i,
             ))
     return output_columns
+
+
+def _extract_mstvf_lineage(self, statement: exp.Create, function_name: str, output_columns: List[ColumnSchema]) -> tuple[List[ColumnLineage], Set[str]]:
+    """Extract lineage from multi-statement table-valued function (AST context)."""
+    lineage: List[ColumnLineage] = []
+    dependencies: Set[str] = set()
+
+    sql_text = str(statement)
+    stmt_patterns = [
+        r'INSERT\s+INTO\s+@\w+.*?(?=(?:INSERT|SELECT|UPDATE|DELETE|RETURN|END|\Z))',
+        r'(?<!INSERT\s+INTO\s+@\w+.*?)SELECT\s+.*?(?=(?:INSERT|SELECT|UPDATE|DELETE|RETURN|END|\Z))',
+        r'UPDATE\s+.*?(?=(?:INSERT|SELECT|UPDATE|DELETE|RETURN|END|\Z))',
+        r'DELETE\s+.*?(?=(?:INSERT|SELECT|UPDATE|DELETE|RETURN|END|\Z))',
+        r'EXEC\s+.*?(?=(?:INSERT|SELECT|UPDATE|DELETE|RETURN|END|\Z))'
+    ]
+
+    for pattern in stmt_patterns:
+        matches = re.finditer(pattern, sql_text, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            try:
+                stmt_sql = match.group(0).strip()
+                if not stmt_sql:
+                    continue
+                parsed_stmts = sqlglot.parse(stmt_sql, read=self.dialect)
+                if not parsed_stmts:
+                    continue
+                for parsed_stmt in parsed_stmts:
+                    if isinstance(parsed_stmt, exp.Select):
+                        stmt_lineage, _ = self._extract_column_lineage(parsed_stmt, function_name)
+                        lineage.extend(stmt_lineage)
+                        stmt_deps = self._extract_dependencies(parsed_stmt)
+                        dependencies.update(stmt_deps)
+                    elif isinstance(parsed_stmt, exp.Insert):
+                        if hasattr(parsed_stmt, 'expression') and isinstance(parsed_stmt.expression, exp.Select):
+                            stmt_lineage, _ = self._extract_column_lineage(parsed_stmt.expression, function_name)
+                            lineage.extend(stmt_lineage)
+                            stmt_deps = self._extract_dependencies(parsed_stmt.expression)
+                            dependencies.update(stmt_deps)
+            except Exception as e:
+                try:
+                    self._log_debug(f"Failed to parse statement in MSTVF: {e}")
+                except Exception:
+                    pass
+                continue
+
+    return lineage, dependencies
+
+
+def _find_last_select_in_procedure(self, statement: exp.Create) -> Optional[exp.Select]:
+    """Find the last top-level SELECT statement in a procedure body (heuristic)."""
+    sql_text = str(statement)
+    select_matches = list(re.finditer(r'(?<!INSERT\s)(?<!UPDATE\s)(?<!DELETE\s)SELECT\s+.*?(?=(?:FROM|$))', sql_text, re.IGNORECASE | re.DOTALL))
+    if not select_matches:
+        return None
+    last_match = select_matches[-1]
+    try:
+        select_sql = last_match.group(0)
+        from_match = re.search(r'FROM.*?(?=(?:WHERE|GROUP|ORDER|HAVING|;|$))', sql_text[last_match.end():], re.IGNORECASE | re.DOTALL)
+        if from_match:
+            select_sql += from_match.group(0)
+        parsed = sqlglot.parse(select_sql, read=self.dialect)
+        if parsed and isinstance(parsed[0], exp.Select):
+            return parsed[0]
+    except Exception:
+        pass
+    return None
