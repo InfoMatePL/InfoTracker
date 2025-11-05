@@ -5,6 +5,7 @@ import re
 from sqlglot import exp  # type: ignore
 
 from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage
+import sqlglot
 
 
 def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -97,3 +98,9 @@ def _is_table_valued_function_string(self, sql_content: str) -> bool:
     """Check if this is a table-valued function (returns TABLE)."""
     sql_upper = sql_content.upper()
     return "RETURNS TABLE" in sql_upper or "RETURNS @" in sql_upper
+
+
+def _extract_function_name(self, sql_content: str) -> Optional[str]:
+    """Extract function name from CREATE FUNCTION statement (string)."""
+    match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+([^\s\(]+)', sql_content, re.IGNORECASE)
+    return match.group(1).strip() if match else None

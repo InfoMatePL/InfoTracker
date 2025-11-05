@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Optional
+from sqlglot import expressions as exp
 
 
 def _rewrite_case_with_commas_to_iif(sql: str) -> str:
@@ -98,6 +99,24 @@ def _normalize_tsql(self, text: str) -> str:
     return t
 
 
+def _extract_dbt_model_name(self, sql_text: str) -> Optional[str]:
+    """Extract dbt model logical name from leading comment, e.g.:
+    -- dbt model: stg_orders
+    Returns lowercased sanitized name or None if not found.
+    """
+    try:
+        head = "\n".join((sql_text or "").splitlines()[:8])
+        m = re.search(r"(?im)^\s*--\s*dbt\s+model:\s*([A-Za-z0-9_\.]+)", head)
+        if m:
+            name = (m.group(1) or "").strip()
+            name = name.split('.')[-1]
+            from ..openlineage_utils import sanitize_name
+            return sanitize_name(name)
+    except Exception:
+        pass
+    return None
+
+
 def _extract_database_from_use_statement(self, content: str) -> Optional[str]:
     lines = (content or "").strip().split('\n')
     for line in lines[:10]:
@@ -163,3 +182,23 @@ def _preprocess_sql(self, sql: str) -> str:
     except Exception:
         pass
     return processed_sql
+
+
+def _rewrite_ast(self, root: Optional[exp.Expression]) -> Optional[exp.Expression]:
+    """Rewrite AST nodes for better T-SQL compatibility."""
+    if root is None:
+        return None
+    for node in list(root.walk()):
+        # Convert CONVERT(T, x [, style]) to CAST(x AS T)
+        if isinstance(node, exp.Convert):
+            target_type = node.args.get("to")
+            source_expr = node.args.get("expression")
+            if target_type and source_expr:
+                cast_node = exp.Cast(this=source_expr, to=target_type)
+                node.replace(cast_node)
+
+        # Mark HASHBYTES(...) nodes for special handling
+        if isinstance(node, exp.Anonymous) and (node.name or "").upper() == "HASHBYTES":
+            node.set("is_hashbytes", True)
+
+    return root

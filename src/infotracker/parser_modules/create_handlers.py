@@ -22,6 +22,15 @@ def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[s
         raise ValueError(f"Unsupported CREATE statement: {statement.kind}")
 
 
+def _is_table_valued_function(self, statement: exp.Create) -> bool:
+    """Heuristic: check if CREATE FUNCTION has RETURNS TABLE/RETURNS @."""
+    try:
+        sql_text = str(statement).upper()
+        return "RETURNS TABLE" in sql_text or "RETURNS @" in sql_text
+    except Exception:
+        return False
+
+
 def _parse_create_table(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
     schema_expr = statement.this
     try:

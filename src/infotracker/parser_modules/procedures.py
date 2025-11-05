@@ -175,3 +175,9 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
         pass
     obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
     return obj
+
+
+def _extract_procedure_name(self, sql_content: str) -> Optional[str]:
+    """Extract procedure name from CREATE PROCEDURE statement (string)."""
+    match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([^\s\(]+)', sql_content, re.IGNORECASE)
+    return match.group(1).strip() if match else None

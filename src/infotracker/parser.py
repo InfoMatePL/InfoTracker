@@ -6,7 +6,6 @@ from __future__ import annotations
 import logging
 import re
 from typing import List, Optional, Set, Dict, Any
-from functools import lru_cache
 
 import sqlglot
 from sqlglot import expressions as exp
@@ -18,21 +17,9 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-# Precompiled regexes for light scans and pre-scan in engine
-RE_SINGLELINE_COMMENT = re.compile(r"--.*?$", re.MULTILINE)
-RE_MULTILINE_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-RE_FQN3 = re.compile(r"(?i)(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
-RE_INSERT_INTO3 = re.compile(r"(?i)\bINSERT\s+INTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
-RE_SELECT_INTO3 = re.compile(r"(?is)\bSELECT\b.*?\bINTO\s+(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)\.(\[[^\]]+\]|\w+)")
+# Note: light-scan regexes moved or inlined where needed
 
-@lru_cache(maxsize=65536)
-def _cached_split_fqn_core(fqn: str):
-    parts = (fqn or "").split(".")
-    if len(parts) >= 3:
-        return parts[0], parts[1], ".".join(parts[2:])
-    if len(parts) == 2:
-        return None, parts[0], parts[1]
-    return None, "dbo", (parts[0] if parts else None)
+# moved to parser_modules.names: _cached_split_fqn_core
 
 
 class SqlParser:
@@ -103,23 +90,8 @@ class SqlParser:
         return _pp._normalize_tsql(self, text)
     
     def _rewrite_ast(self, root: Optional[exp.Expression]) -> Optional[exp.Expression]:
-        """Rewrite AST nodes for better T-SQL compatibility."""
-        if root is None:
-            return None
-        for node in list(root.walk()):
-            # Convert CONVERT(T, x [, style]) to CAST(x AS T)
-            if isinstance(node, exp.Convert):
-                target_type = node.args.get("to")
-                source_expr = node.args.get("expression")
-                if target_type and source_expr:
-                    cast_node = exp.Cast(this=source_expr, to=target_type)
-                    node.replace(cast_node)
-            
-            # Mark HASHBYTES(...) nodes for special handling
-            if isinstance(node, exp.Anonymous) and (node.name or "").upper() == "HASHBYTES":
-                node.set("is_hashbytes", True)
-        
-        return root
+        from .parser_modules import preprocess as _pp
+        return _pp._rewrite_ast(self, root)
 
     # ---- Logging helpers with file context ----
     def _log_info(self, msg: str, *args) -> None:
@@ -163,22 +135,8 @@ class SqlParser:
         logger.debug(prefix + text)
 
     def _extract_dbt_model_name(self, sql_text: str) -> Optional[str]:
-        """Extract dbt model logical name from leading comment, e.g.:
-        -- dbt model: stg_orders
-        Returns lowercased sanitized name or None if not found.
-        """
-        try:
-            head = "\n".join(sql_text.splitlines()[:8])
-            m = re.search(r"(?im)^\s*--\s*dbt\s+model:\s*([A-Za-z0-9_\.]+)", head)
-            if m:
-                name = m.group(1).strip()
-                # Drop any dotted prefixes accidentally captured
-                name = name.split('.')[-1]
-                from .openlineage_utils import sanitize_name
-                return sanitize_name(name)
-        except Exception:
-            pass
-        return None
+        from .parser_modules import preprocess as _pp
+        return _pp._extract_dbt_model_name(self, sql_text)
     
     def _split_fqn(self, fqn: str):
         """Split fully qualified name into database, schema, table components (uses cached core)."""
@@ -796,11 +754,8 @@ class SqlParser:
         return [f"unknown_{i+1}" for i in range(3)]  # Generate unknown_1, unknown_2, unknown_3
     
     def _get_namespace_for_table(self, table_name: str) -> str:
-        """Get appropriate namespace for a table based on its name."""
-        if table_name.startswith('#') or table_name.startswith('tempdb..#'):
-            return "mssql://localhost/tempdb"
-        db = self.current_database or self.default_database or "InfoTrackerDW"
-        return f"mssql://localhost/{db}"
+        from .parser_modules import names as _names
+        return _names._get_namespace_for_table(self, table_name)
 
     def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE FUNCTION using string-based approach (delegated)."""
@@ -830,14 +785,14 @@ class SqlParser:
         return _sf._extract_output_into_lineage_string(self, sql_content)
     
     def _extract_function_name(self, sql_content: str) -> Optional[str]:
-        """Extract function name from CREATE FUNCTION statement."""
-        match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+([^\s\(]+)', sql_content, re.IGNORECASE)
-        return match.group(1).strip() if match else None
+        """Extract function name from CREATE FUNCTION statement (delegated)."""
+        from .parser_modules import functions as _func
+        return _func._extract_function_name(self, sql_content)
     
     def _extract_procedure_name(self, sql_content: str) -> Optional[str]:
-        """Extract procedure name from CREATE PROCEDURE statement."""
-        match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([^\s\(]+)', sql_content, re.IGNORECASE)
-        return match.group(1).strip() if match else None
+        """Extract procedure name from CREATE PROCEDURE statement (delegated)."""
+        from .parser_modules import procedures as _proc
+        return _proc._extract_procedure_name(self, sql_content)
 
     def _is_table_valued_function_string(self, sql_content: str) -> bool:
         """Check if this is a table-valued function (delegated)."""
@@ -868,27 +823,8 @@ class SqlParser:
 
 
     def _extract_first_create_statement(self, sql_content: str, statement_type: str) -> str:
-        """Extract the first CREATE statement of the specified type."""
-        patterns = {
-            'FUNCTION': [
-                r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+.*?(?=CREATE\s+(?:OR\s+ALTER\s+)?(?:FUNCTION|PROCEDURE)|$)',
-                r'CREATE\s+FUNCTION\s+.*?(?=CREATE\s+(?:FUNCTION|PROCEDURE)|$)'
-            ],
-            'PROCEDURE': [
-                r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+.*?(?=CREATE\s+(?:OR\s+ALTER\s+)?(?:FUNCTION|PROCEDURE)|$)',
-                r'CREATE\s+PROCEDURE\s+.*?(?=CREATE\s+(?:FUNCTION|PROCEDURE)|$)'
-            ]
-        }
-        
-        if statement_type not in patterns:
-            return ""
-        
-        for pattern in patterns[statement_type]:
-            match = re.search(pattern, sql_content, re.DOTALL | re.IGNORECASE)
-            if match:
-                return match.group(0).strip()
-        
-        return ""
+        from .parser_modules import string_fallbacks as _sf
+        return _sf._extract_first_create_statement(self, sql_content, statement_type)
 
     def _extract_tvf_lineage_string(self, sql_text: str, function_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str]]:
         from .parser_modules import string_fallbacks as _sf
@@ -933,10 +869,9 @@ class SqlParser:
         
 
     def _is_table_valued_function(self, statement: exp.Create) -> bool:
-        """Check if this is a table-valued function (returns TABLE)."""
-        # Simple heuristic: check if the function has RETURNS TABLE
-        sql_text = str(statement).upper()
-        return "RETURNS TABLE" in sql_text or "RETURNS @" in sql_text
+        """Check if this is a table-valued function (delegated)."""
+        from .parser_modules import create_handlers as _ch
+        return _ch._is_table_valued_function(self, statement)
     
     def _extract_tvf_lineage(self, statement: exp.Create, function_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str]]:
         """Extract lineage from a table-valued function."""

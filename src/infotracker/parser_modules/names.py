@@ -2,8 +2,19 @@ from __future__ import annotations
 
 import re
 from typing import Optional, Tuple
+from functools import lru_cache
 from sqlglot import expressions as exp
 from ..openlineage_utils import qualify_identifier, sanitize_name
+
+
+@lru_cache(maxsize=65536)
+def _cached_split_fqn_core(fqn: str):
+    parts = (fqn or "").split(".")
+    if len(parts) >= 3:
+        return parts[0], parts[1], ".".join(parts[2:])
+    if len(parts) == 2:
+        return None, parts[0], parts[1]
+    return None, "dbo", (parts[0] if parts else None)
 
 
 def _clean_proc_name(self, s: str) -> str:
@@ -25,7 +36,6 @@ def _normalize_table_ident(self, s: str) -> str:
 
 def _split_fqn(self, fqn: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Split fully qualified name into (db, schema, table) using cached core and context default."""
-    from ..parser import _cached_split_fqn_core
     db, sch, tbl = _cached_split_fqn_core(fqn)
     if db is None:
         db = self.current_database or self.default_database
@@ -130,3 +140,11 @@ def _normalize_table_name_for_output(self, table_name: str) -> str:
     if len(parts) == 2:
         return table_name
     return f"dbo.{table_name}"
+
+
+def _get_namespace_for_table(self, table_name: str) -> str:
+    """Return OpenLineage namespace for a given table-like string."""
+    if table_name.startswith('#') or table_name.startswith('tempdb..#'):
+        return "mssql://localhost/tempdb"
+    db = self.current_database or self.default_database or "InfoTrackerDW"
+    return f"mssql://localhost/{db}"

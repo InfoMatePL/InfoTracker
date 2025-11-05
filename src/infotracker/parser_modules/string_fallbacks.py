@@ -109,6 +109,27 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
     return None
 
 
+def _extract_first_create_statement(self, sql_content: str, statement_type: str) -> str:
+    """Extract the first CREATE statement of the specified type (FUNCTION|PROCEDURE)."""
+    patterns = {
+        'FUNCTION': [
+            r'CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\s+.*?(?=CREATE\s+(?:OR\s+ALTER\s+)?(?:FUNCTION|PROCEDURE)|$)',
+            r'CREATE\s+FUNCTION\s+.*?(?=CREATE\s+(?:FUNCTION|PROCEDURE)|$)'
+        ],
+        'PROCEDURE': [
+            r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+.*?(?=CREATE\s+(?:OR\s+ALTER\s+)?(?:FUNCTION|PROCEDURE)|$)',
+            r'CREATE\s+PROCEDURE\s+.*?(?=CREATE\s+(?:FUNCTION|PROCEDURE)|$)'
+        ]
+    }
+    if statement_type not in patterns:
+        return ""
+    for pattern in patterns[statement_type]:
+        match = re.search(pattern, sql_content, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
 def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
     """Best-effort fallback for INSERT EXEC and INSERT INTO table patterns when AST parsing fails."""
     from ..openlineage_utils import sanitize_name
