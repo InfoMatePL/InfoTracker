@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from fnmatch import fnmatch
@@ -21,6 +22,8 @@ from .models import (
     TableSchema,
     ColumnGraph,
     ColumnEdge,
+    ColumnLineage,
+    ColumnReference,
     TransformationType,
 )
 
@@ -244,11 +247,7 @@ class Engine:
                         # Also register in adapter's parser for lineage generation
                         adapter.parser.schema_registry.register(obj_info.schema)
 
-                    # Skip emitting separate OL events for temp tables; continuity is preserved via inlined lineage
-                    if obj_info.object_type == "temp_table" or (obj_info.schema and str(obj_info.schema.name).startswith('tempdb..#')):
-                        continue
-
-                    # Generate OpenLineage directly from resolved ObjectInfo
+                    # Generate OpenLineage directly from resolved ObjectInfo (including temp tables)
                     ol_payload = emit_ol_from_object(
                         obj_info,
                         quality_metrics=True,
@@ -264,6 +263,54 @@ class Engine:
 
                     outputs.append([str(sql_path), str(target)])
 
+                    # Additionally, emit separate OL events for temp tables created in this file
+                    try:
+                        temp_keys = [k for k in (parser.temp_registry.keys()) if isinstance(k, str) and k.startswith('#') and '@' not in k]
+                    except Exception:
+                        temp_keys = []
+                    for tmp in temp_keys:
+                        try:
+                            # Canonicalize temp name and derive ns
+                            canonical = parser._canonical_temp_name(tmp)
+                            db_ctx = getattr(parser, '_ctx_db', None) or getattr(parser, 'current_database', None) or getattr(parser, 'default_database', None) or 'InfoTrackerDW'
+                            ns_tmp = f"mssql://localhost/{str(db_ctx).upper()}"
+                            # Build schema
+                            schema = parser.schema_registry.get(ns_tmp, canonical)
+                            if not schema:
+                                cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(parser.temp_registry.get(tmp, []) or [])]
+                                schema = TableSchema(namespace=ns_tmp, name=canonical, columns=cols)
+                            # Build lineage
+                            lin_list = []
+                            col_map = parser.temp_lineage.get(tmp) or {}
+                            for i, col in enumerate(schema.columns or []):
+                                refs = list(col_map.get(col.name, []))
+                                if refs:
+                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
+                                else:
+                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
+                            deps = set(parser.temp_sources.get(tmp, set()) or set())
+                            temp_obj = ObjectInfo(name=canonical, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
+                            # Include in graph
+                            resolved_objects.append(temp_obj)
+                            # Write OL JSON
+                            # Extract just db.schema.#temp for filename (skip middle object context)
+                            parts = canonical.split('.')
+                            if len(parts) >= 3 and parts[-1].startswith('#'):
+                                # Format: DB.schema.object.#temp or longer -> use DB.schema.#temp
+                                db_part = parts[0]
+                                schema_part = parts[1] if len(parts) > 1 else 'dbo'
+                                temp_part = parts[-1]
+                                safe_name = f"{db_part}.{schema_part}.{temp_part}"
+                            else:
+                                safe_name = canonical
+                            safe = safe_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('#', 'hash')
+                            tpath = out_dir / f"{sql_path.stem}__temp__{safe}.json"
+                            tpayload = emit_ol_from_object(temp_obj, quality_metrics=True, virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True))
+                            tpath.write_text(json.dumps(tpayload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+                            outputs.append([str(sql_path), str(tpath)])
+                        except Exception:
+                            pass
+
                     # Optionally emit minimal source dataset events for inputs that do not have their own outputs
                     if self._emit_external_sources:
                         try:
@@ -276,9 +323,9 @@ class Engine:
                                     nm_in = inp.get('name')
                                     if not nm_in:
                                         continue
-                                    # Skip temp / variables
+                                    # Skip variables only (keep temp datasets visible)
                                     s = str(nm_in)
-                                    if s.startswith('#') or s.startswith('@'):
+                                    if s.startswith('@'):
                                         continue
                                     # filename-safe
                                     safe = s.replace('/', '_').replace('\\', '_').replace(':', '_')
@@ -316,7 +363,11 @@ class Engine:
 
                     if warning_reason:
                         warnings += 1
-                        logger.warning("Object %s: %s", obj_info.name, warning_reason)
+                        try:
+                            disp = f"{obj_info.schema.namespace}.{obj_info.schema.name}" if getattr(obj_info, 'schema', None) else obj_info.name
+                        except Exception:
+                            disp = obj_info.name
+                        logger.warning("Object %s: %s", disp, warning_reason)
 
                 except Exception as e:
                     warnings += 1
@@ -396,28 +447,55 @@ class Engine:
             pass
 
     def _build_dependency_graph(self, objects: List[ObjectInfo]) -> Dict[str, Set[str]]:
-        """Build dependency graph: object_name -> set of dependencies."""
+        """Build dependency graph: object_name -> set of dependencies.
+        
+        Temp tables are now included as normal nodes in the graph with their canonical names (dbo.#name).
+        """
         dependencies: Dict[str, Set[str]] = {}
 
         # Helper: normalize a name to our object key space (schema.table)
+        def _dequote(s: str) -> str:
+            try:
+                import re
+                return re.sub(r"[\[\]\"'`]", "", s or "").strip()
+            except Exception:
+                return (s or "").strip()
+
         def _strip_db(name: str) -> str:
+            name = _dequote(name or "")
             parts = (name or "").split('.')
             return '.'.join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
         def _is_noise(n: str) -> bool:
+            """Check if a name is noise (variables, dynamic tokens, but NOT temp tables)."""
             if not n:
                 return True
             s = n.strip()
-            return s.startswith('#') or s.startswith('@') or ('+' in s) or (s.startswith('[') and s.endswith(']') and '.' not in s)
+            # Variables (@@, @var)
+            if s.startswith('@'):
+                return True
+            # Dynamic string concatenation
+            if '+' in s:
+                return True
+            # Bracket-only tokens without dot (malformed identifiers)
+            if s.startswith('[') and s.endswith(']') and '.' not in s:
+                return True
+            # Temp tables are NOT noise - they're legitimate dependencies
+            return False
 
         # Build case-insensitive key map for objects
         key_map: Dict[str, str] = {}
         for obj in objects:
-            k = (obj.schema.name if obj.schema else obj.name)
-            key_map[k.lower()] = k
+            k = _dequote(obj.schema.name if obj.schema else obj.name)
+            # Canonical key: schema.table (including dbo.#temp for temp tables)
+            canon = _strip_db(k)
+            key_map[canon.lower()] = canon
+            # If an object came with DB prefix, also map the 3-part form to canonical
+            if k.count('.') >= 2:
+                key_map[k.lower()] = canon
 
         for obj in objects:
-            obj_name = obj.schema.name if obj.schema else obj.name
+            obj_name = _strip_db(_dequote(obj.schema.name if obj.schema else obj.name))
             deps: Set[str] = set()
 
             # Prefer explicit ObjectInfo.dependencies
@@ -428,6 +506,7 @@ class Engine:
                     for f in ln.input_fields or []:
                         raw_deps.add(f.table_name)
 
+            # Filter raw deps and map to known objects
             for d in raw_deps:
                 if _is_noise(d):
                     continue
@@ -437,6 +516,19 @@ class Engine:
                 # include only if dependency is among parsed objects
                 if norm in key_map:
                     deps.add(key_map[norm])
+
+            # If explicit deps yielded nothing (e.g., only temps), try lineage inputs as a secondary fallback
+            if not deps and obj.lineage:
+                for ln in obj.lineage:
+                    for f in ln.input_fields or []:
+                        nm2 = f.table_name
+                        if _is_noise(nm2):
+                            continue
+                        norm2 = _strip_db(nm2).lower()
+                        if norm2 == obj_name.lower():
+                            continue
+                        if norm2 in key_map:
+                            deps.add(key_map[norm2])
             dependencies[obj_name] = deps
 
         return dependencies

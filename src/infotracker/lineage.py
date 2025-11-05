@@ -10,17 +10,29 @@ from typing import Dict, List, Any, Optional
 from .models import ObjectInfo, ColumnLineage, TransformationType
 
 
+def _dequote(s: str) -> str:
+    try:
+        import re
+        return re.sub(r"[\[\]\"'`]", "", s or "").strip()
+    except Exception:
+        return (s or "").strip()
+
+
 def _ns_for_dep(dep: str, default_ns: str) -> str:
-    """Determine namespace for a dependency based on its database context."""
-    d = (dep or "").strip()
+    """Determine namespace for a dependency based on its database context.
+
+    Strips quotes/brackets from identifiers to avoid duplicates.
+    """
+    d = _dequote(dep or "")
     dl = d.lower()
     if dl.startswith("tempdb..#") or dl.startswith("#"):
         return "mssql://localhost/tempdb"
     parts = d.split(".")
     db = parts[0] if len(parts) >= 3 else None
-    return f"mssql://localhost/{db}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
+    return f"mssql://localhost/{(db or '').upper()}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
 
 def _strip_db_prefix(name: str) -> str:
+    name = _dequote(name or "")
     parts = (name or "").split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
 
@@ -37,8 +49,7 @@ def _is_noise_dep(dep: str) -> bool:
         return True
     d = dep.strip()
     dl = d.lower()
-    if dl.startswith("tempdb..#") or d.startswith("#"):
-        return True
+    # keep temp tables visible in upstream/lineage
     if d.startswith("@"):
         return True
     if "+" in d:
@@ -91,18 +102,23 @@ class OpenLineageGenerator:
         """Build inputs array from object dependencies."""
         inputs = []
         for dep_name in sorted(obj_info.dependencies):
-             if _is_noise_dep(dep_name):
-                 continue
-             # tempdb: stały namespace
-             if dep_name.startswith('tempdb..#'):
-                 namespace = "mssql://localhost/tempdb"
-             else:
-                 parts = dep_name.split('.')
-                 db = parts[0] if len(parts) >= 3 else None
-                 namespace = f"mssql://localhost/{db}" if db else self.namespace
-             # w name trzymaj schema.table (bez prefiksu DB)
-             name = ".".join(dep_name.split(".")[-2:]) if "." in dep_name else dep_name
-             inputs.append({"namespace": namespace, "name": name})
+            if _is_noise_dep(dep_name):
+                continue
+            d = _dequote(dep_name)
+            # tempdb legacy pattern
+            if d.startswith('tempdb..#'):
+                namespace = "mssql://localhost/tempdb"
+                name = d
+            else:
+                parts = d.split('.')
+                db = parts[0] if len(parts) >= 3 else None
+                namespace = f"mssql://localhost/{db}" if db else self.namespace
+                # Preserve DB for temp canonical names (contain '#')
+                if '#' in d:
+                    name = d
+                else:
+                    name = ".".join(parts[-2:]) if len(parts) >= 2 else d
+            inputs.append({"namespace": namespace, "name": name})
 
         
         return inputs
@@ -210,8 +226,7 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
             def _is_noise_name(n: str) -> bool:
                 if not n:
                     return True
-                if n.startswith('tempdb..#') or n.startswith('#'):
-                    return True
+                # keep temp tables visible
                 if n.startswith('@'):
                     return True
                 if '+' in n:

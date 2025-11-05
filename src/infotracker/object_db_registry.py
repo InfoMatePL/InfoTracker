@@ -49,18 +49,19 @@ class ObjectDbRegistry:
     def learn_from_create(self, obj_type: str, schema_table: str, db: str) -> None:
         if not (schema_table and db):
             return
-        self.hard[_key(obj_type, schema_table)] = db
+        self.hard[_key(obj_type, schema_table)] = str(db).upper()
 
     def learn_from_targets(self, schema_table: str, db: str) -> None:
         if not (schema_table and db):
             return
-        self.hard[_wild(schema_table)] = db
-        self.soft[_wild(schema_table)][db] += 10
+        dbu = str(db).upper()
+        self.hard[_wild(schema_table)] = dbu
+        self.soft[_wild(schema_table)][dbu] += 10
 
     def learn_from_references(self, schema_table: str, db: str) -> None:
         if not (schema_table and db):
             return
-        self.soft[_wild(schema_table)][db] += 1
+        self.soft[_wild(schema_table)][str(db).upper()] += 1
 
     # ---- resolution API ----
     def get(self, key_or_type: str, schema_table: Optional[str] = None) -> Optional[str]:
