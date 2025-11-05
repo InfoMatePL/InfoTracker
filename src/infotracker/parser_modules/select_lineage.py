@@ -12,6 +12,7 @@ def _build_alias_maps(self, select_exp: exp.Select):
     alias_map = {}
     derived_cols = {}
 
+    base_fqns = []
     for t in select_exp.find_all(exp.Table):
         a = getattr(t, "alias", None) or t.args.get("alias")
         alias = None
@@ -21,9 +22,18 @@ def _build_alias_maps(self, select_exp: exp.Select):
             else:
                 alias = str(a).lower()
         fqn = self._qualify_table(t)
+        # If this table corresponds to a known temp by simple name, canonicalize to the temp
+        try:
+            parts_tmp = (fqn or '').split('.')
+            simple = parts_tmp[-1] if parts_tmp else None
+            if simple and not str(simple).startswith('#') and (f"#{simple}" in self.temp_registry):
+                fqn = self._canonical_temp_name(f"#{simple}")
+        except Exception:
+            pass
         if alias:
             alias_map[alias] = fqn
         alias_map[t.name.lower()] = fqn
+        base_fqns.append(fqn)
 
     for sq in select_exp.find_all(exp.Subquery):
         a = getattr(sq, "alias", None) or sq.args.get("alias")
@@ -48,6 +58,14 @@ def _build_alias_maps(self, select_exp: exp.Select):
             derived_cols[key] = list(target.find_all(exp.Column))
             idx += 1
 
+    # If exactly one base table is present, allow resolving unqualified columns to it
+    try:
+        uniq = sorted(set(base_fqns))
+        if len(uniq) == 1 and '' not in alias_map:
+            alias_map[''] = uniq[0]
+    except Exception:
+        pass
+
     return alias_map, derived_cols
 
 
@@ -57,21 +75,31 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     if not table_fqn:
         return
     db, sch, tbl = self._split_fqn(table_fqn)
+    # Detect temp segment anywhere in the FQN
     try:
-        simple = tbl if tbl else None
-        if simple and simple.startswith('#'):
-            ver = self._temp_current(simple)
+        temp_seg = None
+        for seg in (table_fqn or '').split('.'):
+            if str(seg).startswith('#'):
+                temp_seg = seg
+                break
+        if temp_seg:
+            # Include the temp itself as an input (canonical name)
+            temp_canon = self._canonical_temp_name(temp_seg)
+            ns_temp = f"mssql://localhost/{(self._ctx_db or db or 'InfoTrackerDW').upper()}"
+            out_list.append(ColumnReference(namespace=ns_temp, table_name=temp_canon, column_name=col_exp.name))
+            # Inline base lineage if we have it
+            ver = self._temp_current(temp_seg)
             colname = col_exp.name
             if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
                 out_list.extend(self.temp_lineage[ver][colname])
                 return
-            if simple in self.temp_lineage and colname in self.temp_lineage[simple]:
-                out_list.extend(self.temp_lineage[simple][colname])
+            if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
+                out_list.extend(self.temp_lineage[temp_seg][colname])
                 return
     except Exception:
         pass
     out_list.append(ColumnReference(
-        namespace=f"mssql://localhost/{db}" if db else "mssql://localhost",
+        namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
         table_name=f"{sch}.{tbl}",
         column_name=col_exp.name
     ))
@@ -92,7 +120,7 @@ def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derive
 
 
 def _get_schema(self, db: str, sch: str, tbl: str):
-    ns = f"mssql://localhost/{db}" if db else None
+    ns = f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else None
     key = f"{sch}.{tbl}"
     if hasattr(self.schema_registry, "get"):
         return self.schema_registry.get(ns, key)
