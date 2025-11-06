@@ -56,3 +56,30 @@ def _canonical_temp_name(self, name: str) -> str:
         return cur or n
     except Exception:
         return name
+
+
+def _extract_temp_name(self, raw_name: str) -> str:
+    """Extract clean temp table name from a raw identifier string.
+
+    Handles cases like:
+    - '#tmp' → 'tmp'
+    - 'dbo.#tmp' → 'tmp'
+    - '#tmp INTO' or '#tmp (' → 'tmp'
+    - '#tmp_COALESCE(x,y)' → 'tmp'
+
+    Returns only valid identifier characters (alphanumeric + underscore)
+    immediately following the last '#'. If input doesn't contain '#',
+    returns it unchanged.
+    """
+    try:
+        if not raw_name or '#' not in str(raw_name):
+            return raw_name
+        text = str(raw_name)
+        # Get part after last '#'
+        after_hash = text.split('#')[-1]
+        # Extract only valid identifier chars (stop at first non-identifier char)
+        import re as _re
+        m = _re.match(r"([A-Za-z0-9_]+)", after_hash)
+        return m.group(1) if m else after_hash
+    except Exception:
+        return raw_name

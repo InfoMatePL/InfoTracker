@@ -143,10 +143,16 @@ def _parse_insert_exec(self, statement: exp.Insert, object_hint: Optional[str] =
             ColumnSchema(name="output_col_2", data_type="unknown", ordinal=1, nullable=True),
         ]
         if raw_target and (str(raw_target).startswith('#') or 'tempdb..#' in str(raw_target)):
+                # Canonical simple temp key (e.g., '#temp')
                 simple_key = (str(raw_target).split('.')[-1] if '.' in str(raw_target) else str(raw_target))
                 if not simple_key.startswith('#'):
                     simple_key = f"#{simple_key}"
-                namespace, table_name = self._ns_and_name(simple_key, obj_type_hint="temp_table")
+                # Output naming for temp materialization: DB.schema.<object_hint>.#temp
+                db = self.current_database or self.default_database or "InfoTrackerDW"
+                sch = getattr(self, 'default_schema', None) or "dbo"
+                label = (object_hint or "object")
+                table_name = f"{db}.{sch}.{label}.{simple_key}"
+                namespace = f"mssql://localhost/{db}"
         lineage = []
         if procedure_name:
             ns_proc, nm_proc = self._ns_and_name(procedure_name)

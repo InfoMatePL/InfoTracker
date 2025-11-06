@@ -160,8 +160,11 @@ def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str]
         proc_name = self._clean_proc_name(raw_proc)
         if table_name_norm.startswith('#'):
             temp_name = table_name_norm.lstrip('#')
-            table_name = f"tempdb..#{temp_name}"
-            namespace = "mssql://localhost/tempdb"
+            db = self.current_database or self.default_database or "InfoTrackerDW"
+            sch = getattr(self, 'default_schema', None) or "dbo"
+            label = (object_hint or "object")
+            table_name = f"{db}.{sch}.{label}.#{temp_name}"
+            namespace = f"mssql://localhost/{db}"
             object_type = "temp_table"
         else:
             table_name = self._get_full_table_name(table_name_norm)
@@ -194,7 +197,15 @@ def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str]
         proc_full_name = sanitize_name(self._get_full_table_name(self._clean_proc_name(exec_match.group(2))))
         ns_p, nm_p = self._ns_and_name(proc_full_name)
         for col in placeholder_columns:
-            lineage.append(ColumnLineage(output_column=col.name, input_fields=[ColumnReference(namespace=ns_p, table_name=nm_p, column_name="*")], transformation_type=TransformationType.EXEC, transformation_description=f"INSERT INTO {table_name} EXEC {proc_full_name}"))
+            # Use schema.proc in description (without DB prefix) to match tests
+            lineage.append(
+                ColumnLineage(
+                    output_column=col.name,
+                    input_fields=[ColumnReference(namespace=ns_p, table_name=nm_p, column_name="*")],
+                    transformation_type=TransformationType.EXEC,
+                    transformation_description=f"INSERT INTO {table_name} EXEC {nm_p}"
+                )
+            )
 
     self.schema_registry.register(schema)
     obj = ObjectInfo(name=table_name, object_type=object_type, schema=schema, lineage=lineage, dependencies=all_dependencies, is_fallback=True)

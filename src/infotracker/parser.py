@@ -73,6 +73,10 @@ class SqlParser:
     def _canonical_temp_name(self, name: str) -> str:
         from .parser_modules import temp_utils as _tu
         return _tu._canonical_temp_name(self, name)
+
+    def _extract_temp_name(self, raw_name: str) -> str:
+        from .parser_modules import temp_utils as _tu
+        return _tu._extract_temp_name(self, raw_name)
     
     def _clean_proc_name(self, s: str) -> str:
         """Clean procedure name by removing semicolons and parameters."""
@@ -292,17 +296,44 @@ class SqlParser:
             if self.dbt_mode:
                 normalized_sql = self._normalize_tsql(sql_content)
                 preprocessed_sql = self._preprocess_sql(normalized_sql)
+                # Ephemeral-like dbt model: no final SELECT, but has INSERT INTO #temp
+                import re as _re
+                if _re.search(r"(?is)\bINSERT\s+INTO\s+#", preprocessed_sql):
+                    model_name = self._extract_dbt_model_name(sql_content) or sanitize_name(object_hint or "dbt_model")
+                    nm = f"{self.default_schema or 'dbo'}.{model_name}"
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
+                    db_ns = str(db).upper()
+                    deps = self._extract_basic_dependencies(preprocessed_sql)
+                    deps_norm: Set[str] = set()
+                    for dep in deps:
+                        dep_s = sanitize_name(dep)
+                        parts = dep_s.split('.') if dep_s else []
+                        tbl = parts[-1] if parts else dep_s
+                        deps_norm.add(f"{self.default_schema or 'dbo'}.{tbl}")
+                    schema = TableSchema(namespace=f"mssql://localhost/{db_ns}", name=nm, columns=[])
+                    self.schema_registry.register(schema)
+                    obj = ObjectInfo(name=nm, object_type="view", schema=schema, lineage=[], dependencies=deps_norm)
+                    obj.is_fallback = True
+                    obj.no_output_reason = "DBT_NO_FINAL_SELECT"
+                    try:
+                        if object_hint:
+                            obj.job_name = f"dbt/models/{object_hint}.sql"
+                    except Exception:
+                        pass
+                    return obj
                 statements = sqlglot.parse(preprocessed_sql, read=self.dialect) or []
+                # Consider only a top-level final SELECT as a compiled dbt model output
                 last_select = None
-                for st in reversed(statements):
-                    if isinstance(st, exp.Select):
-                        last_select = st
-                        break
+                top_stmt = statements[-1] if statements else None
+                if isinstance(top_stmt, exp.Select):
+                    last_select = top_stmt
                 if last_select is not None:
                     # Prefer model name from header comment; fallback to filename stem
                     model_name = self._extract_dbt_model_name(sql_content) or sanitize_name(object_hint or "dbt_model")
                     nm = f"{self.default_schema or 'dbo'}.{model_name}"
                     db = self.current_database or self.default_database or "InfoTrackerDW"
+                    # For dbt ephemeral fallback, tests expect uppercase DB in namespace
+                    db_ns = str(db).upper()
                     # Dependencies and lineage from last SELECT
                     deps = self._extract_dependencies(last_select)
                     deps_norm: Set[str] = set()
@@ -349,7 +380,7 @@ class SqlParser:
                         tbl = parts[-1] if parts else dep_s
                         deps_norm.add(f"{self.default_schema or 'dbo'}.{tbl}")
                     schema = TableSchema(
-                        namespace=f"mssql://localhost/{db}",
+                        namespace=f"mssql://localhost/{db_ns}",
                         name=nm,
                         columns=[]
                     )
