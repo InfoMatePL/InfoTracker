@@ -152,7 +152,7 @@ def _parse_insert_exec(self, statement: exp.Insert, object_hint: Optional[str] =
                 sch = getattr(self, 'default_schema', None) or "dbo"
                 label = (object_hint or "object")
                 table_name = f"{db}.{sch}.{label}.{simple_key}"
-                namespace = f"mssql://localhost/{db}"
+                namespace = self._canonical_namespace(db)
         lineage = []
         if procedure_name:
             ns_proc, nm_proc = self._ns_and_name(procedure_name)

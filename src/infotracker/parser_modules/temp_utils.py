@@ -47,13 +47,20 @@ def _temp_current(self, name: str) -> Optional[str]:
 
 
 def _canonical_temp_name(self, name: str) -> str:
-    """Return a stable canonical name for a temp table, preferring the current version if available."""
+    """Return canonical temp name including context when available.
+
+    - If we know current object context, format: DB.schema.object.#temp[@v]
+    - Otherwise, return '#temp[@v]' to avoid breaking callers.
+    """
     try:
         n = name if name.startswith('#') else f"#{name}"
-        if '@' in n:
-            return n
-        cur = _temp_current(self, n)
-        return cur or n
+        ver = _temp_current(self, n)
+        seg = ver or n
+        ctx_db = getattr(self, "_ctx_db", None) or getattr(self, "current_database", None) or getattr(self, "default_database", None)
+        ctx_obj = getattr(self, "_ctx_obj", None)
+        if ctx_db and ctx_obj:
+            return f"{ctx_db}.{ctx_obj}.{seg}"
+        return seg
     except Exception:
         return name
 

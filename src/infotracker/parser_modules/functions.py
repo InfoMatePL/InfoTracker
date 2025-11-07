@@ -11,8 +11,13 @@ import sqlglot
 def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
     """Parse CREATE FUNCTION using string-based approach (extracted)."""
     function_name = self._extract_function_name(sql_content) or object_hint or "unknown_function"
-    inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content)
-    namespace = f"mssql://localhost/{inferred_db or self.default_database or 'InfoTrackerDW'}"
+    inferred_db = self._infer_database_for_object(statement=None, sql_text=sql_content) or self.current_database or self.default_database
+    namespace = self._canonical_namespace(inferred_db)
+
+    # Establish ctx (db + object) for canonical temp names inside TVF processing
+    prev_ctx_db, prev_ctx_obj = getattr(self, "_ctx_db", None), getattr(self, "_ctx_obj", None)
+    self._ctx_db = inferred_db or self.current_database or self.default_database
+    self._ctx_obj = self._normalize_table_name_for_output(function_name)
 
     # Scalar function: no lineage, empty schema
     if not self._is_table_valued_function_string(sql_content):
@@ -35,7 +40,9 @@ def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = 
                 self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
-        return obj
+    # restore ctx
+    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+    return obj
 
     # Table-valued function: compute lineage
     lineage, output_columns, dependencies = self._extract_tvf_lineage_string(sql_content, function_name)
@@ -63,6 +70,8 @@ def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = 
             self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
     except Exception:
         pass
+    # restore ctx
+    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
     return obj
 
 

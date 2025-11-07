@@ -95,7 +95,8 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                 sch = "dbo"
                 tbl = parts[0]
                 full_name = f"{db}.{sch}.{tbl}"
-        ns = f"mssql://localhost/{db or (self.current_database or self.default_database or 'InfoTrackerDW')}"
+        canon_db = db or (self.current_database or self.default_database or 'InfoTrackerDW')
+        ns = self._canonical_namespace(canon_db)
         return ObjectInfo(name=full_name, object_type="table", schema=TableSchema(namespace=ns, name=full_name, columns=[]), lineage=[], dependencies=set())
 
     for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
@@ -142,7 +143,7 @@ def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str]
     all_dependencies = self._extract_basic_dependencies(sql_pre)
 
     placeholder_columns = [ColumnSchema(name="output_col_1", data_type="unknown", nullable=True, ordinal=0)]
-    namespace = f"mssql://localhost/{self.current_database or self.default_database or 'InfoTrackerDW'}"
+    namespace = self._canonical_namespace(self.current_database or self.default_database or 'InfoTrackerDW')
     table_name = sanitize_name(object_hint or "script_output")
     object_type = "script"
 
@@ -164,7 +165,7 @@ def _try_insert_exec_fallback(self, sql_content: str, object_hint: Optional[str]
             sch = getattr(self, 'default_schema', None) or "dbo"
             label = (object_hint or "object")
             table_name = f"{db}.{sch}.{label}.#{temp_name}"
-            namespace = f"mssql://localhost/{db}"
+            namespace = self._canonical_namespace(db)
             object_type = "temp_table"
         else:
             table_name = self._get_full_table_name(table_name_norm)
@@ -258,8 +259,13 @@ def _extract_basic_select_columns(self, select_sql: str) -> List[ColumnSchema]:
             parts = col.strip().split()
             col_name = parts[-1]
         else:
-            col_name = col.split('.')[-1] if '.' in col else col
-            col_name = re.sub(r'[^\w]', '', col_name)
+            # Derive a stable name by stripping expression tails if no alias
+            try:
+                from .select_lineage import _strip_expr_tail
+                col_name = _strip_expr_tail(col)
+            except Exception:
+                col_name = col.split('.')[-1] if '.' in col else col
+                col_name = re.sub(r'[^\w]', '', col_name)
 
         if col_name:
             output_columns.append(ColumnSchema(
@@ -520,6 +526,16 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
                     alias_map[tbl.split('.')[-1].lower()] = tbl
             for tbl in set(alias_map.values()):
                 dependencies.add(tbl)
+        # Resolve UPDATE target alias to real table if necessary
+        parts = (dml_target or '').split('.')
+        if len(parts) < 2 and dml_target:
+            real = alias_map.get((dml_target or '').lower())
+            if real:
+                rparts = real.split('.')
+                if len(rparts) >= 2:
+                    dml_target = f"{rparts[-2]}.{rparts[-1]}"
+                else:
+                    dml_target = f"dbo.{real}"
     def _split_expr_list(t: str) -> List[str]:
         items = []
         depth = 0
@@ -547,7 +563,14 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
             out_name = m_as.group(1)
         if not out_name:
             m_col = re.search(r'(?i)\b(?:inserted|deleted)\.(\w+)\b', raw)
-            out_name = m_col.group(1) if m_col else f"col_{i+1}"
+            if m_col:
+                out_name = m_col.group(1)
+            else:
+                try:
+                    from .select_lineage import _strip_expr_tail
+                    out_name = _strip_expr_tail(raw) or f"col_{i+1}"
+                except Exception:
+                    out_name = f"col_{i+1}"
         out_names.append(out_name)
         refs: List[ColumnReference] = []
         for m in re.finditer(r'(?i)\b([A-Za-z_][\w]*)\.(\w+)\b', raw):
@@ -654,7 +677,11 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
 
     # Map temp -> base if created earlier in the body
     temp_to_base: Dict[str, str] = {}
+    # Pattern 1: SELECT ... INTO #tmp FROM base
     for m in re.finditer(r'(?is)SELECT\s+.*?\s+INTO\s+(#\w+)\s+FROM\s+([^\s\(,;]+(?:\.[^\s\(,;]+)*)', cleaned):
+        temp_to_base[self._normalize_table_ident(m.group(1))] = self._normalize_table_ident(m.group(2))
+    # Pattern 2: INSERT INTO #tmp (...) SELECT ... FROM base
+    for m in re.finditer(r'(?is)INSERT\s+INTO\s+(#\w+)\b.*?\bSELECT\b.*?\bFROM\s+([^\s\(,;]+(?:\.[^\s\(,;]+)*)', cleaned):
         temp_to_base[self._normalize_table_ident(m.group(1))] = self._normalize_table_ident(m.group(2))
     if source_name and (source_name.startswith('#') or source_name.lower().startswith('tempdb..#')):
         base = temp_to_base.get(source_name) or temp_to_base.get(source_name.split('.')[-1])
@@ -724,12 +751,30 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
         else:
             target_table = f"dbo.{out_target}"
 
-    # Dependencies
+    # Dependencies (expand temp sources to underlying base tables if known)
     if source_name:
         simple_src = source_name.split('.')[-1]
         if simple_src in self.temp_registry:
-            deps_basic = self._extract_basic_dependencies(cleaned)
-            dependencies.update(d for d in deps_basic if not (target_table and d.endswith(f".{target_table.split('.')[-1]}")))
+            # Add the temp itself for visibility
+            dependencies.add(source_name)
+            # Add any previously recorded base sources for this temp
+            try:
+                temp_key = simple_src if simple_src.startswith('#') else f"#{simple_src}"
+                base_sources = self.temp_sources.get(temp_key, set()) or set()
+                for b in base_sources:
+                    # Avoid self-dependency on target
+                    if not (target_table and b.endswith(f".{target_table.split('.')[-1]}")):
+                        dependencies.add(b)
+            except Exception:
+                pass
+            # Fallback: basic dependency extraction (may include additional tables)
+            try:
+                deps_basic = self._extract_basic_dependencies(cleaned)
+                for d in deps_basic:
+                    if not (target_table and d.endswith(f".{target_table.split('.')[-1]}")):
+                        dependencies.add(d)
+            except Exception:
+                pass
         else:
             dependencies.add(source_name)
 
@@ -758,6 +803,33 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
                 mlast = re.search(r'(?i)\b([A-Za-z_][\w]*)\b$', expr)
                 if mlast:
                     refs.append(ColumnReference(namespace=ns_src_default, table_name=nm_src_default, column_name=mlast.group(1)))
+
+            # If source is a temp table and we have recorded per-column lineage, inline its base refs
+            try:
+                if source_name and (source_name.startswith('#') or source_name.lower().startswith('tempdb..#')):
+                    temp_simple = self._extract_temp_name(source_name)
+                    if not temp_simple.startswith('#'):
+                        temp_simple = f"#{temp_simple}"
+                    # Prefer versioned key if exists
+                    ver_key = self._temp_current(temp_simple) or temp_simple
+                    col_map = self.temp_lineage.get(ver_key) or self.temp_lineage.get(temp_simple) or {}
+                    base_refs = col_map.get(t_col)
+                    if base_refs:
+                        # Add base refs, avoiding duplicates
+                        seen_keys = {(r.namespace, r.table_name, r.column_name) for r in refs}
+                        for br in base_refs:
+                            key = (getattr(br, 'namespace', None), getattr(br, 'table_name', None), getattr(br, 'column_name', None))
+                            if key not in seen_keys:
+                                refs.append(br)
+                                seen_keys.add(key)
+                        # Also include the temp itself explicitly if not already
+                        temp_ns = self._canonical_namespace(self.current_database or self.default_database or 'InfoTrackerDW')
+                        temp_canon = self._canonical_temp_name(temp_simple)
+                        temp_key = (temp_ns, temp_canon, t_col)
+                        if temp_key not in seen_keys:
+                            refs.append(ColumnReference(namespace=temp_ns, table_name=temp_canon, column_name=t_col))
+            except Exception:
+                pass
             lineage.append(ColumnLineage(
                 output_column=t_col,
                 input_fields=refs,

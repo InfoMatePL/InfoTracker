@@ -40,6 +40,9 @@ class SqlParser:
         self._temp_version: Dict[str, int] = {}
         self.default_database: Optional[str] = None  # Will be set from config
         self.current_database: Optional[str] = None  # Track current database context
+        # Current object context (db + schema.object) for canonical temp naming – parity with legacy dev_parser
+        self._ctx_db: Optional[str] = None
+        self._ctx_obj: Optional[str] = None
         # cross-file object→DB registry (optional)
         self.registry = registry
         # dbt specifics
@@ -150,6 +153,10 @@ class SqlParser:
     def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
         from .parser_modules import names as _names
         return _names._ns_and_name(self, table_name, obj_type_hint)
+
+    def _canonical_namespace(self, db: str | None) -> str:
+        from .parser_modules import names as _names
+        return _names._canonical_namespace(self, db)
 
     # -- DB inference helpers (delegated)
     def _strip_sql_comments(self, sql: str) -> str:
@@ -310,7 +317,7 @@ class SqlParser:
                         parts = dep_s.split('.') if dep_s else []
                         tbl = parts[-1] if parts else dep_s
                         deps_norm.add(f"{self.default_schema or 'dbo'}.{tbl}")
-                    schema = TableSchema(namespace=f"mssql://localhost/{db_ns}", name=nm, columns=[])
+                    schema = TableSchema(namespace=self._canonical_namespace(db_ns), name=nm, columns=[])
                     self.schema_registry.register(schema)
                     obj = ObjectInfo(name=nm, object_type="view", schema=schema, lineage=[], dependencies=deps_norm)
                     obj.is_fallback = True
@@ -347,7 +354,7 @@ class SqlParser:
                     has_from_tables = any(True for _ in last_select.find_all(exp.Table))
                     obj_type = "view" if has_from_tables else "table"
                     schema = TableSchema(
-                        namespace=f"mssql://localhost/{db}",
+                        namespace=self._canonical_namespace(db),
                         name=nm,
                         columns=output_columns
                     )
@@ -380,7 +387,7 @@ class SqlParser:
                         tbl = parts[-1] if parts else dep_s
                         deps_norm.add(f"{self.default_schema or 'dbo'}.{tbl}")
                     schema = TableSchema(
-                        namespace=f"mssql://localhost/{db_ns}",
+                        namespace=self._canonical_namespace(db_ns),
                         name=nm,
                         columns=[]
                     )
@@ -422,10 +429,20 @@ class SqlParser:
                 except Exception:
                     pass
                 return self._parse_create_table_string(sql_content, object_hint)
-            # If it's a single function or procedure, use string-based approach
+            # If it's a single function, use string-based approach (TVF-specific heuristics)
             if create_function_count == 1 and create_procedure_count == 0:
                 return self._parse_function_string(sql_content, object_hint)
+            # For a single procedure prefer AST parsing to preserve temp lineage; fallback to string only if AST fails
             elif create_procedure_count == 1 and create_function_count == 0:
+                try:
+                    normalized_sql = self._normalize_tsql(sql_content)
+                    preprocessed_sql = self._preprocess_sql(normalized_sql)
+                    stmts = sqlglot.parse(preprocessed_sql, read=self.dialect) or []
+                    st = stmts[0] if stmts else None
+                    if st and isinstance(st, exp.Create) and (getattr(st, "kind", "") or "").upper() == "PROCEDURE":
+                        return self._parse_create_procedure(st, object_hint)
+                except Exception:
+                    pass
                 return self._parse_procedure_string(sql_content, object_hint)
             
             # If it's multiple functions but no procedures, process the first function as primary
@@ -586,7 +603,7 @@ class SqlParser:
                     name=sanitize_name(object_hint or "loose_statements"),
                     object_type="script",
                     schema=TableSchema(
-                        namespace=f"mssql://localhost/{db}",
+                        namespace=self._canonical_namespace(db),
                         name=sanitize_name(object_hint or "loose_statements"),
                         columns=[]
                     ),
@@ -623,7 +640,7 @@ class SqlParser:
                 name=nm,
                 object_type="unknown",
                 schema=TableSchema(
-                    namespace=f"mssql://localhost/{db}",
+                    namespace=self._canonical_namespace(db),
                     name=nm,
                     columns=[]
                 ),

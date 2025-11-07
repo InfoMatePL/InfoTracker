@@ -53,6 +53,7 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
     if getattr(self, 'dbt_mode', False):
         last = parts[-1] if parts else table_name
         db = self.current_database or self.default_database or "InfoTrackerDW"
+        # dbt-mode keeps db name case as provided by project.yml/tests
         ns = f"mssql://localhost/{db}"
         nm = f"{self.default_schema or 'dbo'}.{last}"
         return ns, nm
@@ -71,7 +72,8 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
             db = self.registry.resolve(obj_type_hint or "table", schema_table, fallback=fallback)
         if not db:
             db = self.current_database or self.default_database or "InfoTrackerDW"
-    ns = f"mssql://localhost/{db}"
+    # In classic mode, canonicalize DB casing to avoid duplicate namespaces
+    ns = f"mssql://localhost/{str(db).upper()}"
     if len(parts) >= 2:
         nm = ".".join(parts[-2:])
     elif len(parts) == 1 and parts[0]:
@@ -92,6 +94,21 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
     """Extract table name from expression and qualify with current or default database."""
     database_to_use = self.current_database or self.default_database
     if isinstance(table_expr, exp.Table):
+        # sqlglot drops the leading '#' from temp table identifiers in T-SQL.
+        # Detect temps via context:
+        #  - catalog == tempdb means it's a temp (restore '#')
+        #  - simple name present in temp_registry (as '#name')
+        try:
+            simple = str(table_expr.name)
+            if getattr(table_expr, 'catalog', None):
+                cat = str(table_expr.catalog)
+                if cat and cat.lower() == 'tempdb':
+                    return f"tempdb..#{simple}"
+            # If we have materialized this temp earlier in the procedure, map it to tempdb canonical form
+            if simple and (f"#{simple}" in self.temp_registry):
+                return f"tempdb..#{simple}"
+        except Exception:
+            pass
         catalog = str(table_expr.catalog) if table_expr.catalog else None
         if catalog and catalog.lower() in {"view", "function", "procedure"}:
             catalog = None
@@ -104,6 +121,13 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
             table_name = str(table_expr.name)
             full_name = qualify_identifier(table_name, database_to_use)
     elif isinstance(table_expr, exp.Identifier):
+        # Identifiers may also point at temps without leading '#'. If present in temp_registry, restore it.
+        try:
+            ident = str(table_expr.this)
+            if ident and (f"#{ident}" in self.temp_registry):
+                return f"tempdb..#{ident}"
+        except Exception:
+            pass
         table_name = str(table_expr.this)
         full_name = qualify_identifier(table_name, database_to_use)
     else:
@@ -143,8 +167,28 @@ def _normalize_table_name_for_output(self, table_name: str) -> str:
 
 
 def _get_namespace_for_table(self, table_name: str) -> str:
-    """Return OpenLineage namespace for a given table-like string."""
+    """Return OpenLineage namespace for a given table-like string.
+
+    Canonicalization rules:
+    - temp tables -> tempdb namespace
+    - dbt mode keeps DB case as provided
+    - classic mode uppercases DB to avoid duplicate buckets differing only by case
+    """
     if table_name.startswith('#') or table_name.startswith('tempdb..#'):
         return "mssql://localhost/tempdb"
     db = self.current_database or self.default_database or "InfoTrackerDW"
-    return f"mssql://localhost/{db}"
+    if getattr(self, 'dbt_mode', False):
+        return f"mssql://localhost/{db}"
+    return f"mssql://localhost/{str(db).upper()}"
+
+def _canonical_namespace(self, db: str | None) -> str:
+    """Build a canonical namespace string for the current parser mode.
+
+    In dbt mode we preserve the provided case (tests rely on it). In classic mode
+    we uppercase to collapse duplicates that differ only by case.
+    """
+    if not db:
+        db = "InfoTrackerDW"
+    if getattr(self, 'dbt_mode', False):
+        return f"mssql://localhost/{db}"
+    return f"mssql://localhost/{str(db).upper()}"

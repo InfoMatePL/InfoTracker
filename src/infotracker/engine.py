@@ -177,6 +177,23 @@ class Engine:
 
         ignore_patterns: List[str] = list(getattr(self.config, "ignore", []) or [])
         
+        # Helper: build canonical object key for grouping (schema.table)
+        def _canon_key(name: str) -> str:
+            try:
+                from .openlineage_utils import sanitize_name
+            except Exception:
+                def sanitize_name(x):
+                    return x
+            s = sanitize_name(name or "")
+            parts = [p for p in s.split('.') if p != ""]
+            if len(parts) >= 3:
+                # db.schema.table OR prefix.schema.table -> take last two segments
+                return f"{parts[-2]}.{parts[-1]}"
+            # Drop known prefixes like Table/View/StoredProcedure/Function
+            if len(parts) >= 2 and parts[0].lower() in {"table", "view", "storedprocedure", "procedure", "function"}:
+                return ".".join(parts[1:])
+            return s
+
         # Phase 1: Parse all SQL files and collect objects
         for sql_path in sql_files:
             try:
@@ -189,7 +206,8 @@ class Engine:
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
                 
                 # Store mapping for later processing
-                obj_name = getattr(getattr(obj_info, "schema", None), "name", None) or getattr(obj_info, "name", None)
+                raw_name = getattr(getattr(obj_info, "schema", None), "name", None) or getattr(obj_info, "name", None)
+                obj_name = _canon_key(raw_name) if raw_name else None
                 if obj_name:
                     # Allow multiple files to produce the same logical object (e.g., MERGE in SP outputs a table)
                     sql_file_map.setdefault(obj_name, []).append(sql_path)
@@ -227,34 +245,58 @@ class Engine:
         for obj_name in processing_order:
             if obj_name not in sql_file_map:
                 continue
-            # Process every file that contributes to this object name
+            # Parse every file that contributes to this object name first, then enrich
+            group_infos: List[ObjectInfo] = []
+            group_paths: List[Path] = []
             for sql_path in sql_file_map[obj_name]:
                 try:
                     sql_text = read_text_safely(sql_path, encoding=req.encoding)
-                    # set current file for logging context (relative to sql_root)
                     try:
                         parser._current_file = sql_path.relative_to(sql_root).as_posix()
                     except Exception:
                         parser._current_file = str(sql_path)
-
-                    # Parse with updated schema registry (now has dependencies resolved)
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
-                    resolved_objects.append(obj_info)
+                    group_infos.append(obj_info)
+                    group_paths.append(sql_path)
+                except Exception as e:
+                    warnings += 1
+                    logger.warning("failed to parse %s: %s", sql_path, e)
 
-                    # Register this object's schema for future dependencies
+            # Compute union lineage/deps across contributions to the same object (e.g., SP materializing the table)
+            union_lineage: List[ColumnLineage] = []
+            union_deps: Set[str] = set()
+            try:
+                # prefer contributions that already have lineage (procedures)
+                for gi in group_infos:
+                    if gi.lineage:
+                        union_lineage.extend(gi.lineage)
+                    if gi.dependencies:
+                        union_deps.update(gi.dependencies)
+            except Exception:
+                pass
+
+            # Now emit each file, enriching table-only DDL objects with union lineage if they had none
+            for obj_info, sql_path in zip(group_infos, group_paths):
+                try:
+                    # Register schema before emission
                     if obj_info.schema:
                         parser.schema_registry.register(obj_info.schema)
-                        # Also register in adapter's parser for lineage generation
                         adapter.parser.schema_registry.register(obj_info.schema)
 
-                    # Generate OpenLineage directly from resolved ObjectInfo (including temp tables)
+                    # Enrich: if this is a 'table' with no lineage but a sibling provided lineage
+                    if (getattr(obj_info, 'object_type', None) == 'table' and not obj_info.lineage and union_lineage):
+                        obj_info.lineage = list(union_lineage)
+                        if not obj_info.dependencies:
+                            obj_info.dependencies = set(union_deps)
+
+                    resolved_objects.append(obj_info)
+
                     ol_payload = emit_ol_from_object(
                         obj_info,
                         quality_metrics=True,
                         virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
                     )
 
-                    # Save to file
                     target = out_dir / f"{sql_path.stem}.json"
                     target.write_text(
                         json.dumps(ol_payload, indent=2, ensure_ascii=False, sort_keys=True),

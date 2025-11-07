@@ -8,6 +8,13 @@ from typing import Set
 
 
 def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
+    """Extract dependencies from a Select/Union expression.
+
+    Enhancements:
+    - Recurse into Subquery nodes robustly
+    - Handle wrapped Select under Subquery directly
+    - Include table-valued function calls appearing in FROM/JOIN (heuristic)
+    """
     deps: Set[str] = set()
     if isinstance(stmt, exp.Union):
         if isinstance(stmt.left, (exp.Select, exp.Union)):
@@ -16,6 +23,9 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
             deps.update(_extract_dependencies(self, stmt.right))
         return deps
     if not isinstance(stmt, exp.Select):
+        # Allow a Subquery wrapper to be passed accidentally
+        if isinstance(stmt, exp.Subquery) and isinstance(stmt.this, exp.Select):
+            return _extract_dependencies(self, stmt.this)
         return deps
 
     select_stmt = stmt
@@ -47,10 +57,27 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
         else:
             deps.add(table_name)
 
+    # Recurse into scalar / lateral subqueries
     for subquery in select_stmt.find_all(exp.Subquery):
-        if isinstance(subquery.this, exp.Select):
-            deps.update(_extract_dependencies(self, subquery.this))
+        try:
+            inner = subquery.this
+            if isinstance(inner, exp.Select):
+                deps.update(_extract_dependencies(self, inner))
+        except Exception:
+            continue
 
+    # Heuristic: table-valued function calls may appear as Anonymous/Func in FROM/JOIN context
+    for func in select_stmt.find_all(exp.Anonymous):
+        try:
+            parent = func.parent
+            if isinstance(parent, (exp.From, exp.Join, exp.Lateral)):
+                fname = getattr(func, 'name', None)
+                if fname:
+                    low = fname.lower()
+                    if low not in {"getdate","sysdatetime","row_number","count","sum","min","max","avg","cast","convert"}:
+                        deps.add(self._get_full_table_name(fname))
+        except Exception:
+            continue
     return deps
 
 

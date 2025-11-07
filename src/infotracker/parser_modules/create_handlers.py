@@ -53,7 +53,7 @@ def _parse_create_table(self, statement: exp.Create, object_hint: Optional[str] 
     if not explicit_db:
         inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
         if inferred_db:
-            namespace = f"mssql://localhost/{inferred_db}"
+            namespace = self._canonical_namespace(inferred_db)
     try:
         db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
         if self.registry and db_raw:
@@ -86,7 +86,7 @@ def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None
     if not has_db:
         inferred_db = self._infer_database_for_object(statement=None, sql_text=sql)
         if inferred_db:
-            namespace = f"mssql://localhost/{inferred_db}"
+            namespace = self._canonical_namespace(inferred_db)
 
     cols: List[ColumnSchema] = []
     body_match = re.search(r'(?is)CREATE\s+TABLE\s+[^\(]+\((.*)\)', sql)
@@ -169,7 +169,7 @@ def _parse_create_view(self, statement: exp.Create, object_hint: Optional[str] =
     if not explicit_db:
         inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
         if inferred_db:
-            namespace = f"mssql://localhost/{inferred_db}"
+            namespace = self._canonical_namespace(inferred_db)
     try:
         raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
         db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
@@ -254,7 +254,7 @@ def _parse_create_function(self, statement: exp.Create, object_hint: Optional[st
     if not explicit_db:
         inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
         if inferred_db:
-            namespace = f"mssql://localhost/{inferred_db}"
+            namespace = self._canonical_namespace(inferred_db)
     try:
         raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
         db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
@@ -283,6 +283,9 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     ns, nm = self._ns_and_name(raw_proc, obj_type_hint="procedure")
     namespace = ns
     procedure_name = nm
+    # Establish context for canonical temp naming (db + object)
+    prev_ctx_db = getattr(self, "_ctx_db", None)
+    prev_ctx_obj = getattr(self, "_ctx_obj", None)
     explicit_db = False
     try:
         raw_tbl = getattr(statement.this, 'this', statement.this)
@@ -295,7 +298,7 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     if not explicit_db:
         inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
         if inferred_db:
-            namespace = f"mssql://localhost/{inferred_db}"
+            namespace = self._canonical_namespace(inferred_db)
     try:
         raw_ident = statement.this.sql(dialect=self.dialect) if hasattr(statement, 'this') and hasattr(statement.this, 'sql') else str(statement.this)
         db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
@@ -303,6 +306,13 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
             self.registry.learn_from_create("procedure", f"{sch_raw}.{tbl_raw}", db_raw)
     except Exception:
         pass
+
+    # Update context after potential namespace adjustment
+    try:
+        self._ctx_db = (namespace.rsplit('/', 1)[-1]) if isinstance(namespace, str) else (self.current_database or self.default_database)
+    except Exception:
+        self._ctx_db = (self.current_database or self.default_database)
+    self._ctx_obj = procedure_name
 
     materialized_outputs = self._extract_procedure_outputs(statement)
     if not materialized_outputs:
@@ -314,19 +324,79 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
             ns_tgt, nm_tgt = self._ns_and_name(m_target, obj_type_hint="table")
             schema = TableSchema(namespace=namespace or ns_tgt, name=nm_tgt, columns=m_cols)
             out_obj = ObjectInfo(name=nm_tgt, object_type="table", schema=schema, lineage=m_lineage, dependencies=m_deps)
+            # Restore context before returning
+            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return out_obj
 
     if materialized_outputs:
         last_output = materialized_outputs[-1]
+        # Prefer AST-derived lineage/dependencies; only use string fallbacks to supplement when missing
+        try:
+            ins_lineage, ins_deps = self._extract_insert_select_lineage_string(str(statement), procedure_name)
+        except Exception:
+            ins_lineage, ins_deps = ([], set())
         lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
-        last_output.lineage = lineage
-        last_output.dependencies = dependencies
+
+        # Lineage: keep AST if present; otherwise use string fallbacks
+        if not last_output.lineage:
+            if ins_lineage:
+                last_output.lineage = ins_lineage
+            elif lineage:
+                last_output.lineage = lineage
+
+        # Dependencies: keep AST if present; otherwise use fallbacks
+        ast_deps = set(last_output.dependencies or [])
+        if not ast_deps:
+            if ins_deps:
+                last_output.dependencies = ins_deps
+            elif dependencies:
+                last_output.dependencies = dependencies
+            else:
+                # Absolute fallback: basic string scan
+                try:
+                    basic = self._extract_basic_dependencies(str(statement))
+                    out_key = last_output.name.split('.')[-1]
+                    last_output.dependencies = {d for d in basic if d.split('.')[-1] != out_key}
+                except Exception:
+                    pass
         if last_output.schema:
             last_output.schema.namespace = namespace
             last_output.schema.name = self._normalize_table_name_for_output(last_output.schema.name)
         last_output.name = last_output.schema.name if last_output.schema else last_output.name
         if output_columns:
             last_output.schema = TableSchema(namespace=last_output.schema.namespace, name=last_output.name, columns=output_columns)
+        # After processing all nodes, expand any temp dependencies to their base sources
+        try:
+            deps_expanded = set(last_output.dependencies or [])
+            for d in list(deps_expanded):
+                low = str(d).lower()
+                is_temp = ('#' in d) or ('tempdb' in low)
+                if not is_temp:
+                    # Heuristic: if simple name matches a registered temp, treat as temp
+                    simple = d.split('.')[-1]
+                    if f"#{simple}" in self.temp_sources:
+                        is_temp = True
+                        tkey = f"#{simple}"
+                    else:
+                        tkey = None
+                else:
+                    # Extract temp key: '#name'
+                    if '#' in d:
+                        tname = d.split('#', 1)[1]
+                        tname = tname.split('.')[0]
+                        tkey = f"#{tname}"
+                    else:
+                        simple = d.split('.')[-1]
+                        tkey = f"#{simple}"
+                if is_temp and tkey:
+                    bases = self.temp_sources.get(tkey, set())
+                    if bases:
+                        deps_expanded.update(bases)
+            last_output.dependencies = deps_expanded
+        except Exception:
+            pass
+        # Restore context before returning
+        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return last_output
 
     lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
@@ -334,6 +404,8 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     self.schema_registry.register(schema)
     obj = ObjectInfo(name=procedure_name, object_type="procedure", schema=schema, lineage=lineage, dependencies=dependencies)
     obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
+    # Restore context before returning
+    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
     return obj
 
 
@@ -367,50 +439,91 @@ def _apply_view_header_names(self, create_exp: exp.Create, select_exp: exp.Selec
 
 
 def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
-    """Extract materialized outputs (SELECT INTO, INSERT INTO) from procedure body."""
+    """Extract materialized outputs (SELECT INTO, INSERT INTO) from procedure body.
+
+    Prefer AST-based detection to capture both persistent and temp outputs with
+    correct lineage/dependencies. Falls back to light regex only if AST walk
+    fails, preserving previous behavior.
+    """
     outputs: List[ObjectInfo] = []
+
+    # First try AST walk to find SELECT ... INTO and INSERT ... (SELECT|EXEC)
+    try:
+        for node in statement.walk():
+            # SELECT ... INTO ...
+            if isinstance(node, exp.Select) and self._is_select_into(node):
+                try:
+                    obj = self._parse_select_into(node)
+                    if obj:
+                        outputs.append(obj)
+                except Exception:
+                    pass
+            # INSERT ... (SELECT | EXEC)
+            elif isinstance(node, exp.Insert):
+                try:
+                    if self._is_insert_exec(node):
+                        obj = self._parse_insert_exec(node)
+                    else:
+                        obj = self._parse_insert_select(node)
+                    if obj:
+                        outputs.append(obj)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    if outputs:
+        return outputs
+
+    # Fallback to previous regex-based heuristic (persistent tables only)
     sql_text = str(statement)
 
-    # SELECT ... INTO <table>
-    select_into_pattern = r'(?i)SELECT\s+.*?\s+INTO\s+([^\s,]+)'
-    select_into_matches = re.findall(select_into_pattern, sql_text, re.DOTALL)
-    for table_match in select_into_matches:
-        table_name = table_match.strip()
-        if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-            normalized_name = self._normalize_table_name_for_output(table_name)
-            db = self.current_database or self.default_database or "InfoTrackerDW"
-            outputs.append(ObjectInfo(
-                name=normalized_name,
-                object_type="table",
-                schema=TableSchema(
-                    namespace=f"mssql://localhost/{db}",
-                    name=normalized_name,
-                    columns=[]
-                ),
-                lineage=[],
-                dependencies=set()
-            ))
-
-    # INSERT INTO <table>
-    insert_into_pattern = r'(?i)INSERT\s+INTO\s+([^\s,\(]+)'
-    insert_into_matches = re.findall(insert_into_pattern, sql_text)
-    for table_match in insert_into_matches:
-        table_name = table_match.strip()
-        if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
-            normalized_name = self._normalize_table_name_for_output(table_name)
-            if not any(output.name == normalized_name for output in outputs):
+    try:
+        # Look for SELECT ... INTO patterns
+        select_into_pattern = r'SELECT\s+.*?\s+INTO\s+([^\s,]+)'
+        select_into_matches = re.findall(select_into_pattern, sql_text, flags=re.IGNORECASE | re.DOTALL)
+        for table_match in select_into_matches:
+            table_name = table_match.strip()
+            # Skip temp tables in fallback
+            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                normalized_name = self._normalize_table_name_for_output(table_name)
                 db = self.current_database or self.default_database or "InfoTrackerDW"
                 outputs.append(ObjectInfo(
                     name=normalized_name,
                     object_type="table",
                     schema=TableSchema(
-                        namespace=f"mssql://localhost/{db}",
+                        namespace=self._canonical_namespace(db),
                         name=normalized_name,
                         columns=[]
                     ),
                     lineage=[],
                     dependencies=set()
                 ))
+
+        # Look for INSERT INTO patterns (non-temp tables)
+        insert_into_pattern = r'INSERT\s+INTO\s+([^\s,\(]+)'
+        insert_into_matches = re.findall(insert_into_pattern, sql_text, flags=re.IGNORECASE)
+        for table_match in insert_into_matches:
+            table_name = table_match.strip()
+            # Skip temp tables in fallback
+            if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                normalized_name = self._normalize_table_name_for_output(table_name)
+                # Avoid duplicates from SELECT INTO detection
+                if not any(output.name == normalized_name for output in outputs):
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
+                    outputs.append(ObjectInfo(
+                        name=normalized_name,
+                        object_type="table",
+                        schema=TableSchema(
+                            namespace=self._canonical_namespace(db),
+                            name=normalized_name,
+                            columns=[]
+                        ),
+                        lineage=[],
+                        dependencies=set()
+                    ))
+    except Exception:
+        pass
 
     return outputs
 

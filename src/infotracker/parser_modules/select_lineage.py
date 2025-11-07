@@ -6,6 +6,22 @@ import sqlglot
 from sqlglot import expressions as exp
 
 from ..models import ColumnReference, ColumnSchema, ColumnLineage, TransformationType
+import re
+
+# Minimal tail-strip regex similar to legacy dev_parser for stable derived column names
+_FUNC_TAIL_RE = re.compile(r"\b(?:COALESCE|ISNULL|CAST|CONVERT|TRY_CAST|HASHBYTES|IIF)\s*\(", re.I)
+
+def _strip_expr_tail(name: str) -> str:
+    if not name:
+        return ""
+    s = re.sub(r"/\*.*?\*/", "", str(name), flags=re.S)
+    s = re.sub(r"--.*?$", "", s, flags=re.M)
+    s = re.sub(r"\s+", " ", s).strip()
+    m = _FUNC_TAIL_RE.search(s)
+    if m:
+        s = s[:m.start()].strip()
+    s = re.sub(r"[^\w#]+", "_", s).strip("_")
+    return s
 
 
 def _build_alias_maps(self, select_exp: exp.Select):
@@ -85,7 +101,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
         if temp_seg:
             # Include the temp itself as an input (canonical name)
             temp_canon = self._canonical_temp_name(temp_seg)
-            ns_temp = f"mssql://localhost/{(self._ctx_db or db or 'InfoTrackerDW').upper()}"
+            ns_temp = self._canonical_namespace(getattr(self, '_ctx_db', None) or db or 'InfoTrackerDW')
             out_list.append(ColumnReference(namespace=ns_temp, table_name=temp_canon, column_name=col_exp.name))
             # Inline base lineage if we have it
             ver = self._temp_current(temp_seg)
@@ -99,7 +115,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     except Exception:
         pass
     out_list.append(ColumnReference(
-        namespace=f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else "mssql://localhost",
+        namespace=self._canonical_namespace(db) if db else "mssql://localhost",
         table_name=f"{sch}.{tbl}",
         column_name=col_exp.name
     ))
@@ -120,7 +136,7 @@ def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derive
 
 
 def _get_schema(self, db: str, sch: str, tbl: str):
-    ns = f"mssql://localhost/{(db or 'InfoTrackerDW').upper()}" if db else None
+    ns = self._canonical_namespace(db) if db else None
     key = f"{sch}.{tbl}"
     if hasattr(self.schema_registry, "get"):
         return self.schema_registry.get(ns, key)
@@ -326,7 +342,7 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             input_refs = self._extract_column_references(select_expr, select_stmt)
             if not input_refs:
                 db = self.current_database or self.default_database or "InfoTrackerDW"
-                input_refs = [ColumnReference(namespace=f"mssql://localhost/{db}", table_name="LITERAL", column_name=str(select_expr))]
+                input_refs = [ColumnReference(namespace=self._canonical_namespace(db), table_name="LITERAL", column_name=str(select_expr))]
             lineage.append(ColumnLineage(output_column=col_name, input_fields=input_refs, transformation_type=TransformationType.EXPRESSION, transformation_description=f"SELECT {str(select_expr)}"))
 
     return lineage, output_columns
@@ -398,7 +414,8 @@ def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple
             elif isinstance(proj, exp.Column):
                 out_name = proj.name
             else:
-                out_name = "calc_expr"
+                # Attempt to derive a stable name from expression tail if no alias provided
+                out_name = _strip_expr_tail(str(proj)) or "calc_expr"
             inner = proj
 
         inputs = _collect_inputs_for_expr(self, inner, alias_map, derived_cols)
