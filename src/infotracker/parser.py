@@ -473,12 +473,19 @@ class SqlParser:
             if not statements:
                 # If SQLGlot parsing fails completely, try to extract dependencies with string parsing
                 dependencies = self._extract_basic_dependencies(preprocessed_sql)
+                # Provide a valid TableSchema instead of a raw list to avoid downstream crashes
+                db = self.current_database or self.default_database or "InfoTrackerDW"
+                nm = (object_hint or self._get_fallback_name(sql_content))
                 return ObjectInfo(
-                    name=object_hint or self._get_fallback_name(sql_content),
+                    name=nm,
                     object_type="script",
-                    schema=[],
+                    schema=TableSchema(
+                        namespace=self._canonical_namespace(db),
+                        name=nm,
+                        columns=[],
+                    ),
                     dependencies=dependencies,
-                    lineage=[]
+                    lineage=[],
                 )
             
             # Process the entire script - aggregate across all statements

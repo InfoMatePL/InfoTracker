@@ -40,9 +40,9 @@ def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = 
                 self.registry.learn_from_create("function", f"{sch_raw}.{tbl_raw}", db_raw)
         except Exception:
             pass
-    # restore ctx
-    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
-    return obj
+        # restore ctx
+        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+        return obj
 
     # Table-valued function: compute lineage
     lineage, output_columns, dependencies = self._extract_tvf_lineage_string(sql_content, function_name)
