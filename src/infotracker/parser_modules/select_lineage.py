@@ -114,11 +114,34 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 return
     except Exception:
         pass
-    out_list.append(ColumnReference(
-        namespace=self._canonical_namespace(db) if db else "mssql://localhost",
-        table_name=f"{sch}.{tbl}",
-        column_name=col_exp.name
-    ))
+    # Resolve namespace for non-temp inputs:
+    # - prefer explicit db from the FQN,
+    # - otherwise consult the global object→DB registry,
+    # - finally fall back to current/default DB (or InfoTrackerDW).
+    effective_db = db
+    if not effective_db:
+        # Try registry (learned from CREATE TABLE/VIEW/PROC)
+        try:
+            if getattr(self, "registry", None) and sch and tbl:
+                schema_table = f"{sch}.{tbl}"
+                fallback_db = getattr(self, "current_database", None) or getattr(self, "default_database", None) or "InfoTrackerDW"
+                resolved = self.registry.resolve("table", schema_table, fallback=fallback_db)
+                if resolved:
+                    effective_db = resolved
+        except Exception:
+            effective_db = None
+    if not effective_db:
+        try:
+            effective_db = self.current_database or self.default_database or "InfoTrackerDW"
+        except Exception:
+            effective_db = "InfoTrackerDW"
+    out_list.append(
+        ColumnReference(
+            namespace=self._canonical_namespace(effective_db),
+            table_name=f"{sch}.{tbl}",
+            column_name=col_exp.name,
+        )
+    )
 
 
 def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derived_cols: dict):
@@ -652,4 +675,3 @@ def _process_ctes(self, select_stmt: exp.Select) -> exp.Select:
                             cte_columns.append(f"col_{len(cte_columns) + 1}")
                 self.cte_registry[cte_name] = cte_columns
     return select_stmt
-
