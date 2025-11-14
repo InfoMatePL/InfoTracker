@@ -70,6 +70,24 @@ def _choose_db(self, counter) -> Optional[str]:
 
 def _infer_database_for_object(self, statement=None, sql_text: Optional[str] = None) -> Optional[str]:
     from collections import Counter
+    # 1) If SQL text contains an explicit USE statement, honor it as the
+    # primary database context for the created object. This matches T-SQL
+    # semantics and avoids mis-assigning objects to the DB of their sources
+    # (e.g. views in INFO_SALES sourcing from EDW_CORE.*).
+    db_from_use: Optional[str] = None
+    try:
+        if sql_text and hasattr(self, "_extract_database_from_use_statement"):
+            db_from_use = self._extract_database_from_use_statement(sql_text)  # type: ignore[attr-defined]
+    except Exception:
+        db_from_use = None
+    if db_from_use:
+        try:
+            self.current_database = db_from_use
+        except Exception:
+            pass
+        return db_from_use
+
+    # 2) Otherwise, fall back to heuristic inference from AST and SQL text.
     c = Counter()
     try:
         if statement is not None:
