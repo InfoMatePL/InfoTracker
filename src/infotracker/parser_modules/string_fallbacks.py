@@ -46,25 +46,52 @@ def _find_last_select_string_fallback(self, sql_content: str) -> str | None:
 
 
 def _extract_insert_select_lineage_string(self, sql_content: str, object_name: str) -> tuple[List[ColumnLineage], Set[str]]:
+    """Extract column lineage from INSERT INTO ... SELECT statements.
+    
+    Searches for ALL INSERT INTO patterns and matches against object_name to handle
+    procedures with multiple INSERT statements (temp tables + persistent tables).
+    """
     lineage: List[ColumnLineage] = []
     dependencies: Set[str] = set()
     s = self._strip_sql_comments(self._normalize_tsql(sql_content))
-    m = re.search(r'(?is)INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?);', s)
-    if not m:
-        m = re.search(r'(?is)INSERT\s+INTO\s+[^;]+?\bSELECT\b(.*?)(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b|$)', s)
-    if not m:
-        return lineage, dependencies
-    select_sql = "SELECT " + m.group(1)
-    try:
-        parsed = sqlglot.parse(select_sql, read=self.dialect)
-        if parsed and isinstance(parsed[0], exp.Select):
-            lineage, _out_cols = self._extract_column_lineage(parsed[0], object_name)
-            deps = self._extract_dependencies(parsed[0])
-            dependencies.update(deps)
-        else:
+    
+    # Normalize object_name for comparison (strip schema/db prefix if present)
+    target_simple = object_name.split('.')[-1].lower()
+    
+    # Find ALL INSERT INTO ... SELECT patterns (using finditer instead of search)
+    pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
+    
+    for match in re.finditer(pattern_with_terminator, s):
+        table_ref = match.group(1).strip()
+        select_part = match.group(2)
+        
+        # Normalize table reference for comparison
+        table_simple = table_ref.split('.')[-1].lower().strip('[]')
+        
+        # Skip temp tables (unless target is also temp)
+        if table_simple.startswith('#') and not target_simple.startswith('#'):
+            continue
+        
+        # Check if this INSERT matches our target table
+        if table_simple != target_simple:
+            continue
+        
+        # Found matching INSERT - extract lineage from SELECT
+        select_sql = "SELECT " + select_part
+        try:
+            parsed = sqlglot.parse(select_sql, read=self.dialect)
+            if parsed and isinstance(parsed[0], exp.Select):
+                lineage, _out_cols = self._extract_column_lineage(parsed[0], object_name)
+                deps = self._extract_dependencies(parsed[0])
+                dependencies.update(deps)
+                break  # Found target, stop searching
+            else:
+                dependencies.update(self._extract_basic_dependencies(select_sql))
+                break
+        except Exception:
             dependencies.update(self._extract_basic_dependencies(select_sql))
-    except Exception:
-        dependencies.update(self._extract_basic_dependencies(select_sql))
+            break
+    
     return lineage, dependencies
 
 

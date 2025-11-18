@@ -38,9 +38,8 @@ def _parse_create_table(self, statement: exp.Create, object_hint: Optional[str] 
     except Exception:
         raw_ident = str(schema_expr.this)
     raw_ident = self._normalize_table_ident(raw_ident)
-    ns, nm = self._ns_and_name(raw_ident, obj_type_hint="table")
-    namespace = ns
-    table_name = nm
+    
+    # Check if raw_ident has explicit database qualifier (3 parts)
     explicit_db = False
     try:
         raw_tbl = schema_expr.this
@@ -50,10 +49,32 @@ def _parse_create_table(self, statement: exp.Create, object_hint: Optional[str] 
                 explicit_db = True
     except Exception:
         pass
-    if not explicit_db:
+    
+    # If current_database is set from USE statement, use it directly
+    # This ensures USE [edw_core] is respected before falling back to inference
+    db_to_use = None
+    if self.current_database and not explicit_db:
+        db_to_use = self.current_database
+    elif explicit_db:
+        # If explicit DB in identifier, extract it
+        parts = raw_ident.split('.')
+        if len(parts) >= 3:
+            db_to_use = parts[0]
+    
+    # If still no database, try inference as fallback
+    if not db_to_use:
         inferred_db = self._infer_database_for_object(statement=statement, sql_text=getattr(self, "_current_raw_sql", None))
         if inferred_db:
-            namespace = self._canonical_namespace(inferred_db)
+            db_to_use = inferred_db
+        else:
+            db_to_use = self.default_database or "InfoTrackerDW"
+    
+    # Build namespace first, then call _ns_and_name with proper context
+    namespace = self._canonical_namespace(db_to_use)
+    
+    # Now get the table name (schema.table) without DB prefix
+    ns, nm = self._ns_and_name(raw_ident, obj_type_hint="table")
+    table_name = nm
     try:
         db_raw, sch_raw, tbl_raw = self._split_fqn(raw_ident)
         if self.registry and db_raw:
@@ -79,14 +100,34 @@ def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None
     m = re.search(r'(?is)CREATE\s+TABLE\s+([^\s(]+)', sql)
     raw_ident = self._normalize_table_ident(m.group(1)) if m else None
     name_for_ns = raw_ident or (object_hint or "dbo.unknown_table")
-    ns, nm = self._ns_and_name(name_for_ns, obj_type_hint="table")
-    namespace = ns
-    table_name = nm
+    
+    # Check if raw_ident has explicit database qualifier (3 parts)
     has_db = bool(raw_ident and raw_ident.count('.') >= 2)
-    if not has_db:
+    
+    # Prioritize current_database from USE statement
+    db_to_use = None
+    if self.current_database and not has_db:
+        db_to_use = self.current_database
+    elif has_db and raw_ident:
+        # Extract explicit DB from identifier
+        parts = raw_ident.split('.')
+        if len(parts) >= 3:
+            db_to_use = parts[0]
+    
+    # If still no database, try inference as fallback
+    if not db_to_use:
         inferred_db = self._infer_database_for_object(statement=None, sql_text=sql)
         if inferred_db:
-            namespace = self._canonical_namespace(inferred_db)
+            db_to_use = inferred_db
+        else:
+            db_to_use = self.default_database or "InfoTrackerDW"
+    
+    # Build namespace with determined database
+    namespace = self._canonical_namespace(db_to_use)
+    
+    # Get table name (schema.table) without DB prefix
+    ns, nm = self._ns_and_name(name_for_ns, obj_type_hint="table")
+    table_name = nm
 
     cols: List[ColumnSchema] = []
     body_match = re.search(r'(?is)CREATE\s+TABLE\s+[^\(]+\((.*)\)', sql)
@@ -332,7 +373,9 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
         last_output = materialized_outputs[-1]
         # Prefer AST-derived lineage/dependencies; only use string fallbacks to supplement when missing
         try:
-            ins_lineage, ins_deps = self._extract_insert_select_lineage_string(str(statement), procedure_name)
+            # Pass the OUTPUT table name (not procedure name) for matching INSERT INTO target
+            target_name = last_output.schema.name if last_output.schema else last_output.name
+            ins_lineage, ins_deps = self._extract_insert_select_lineage_string(str(statement), target_name)
         except Exception:
             ins_lineage, ins_deps = ([], set())
         lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)

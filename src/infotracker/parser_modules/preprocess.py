@@ -47,6 +47,31 @@ def _rewrite_case_with_commas_to_iif(sql: str) -> str:
     return out
 
 
+def _remove_try_catch_blocks(sql: str) -> str:
+    """Remove T-SQL BEGIN TRY ... END TRY / BEGIN CATCH ... END CATCH blocks.
+    
+    Sqlglot doesn't support T-SQL error handling syntax, so we strip these
+    constructs while preserving the SQL statements inside TRY blocks.
+    """
+    if not sql:
+        return sql
+    
+    # Remove BEGIN TRY and END TRY (keep content inside)
+    sql = re.sub(r'(?i)\bBEGIN\s+TRY\b', '', sql)
+    sql = re.sub(r'(?i)\bEND\s+TRY\b', '', sql)
+    
+    # Remove entire CATCH blocks (including content)
+    # Match BEGIN CATCH ... END CATCH
+    sql = re.sub(
+        r'(?i)\bBEGIN\s+CATCH\b.*?\bEND\s+CATCH\b',
+        '',
+        sql,
+        flags=re.DOTALL
+    )
+    
+    return sql
+
+
 def _strip_udf_options_between_returns_and_as(sql: str) -> str:
     """Strip UDF options between RETURNS ... and AS.
 
@@ -161,6 +186,9 @@ def _preprocess_sql(self, sql: str) -> str:
     processed_lines = []
     for line in lines:
         stripped_line = line.strip()
+        # Skip lines that start with # (non-standard comment marker)
+        if stripped_line.startswith('#'):
+            continue
         if re.match(r'(?i)^(DECLARE|SET|PRINT)\b', stripped_line):
             continue
         if (re.match(r"(?i)^IF\s+OBJECT_ID\('tempdb\.\.#", stripped_line) or
@@ -175,6 +203,13 @@ def _preprocess_sql(self, sql: str) -> str:
 
     processed_sql = '\n'.join(processed_lines)
     processed_sql = re.sub(r'(INSERT\s+INTO\s+#\w+)\s*\n\s*(EXEC\b)', r'\1 \2', processed_sql, flags=re.IGNORECASE)
+    
+    # Remove TRY/CATCH blocks BEFORE cutting to first statement
+    try:
+        processed_sql = _remove_try_catch_blocks(processed_sql)
+    except Exception:
+        pass
+    
     processed_sql = _cut_to_first_statement(self, processed_sql)
     try:
         processed_sql = _strip_udf_options_between_returns_and_as(processed_sql)

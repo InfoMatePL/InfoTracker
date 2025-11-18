@@ -47,7 +47,7 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
         return "mssql://localhost/tempdb", table_name
     raw_parts = (table_name or "").split('.')
     parts = [p for p in raw_parts if p != ""]
-    pseudo = {"view", "function", "procedure"}
+    pseudo = {"view", "function", "procedure", "table", "storedprocedure"}
     if len(parts) >= 3 and parts[0].lower() in pseudo:
         parts = parts[1:]
     if getattr(self, 'dbt_mode', False):
@@ -57,29 +57,36 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
         ns = f"mssql://localhost/{db}"
         nm = f"{self.default_schema or 'dbo'}.{last}"
         return ns, nm
+    
+    # Classic mode: determine database and schema based on qualification level
     db: Optional[str]
+    schema: Optional[str]
+    name: Optional[str]
+    
     if len(parts) >= 3:
+        # baza.schemat.nazwa - use all three parts explicitly
         db = parts[0]
+        schema = parts[1]
+        name = parts[2]
+    elif len(parts) == 2:
+        # schemat.nazwa - database is same as currently parsed object (from USE statement)
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        schema = parts[0]
+        name = parts[1]
+    elif len(parts) == 1 and parts[0]:
+        # nazwa - database and schema are same as currently parsed object
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        schema = getattr(self, '_ctx_schema', None) or self.default_schema or "dbo"
+        name = parts[0]
     else:
-        db = None
-        schema_table = None
-        if len(parts) >= 2:
-            schema_table = ".".join(parts[-2:])
-        elif len(parts) == 1 and parts[0]:
-            schema_table = f"dbo.{parts[0]}"
-        if getattr(self, 'registry', None) and schema_table:
-            fallback = self.current_database or self.default_database or "InfoTrackerDW"
-            db = self.registry.resolve(obj_type_hint or "table", schema_table, fallback=fallback)
-        if not db:
-            db = self.current_database or self.default_database or "InfoTrackerDW"
+        # fallback
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        schema = "dbo"
+        name = table_name
+    
     # In classic mode, canonicalize DB casing to avoid duplicate namespaces
     ns = f"mssql://localhost/{str(db).upper()}"
-    if len(parts) >= 2:
-        nm = ".".join(parts[-2:])
-    elif len(parts) == 1 and parts[0]:
-        nm = f"dbo.{parts[0]}"
-    else:
-        nm = table_name
+    nm = f"{schema}.{name}" if schema and name else table_name
     return ns, nm
 
 
@@ -93,6 +100,12 @@ def _qualify_table(self, tbl: exp.Table) -> str:
 def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None) -> str:
     """Extract table name from expression and qualify with current or default database."""
     database_to_use = self.current_database or self.default_database
+    explicit_db = False
+
+    # If table_expr is Schema (INSERT INTO table (cols)), extract the actual table from .this
+    if isinstance(table_expr, exp.Schema):
+        table_expr = table_expr.this
+
     if isinstance(table_expr, exp.Table):
         # sqlglot drops the leading '#' from temp table identifiers in T-SQL.
         # Detect temps via context:
@@ -113,7 +126,9 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
         if catalog and catalog.lower() in {"view", "function", "procedure"}:
             catalog = None
         if catalog and table_expr.db:
+            # Explicit DB qualifier in SQL – trust it and do not override via registry.
             full_name = f"{catalog}.{table_expr.db}.{table_expr.name}"
+            explicit_db = True
         elif table_expr.db:
             table_name = f"{table_expr.db}.{table_expr.name}"
             full_name = qualify_identifier(table_name, database_to_use)
@@ -132,9 +147,31 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
         full_name = qualify_identifier(table_name, database_to_use)
     else:
         full_name = hint or "unknown"
-    if full_name and full_name.startswith('#'):
+
+    # Temp tables: keep original canonicalization logic, skip registry-based DB resolution
+    if full_name and (full_name.startswith('#') or full_name.lower().startswith('tempdb..#')):
         temp_name = full_name.lstrip('#')
         return f"tempdb..#{temp_name}"
+
+    # Registry-aware DB resolution:
+    # If the DB came from a weak default (InfoTrackerDW/InfoTrackerDB),
+    # prefer a learned mapping from ObjectDbRegistry when available.
+    try:
+        if not explicit_db and full_name and getattr(self, "registry", None):
+            parts = [p for p in (full_name or "").split(".") if p != ""]
+            if len(parts) >= 2:
+                schema_table = ".".join(parts[-2:])
+                # Current DB context inferred from identifier or parser defaults
+                current_db = parts[0] if len(parts) >= 3 else database_to_use
+                weak_defaults = {"infotrackerdb", "infotrackerdw"}
+                if current_db and str(current_db).lower() in weak_defaults:
+                    resolved_db = self.registry.resolve("table", schema_table, fallback=current_db)
+                    if resolved_db and str(resolved_db).upper() != str(current_db).upper():
+                        full_name = ".".join([str(resolved_db).upper(), parts[-2], parts[-1]])
+    except Exception:
+        # On any registry or resolution error, fall back to original full_name
+        pass
+
     return sanitize_name(full_name)
 
 
@@ -148,6 +185,27 @@ def _get_full_table_name(self, table_name: str) -> str:
     db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
     parts = (table_name or "").split('.')
     parts = [p for p in parts if p != ""]
+
+    # If no DB segment is present and we're on a weak default DB, consult the registry.
+    # This allows a learned EDW/STG mapping to override generic InfoTrackerDW.
+    try:
+        if len(parts) <= 2 and getattr(self, "registry", None):
+            weak_defaults = {"infotrackerdb", "infotrackerdw"}
+            if db_to_use and str(db_to_use).lower() in weak_defaults:
+                if len(parts) == 2:
+                    schema_table = ".".join(parts)
+                elif len(parts) == 1 and parts[0]:
+                    schema_table = f"dbo.{parts[0]}"
+                else:
+                    schema_table = None
+                if schema_table:
+                    resolved_db = self.registry.resolve("table", schema_table, fallback=db_to_use)
+                    if resolved_db:
+                        db_to_use = resolved_db
+    except Exception:
+        # On any registry or resolution error, keep original db_to_use
+        pass
+
     if len(parts) == 1:
         return f"{db_to_use}.dbo.{parts[0]}"
     if len(parts) == 2:

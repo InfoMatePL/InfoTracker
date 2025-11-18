@@ -443,6 +443,13 @@ class SqlParser:
                         return self._parse_create_procedure(st, object_hint)
                 except Exception:
                     pass
+                # AST failed - try extracting procedure body and parsing statements directly
+                try:
+                    body_sql = self._extract_procedure_body(sql_content)
+                    if body_sql:
+                        return self._parse_procedure_body_statements(body_sql, object_hint, sql_content)
+                except Exception:
+                    pass
                 return self._parse_procedure_string(sql_content, object_hint)
             
             # If it's multiple functions but no procedures, process the first function as primary
@@ -848,6 +855,16 @@ class SqlParser:
         """Extract procedure name from CREATE PROCEDURE statement (delegated)."""
         from .parser_modules import procedures as _proc
         return _proc._extract_procedure_name(self, sql_content)
+    
+    def _extract_procedure_body(self, sql_content: str) -> Optional[str]:
+        """Extract the body of a CREATE PROCEDURE (everything after AS keyword)."""
+        from .parser_modules import procedures as _proc
+        return _proc._extract_procedure_body(self, sql_content)
+    
+    def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[str] = None, full_sql: str = "") -> ObjectInfo:
+        """Parse procedure body statements directly (fallback when CREATE PROCEDURE fails in sqlglot)."""
+        from .parser_modules import procedures as _proc
+        return _proc._parse_procedure_body_statements(self, body_sql, object_hint, full_sql)
 
     def _is_table_valued_function_string(self, sql_content: str) -> bool:
         """Check if this is a table-valued function (delegated)."""

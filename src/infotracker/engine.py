@@ -282,6 +282,21 @@ class Engine:
                     if obj_info.schema:
                         parser.schema_registry.register(obj_info.schema)
                         adapter.parser.schema_registry.register(obj_info.schema)
+                        
+                        # Update registry so subsequent files can resolve this object's database
+                        try:
+                            ns = obj_info.schema.namespace
+                            nm = obj_info.schema.name
+                            if ns and nm and '://' in ns:
+                                db_name = ns.rsplit('/', 1)[-1]
+                                # Extract schema.table from nm (may already be qualified)
+                                if '.' in nm:
+                                    schema_table = nm
+                                else:
+                                    schema_table = f"dbo.{nm}"
+                                registry.learn_from_create(obj_info.object_type or "table", schema_table, db_name)
+                        except Exception:
+                            pass
 
                     # Enrich: if this is a 'table' with no lineage but a sibling provided lineage
                     if (getattr(obj_info, 'object_type', None) == 'table' and not obj_info.lineage and union_lineage):

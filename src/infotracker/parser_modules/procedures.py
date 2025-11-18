@@ -344,3 +344,107 @@ def _extract_procedure_name(self, sql_content: str) -> Optional[str]:
     """Extract procedure name from CREATE PROCEDURE statement (string)."""
     match = re.search(r'CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+([^\s\(]+)', sql_content, re.IGNORECASE)
     return match.group(1).strip() if match else None
+
+
+def _extract_procedure_body(self, sql_content: str) -> Optional[str]:
+    """Extract the body of a CREATE PROCEDURE (everything after AS keyword)."""
+    import re
+    # Match CREATE PROCEDURE ... AS and extract everything after
+    match = re.search(
+        r'(?is)CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+\S+.*?\bAS\b\s*(.*)',
+        sql_content,
+        re.DOTALL
+    )
+    if match:
+        return match.group(1)
+    return None
+
+
+def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[str] = None, full_sql: str = "") -> ObjectInfo:
+    """
+    Parse procedure body statements directly (fallback when CREATE PROCEDURE fails in sqlglot).
+    Extracts INSERT INTO ... SELECT statements and builds lineage.
+    """
+    from ..openlineage_utils import sanitize_name
+    
+    procedure_name = self._extract_procedure_name(full_sql) or object_hint or "unknown_procedure"
+    
+    # Infer DB and namespace
+    inferred_db = self._infer_database_for_object(statement=None, sql_text=full_sql) or self.current_database or self.default_database
+    namespace = self._canonical_namespace(inferred_db)
+    
+    # Set context
+    prev_ctx_db, prev_ctx_obj = getattr(self, "_ctx_db", None), getattr(self, "_ctx_obj", None)
+    try:
+        self._ctx_db = (namespace.rsplit('/', 1)[-1]) if isinstance(namespace, str) else (self.current_database or self.default_database)
+    except Exception:
+        self._ctx_db = (self.current_database or self.default_database)
+    self._ctx_obj = procedure_name
+    
+    # Preprocess body (remove DECLARE, SET, etc.)
+    preprocessed_body = self._preprocess_sql(body_sql)
+    
+    # Parse statements in body - use one_statement mode to be more forgiving
+    try:
+        statements = []
+        # Try to parse each statement separately to avoid full failure on syntax errors
+        import sqlglot
+        for stmt_sql in preprocessed_body.split(';'):
+            stmt_sql = stmt_sql.strip()
+            if not stmt_sql or stmt_sql.upper() in ('GO', 'END'):
+                continue
+            try:
+                parsed = sqlglot.parse_one(stmt_sql, read=self.dialect)
+                if parsed:
+                    statements.append(parsed)
+            except Exception:
+                # Skip unparseable statements
+                continue
+    except Exception:
+        statements = []
+    
+    all_outputs = []
+    all_inputs: Set[str] = set()
+    last_persistent_output = None
+    
+    for statement in statements:
+        if isinstance(statement, exp.Insert):
+            if self._is_insert_exec(statement):
+                obj = self._parse_insert_exec(statement, object_hint)
+            else:
+                obj = self._parse_insert_select(statement, object_hint)
+            
+            if obj:
+                all_outputs.append(obj)
+                if not obj.name.startswith("#") and "tempdb" not in obj.name.lower():
+                    last_persistent_output = obj
+                all_inputs.update(obj.dependencies or [])
+    
+    # If we found persistent outputs, return the last one (typically the main table updated by procedure)
+    if last_persistent_output:
+        # Restore context
+        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+        return last_persistent_output
+    
+    # Fallback: return basic procedure info with dependencies from all statements
+    dependencies = all_inputs
+    
+    schema = TableSchema(
+        namespace=namespace,
+        name=sanitize_name(procedure_name),
+        columns=[]
+    )
+    self.schema_registry.register(schema)
+    
+    obj = ObjectInfo(
+        name=sanitize_name(procedure_name),
+        object_type="procedure",
+        schema=schema,
+        lineage=[],
+        dependencies=dependencies
+    )
+    obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
+    
+    # Restore context
+    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+    return obj
