@@ -38,12 +38,13 @@ def _build_alias_maps(self, select_exp: exp.Select):
             else:
                 alias = str(a).lower()
         fqn = self._qualify_table(t)
-        # If this table corresponds to a known temp by simple name, canonicalize to the temp
+        # If this table corresponds to a known temp by simple name, use simple format
         try:
             parts_tmp = (fqn or '').split('.')
             simple = parts_tmp[-1] if parts_tmp else None
             if simple and not str(simple).startswith('#') and (f"#{simple}" in self.temp_registry):
-                fqn = self._canonical_temp_name(f"#{simple}")
+                # Use simple format dbo.#temp instead of canonical with procedure context
+                fqn = f"dbo.#{simple}"
         except Exception:
             pass
         if alias:
@@ -99,10 +100,10 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 temp_seg = seg
                 break
         if temp_seg:
-            # Include the temp itself as an input (canonical name)
-            temp_canon = self._canonical_temp_name(temp_seg)
+            # Use simple format for temp tables: dbo.#temp (not canonical with procedure context)
             ns_temp = self._canonical_namespace(getattr(self, '_ctx_db', None) or db or 'InfoTrackerDW')
-            out_list.append(ColumnReference(namespace=ns_temp, table_name=temp_canon, column_name=col_exp.name))
+            simple_temp_name = f"dbo.{temp_seg}"
+            out_list.append(ColumnReference(namespace=ns_temp, table_name=simple_temp_name, column_name=col_exp.name))
             # Inline base lineage if we have it
             ver = self._temp_current(temp_seg)
             colname = col_exp.name

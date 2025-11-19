@@ -43,8 +43,26 @@ def _split_fqn(self, fqn: str) -> Tuple[Optional[str], Optional[str], Optional[s
 
 
 def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
-    if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name):
-        return "mssql://localhost/tempdb", table_name
+    if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
+        # Extract clean temp table name (remove context like DB.procedure.#temp or DB.[procedure].#temp)
+        # Use current database context, not tempdb
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        
+        # Find the temp table name
+        if '.' in table_name:
+            parts = table_name.split('.')
+            for part in reversed(parts):
+                # Remove square brackets if present
+                clean_part = part.strip('[]')
+                if '#' in clean_part:
+                    clean_temp = clean_part if clean_part.startswith('#') else f"#{clean_part.lstrip('#')}"
+                    return f"mssql://localhost/{db}", f"dbo.{clean_temp}"
+        
+        # Simple case: #temp
+        clean_temp = table_name.strip('[]')
+        if not clean_temp.startswith('#'):
+            clean_temp = f"#{clean_temp.lstrip('#')}"
+        return f"mssql://localhost/{db}", f"dbo.{clean_temp}"
     raw_parts = (table_name or "").split('.')
     parts = [p for p in raw_parts if p != ""]
     pseudo = {"view", "function", "procedure", "table", "storedprocedure"}

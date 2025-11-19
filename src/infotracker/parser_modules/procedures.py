@@ -384,12 +384,47 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     # Preprocess body (remove DECLARE, SET, etc.)
     preprocessed_body = self._preprocess_sql(body_sql)
     
+    # Register temp tables found in procedure body for proper namespace resolution
+    # sqlglot drops '#' from temp table names, so we need to register them beforehand
+    import re
+    temp_pattern = r'#(\w+)'
+    for match in re.finditer(temp_pattern, preprocessed_body):
+        temp_name = f"#{match.group(1)}"
+        if temp_name not in self.temp_registry:
+            # Register with placeholder schema (will be filled during actual INSERT parsing)
+            self.temp_registry[temp_name] = []
+    
     # Parse statements in body - use one_statement mode to be more forgiving
     try:
         statements = []
-        # Try to parse each statement separately to avoid full failure on syntax errors
+        # Split by semicolon but also try to extract major DML statements
         import sqlglot
-        for stmt_sql in preprocessed_body.split(';'):
+        import re
+        
+        # First try splitting by semicolon
+        chunks = preprocessed_body.split(';')
+        
+        # Additionally, split chunks that contain multiple statements based on keywords
+        # Look for INSERT/UPDATE/DELETE/MERGE at line start
+        expanded_chunks = []
+        for chunk in chunks:
+            # Find all DML statement starts
+            dml_pattern = r'^\s*(INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|MERGE\s+)'
+            matches = list(re.finditer(dml_pattern, chunk, re.MULTILINE | re.IGNORECASE))
+            
+            if len(matches) > 1:
+                # Multiple DML statements in one chunk - split them
+                prev_pos = 0
+                for match in matches:
+                    if match.start() > prev_pos:
+                        expanded_chunks.append(chunk[prev_pos:match.start()])
+                    prev_pos = match.start()
+                expanded_chunks.append(chunk[prev_pos:])
+            else:
+                expanded_chunks.append(chunk)
+        
+        # Now parse each chunk
+        for stmt_sql in expanded_chunks:
             stmt_sql = stmt_sql.strip()
             if not stmt_sql or stmt_sql.upper() in ('GO', 'END'):
                 continue
@@ -406,6 +441,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     all_outputs = []
     all_inputs: Set[str] = set()
     last_persistent_output = None
+    best_match_output = None
     
     for statement in statements:
         if isinstance(statement, exp.Insert):
@@ -416,15 +452,38 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
             
             if obj:
                 all_outputs.append(obj)
-                if not obj.name.startswith("#") and "tempdb" not in obj.name.lower():
-                    last_persistent_output = obj
+                # Skip temp tables
+                if obj.name.startswith("#") or "tempdb" in obj.name.lower():
+                    all_inputs.update(obj.dependencies or [])
+                    continue
+                
+                # Skip auxiliary tables (_ins_upd_results, _temp, etc.)
+                table_basename = obj.name.split('.')[-1].lower()
+                if any(suffix in table_basename for suffix in ['_ins_upd_results', '_results', '_log', '_audit']):
+                    all_inputs.update(obj.dependencies or [])
+                    continue
+                
+                # This is a candidate persistent table
+                last_persistent_output = obj
+                
+                # If table name matches procedure name pattern (e.g., update_X_BV -> X_BV),
+                # it's likely the main target
+                proc_basename = object_hint.split('.')[-1].lower() if object_hint else ""
+                if proc_basename.startswith('update_') or proc_basename.startswith('load_'):
+                    expected_table = proc_basename.replace('update_', '').replace('load_', '')
+                    if table_basename == expected_table or table_basename.endswith(expected_table):
+                        best_match_output = obj
+                
                 all_inputs.update(obj.dependencies or [])
     
-    # If we found persistent outputs, return the last one (typically the main table updated by procedure)
-    if last_persistent_output:
+    # Prefer best match (procedure name → table name), otherwise use last persistent
+    result_output = best_match_output or last_persistent_output
+    
+    # If we found persistent outputs, return the best one
+    if result_output:
         # Restore context
         self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
-        return last_persistent_output
+        return result_output
     
     # Fallback: return basic procedure info with dependencies from all statements
     dependencies = all_inputs
