@@ -49,17 +49,30 @@ def _temp_current(self, name: str) -> Optional[str]:
 def _canonical_temp_name(self, name: str) -> str:
     """Return canonical temp name including context when available.
 
-    - If we know current object context, format: DB.schema.object.#temp[@v]
-    - Otherwise, return '#temp[@v]' to avoid breaking callers.
+    - If we know current object context, format: DB.schema.object.#temp (without version suffix)
+    - Otherwise, return '#temp' to avoid breaking callers.
+    - Version suffix (@v) is used internally for tracking but not included in final object names.
     """
     try:
         n = name if name.startswith('#') else f"#{name}"
-        ver = _temp_current(self, n)
-        seg = ver or n
-        ctx_db = getattr(self, "_ctx_db", None) or getattr(self, "current_database", None) or getattr(self, "default_database", None)
+        # Remove version suffix if present (e.g., "#temp@2" -> "#temp")
+        # Version is used internally but not in final object names
+        if '@' in n:
+            n = n.split('@')[0]
+        seg = n
+        # Prefer current_database from USE statement, then _ctx_db, then default
+        # This ensures temp tables use the correct database (e.g., EDW_CORE instead of INFOTRACKERDW)
+        ctx_db = getattr(self, "current_database", None) or getattr(self, "_ctx_db", None) or getattr(self, "default_database", None)
         ctx_obj = getattr(self, "_ctx_obj", None)
+        # Debug: log context availability
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"_canonical_temp_name({name}): ctx_db={ctx_db}, ctx_obj={ctx_obj}, seg={seg}")
         if ctx_db and ctx_obj:
-            return f"{ctx_db}.{ctx_obj}.{seg}"
+            result = f"{ctx_db}.{ctx_obj}.{seg}"
+            logger.debug(f"_canonical_temp_name({name}): returning {result}")
+            return result
+        logger.debug(f"_canonical_temp_name({name}): returning {seg} (no context)")
         return seg
     except Exception:
         return name

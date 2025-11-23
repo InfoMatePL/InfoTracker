@@ -64,8 +64,14 @@ def extract(
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
     exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
     encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files. Supported: " + ", ".join(get_supported_encodings()), show_choices=True),
+    log_level: Optional[str] = typer.Option(None, "--log-level", help="Override log level: debug|info|warn|error"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    # Override log level if provided in extract command
+    if log_level:
+        cfg.log_level = log_level
+        level = getattr(logging, cfg.log_level.upper(), logging.INFO)
+        logging.basicConfig(level=level, force=True)
     # dbt mode flag (overrides config)
     if dbt:
         cfg.dbt_mode = True

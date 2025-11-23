@@ -1,19 +1,25 @@
 from __future__ import annotations
 from typing import Optional, List, Set
 import re
+import logging
 
 import sqlglot
 from sqlglot import exp  # type: ignore
 
 from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage
 
+logger = logging.getLogger(__name__)
+
 
 def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
     """Parse CREATE PROCEDURE using string-based approach (extracted)."""
+    logger.debug(f"_parse_procedure_string: Called with object_hint={object_hint}")
     # Normalize headers (SET/GO, COLLATE, etc.)
     sql_content = self._normalize_tsql(sql_content)
 
     # Determine DB context from USE at the start
+    # NOTE: current_database should already be set by parse_sql_file from USE statement
+    # But we check again here in case this function is called directly
     try:
         db_from_use = self._extract_database_from_use_statement(sql_content)
         if db_from_use:
@@ -28,9 +34,11 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
     namespace = self._canonical_namespace(inferred_db)
 
     # --- Establish parsing context for canonical temp naming (parity with legacy dev_parser) ---
+    # IMPORTANT: Set context BEFORE any parsing that might create temp tables
     prev_ctx_db, prev_ctx_obj = getattr(self, "_ctx_db", None), getattr(self, "_ctx_obj", None)
     self._ctx_db = inferred_db or self.current_database or self.default_database
     self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
+    logger.debug(f"_parse_procedure_string: Set context at start: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}, procedure_name={procedure_name}")
 
     # --- Prescan AST for temp materializations to register temp lineage early ---
     try:
@@ -38,9 +46,13 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
         normalized = self._normalize_tsql(sql_content)
         preprocessed = self._preprocess_sql(normalized)
         stmts = sqlglot.parse(preprocessed, read=self.dialect) or []
-        for st in stmts:
+        logger.debug(f"_parse_procedure_body_statements: Parsed {len(stmts)} statements")
+        for i, st in enumerate(stmts):
+            st_type = type(st).__name__
+            logger.debug(f"_parse_procedure_body_statements: Statement {i+1}: {st_type}")
             # Top-level SELECT ... INTO #tmp
             if isinstance(st, exp.Select) and self._is_select_into(st):
+                logger.debug(f"_parse_procedure_body_statements: Found top-level SELECT INTO")
                 self._parse_select_into(st, object_hint)
             # Top-level INSERT INTO #tmp SELECT ...
             if isinstance(st, exp.Insert):
@@ -49,43 +61,103 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                         self._parse_insert_select(st, object_hint)
                 except Exception:
                     pass
+            # Handle WITH ... INSERT INTO ... statements
+            elif isinstance(st, exp.With):
+                # Check if the WITH contains an INSERT statement
+                if hasattr(st, 'this'):
+                    if isinstance(st.this, exp.Insert):
+                        # Process CTEs from the WITH clause before parsing INSERT
+                        self._process_ctes(st)
+                        logger.debug(f"_parse_procedure_body_statements: Processed CTEs from WITH ... INSERT, cte_registry keys: {list(self.cte_registry.keys())}")
+                        # Now parse the INSERT
+                        if hasattr(st.this, 'expression') and isinstance(st.this.expression, exp.Select):
+                            self._parse_insert_select(st.this, object_hint)
             if isinstance(st, exp.Create):
+                logger.debug(f"_parse_procedure_body_statements: Found CREATE statement, walking nodes...")
+                node_count = 0
+                with_count = 0
+                select_count = 0
+                select_into_count = 0
                 for node in st.walk():
+                    node_count += 1
+                    node_type = type(node).__name__
+                    # Log first few nodes to see what we're getting
+                    if node_count <= 10:
+                        logger.debug(f"_parse_procedure_body_statements: Node {node_count}: {node_type}")
+                    
+                    # Handle WITH statement that contains SELECT INTO
+                    if isinstance(node, exp.With):
+                        with_count += 1
+                        logger.debug(f"_parse_procedure_body_statements: Found WITH node #{with_count}")
+                        # Check if the SELECT inside WITH has INTO
+                        if hasattr(node, 'this') and isinstance(node.this, exp.Select):
+                            logger.debug(f"_parse_procedure_body_statements: WITH node has SELECT as this")
+                            if self._is_select_into(node.this):
+                                select_into_count += 1
+                                logger.debug(f"_parse_procedure_body_statements: Found SELECT INTO #{select_into_count} inside WITH")
+                                self._parse_select_into(node.this, object_hint)
+                            else:
+                                logger.debug(f"_parse_procedure_body_statements: SELECT inside WITH does not have INTO")
                     # Nested SELECT ... INTO #tmp inside CREATE PROCEDURE body
-                    if isinstance(node, exp.Select) and self._is_select_into(node):
+                    elif isinstance(node, exp.Select):
+                        select_count += 1
+                        if self._is_select_into(node):
+                            select_into_count += 1
+                            logger.debug(f"_parse_procedure_body_statements: Found SELECT INTO node #{select_into_count}: {node_type}")
                         self._parse_select_into(node, object_hint)
                     # Nested INSERT INTO #tmp SELECT ... inside CREATE PROCEDURE body
-                    if isinstance(node, exp.Insert):
+                    elif isinstance(node, exp.Insert):
                         try:
                             if hasattr(node, 'expression') and isinstance(node.expression, exp.Select):
                                 self._parse_insert_select(node, object_hint)
                         except Exception:
                             pass
+                logger.debug(f"_parse_procedure_body_statements: Total nodes: {node_count}, WITH: {with_count}, SELECT: {select_count}, SELECT INTO: {select_into_count}")
     except Exception:
         pass
 
     # 1) Check if procedure materializes (SELECT INTO / INSERT INTO ... SELECT)
     materialized_output = self._extract_materialized_output_from_procedure_string(sql_content)
     if materialized_output:
+        # Ensure materialized output uses the correct database from USE statement
+        if materialized_output.schema:
+            # Update namespace to use current_database (from USE statement)
+            correct_db = self.current_database or self.default_database or "InfoTrackerDW"
+            materialized_output.schema.namespace = self._canonical_namespace(correct_db)
+            # Update name to include correct database if needed
+            if materialized_output.schema.name:
+                parts = materialized_output.schema.name.split('.')
+                if len(parts) == 2:  # schema.table
+                    # Name is already correct (schema.table), namespace has the DB
+                    pass
+                elif len(parts) == 1:  # table only
+                    materialized_output.schema.name = f"dbo.{parts[0]}"
+            materialized_output.name = materialized_output.schema.name
         # Specialized parser: INSERT INTO ... SELECT -> compute lineage from that SELECT
-        try:
-            ins_lineage, ins_deps = self._extract_insert_select_lineage_string(sql_content, procedure_name)
-            if ins_deps:
-                materialized_output.dependencies = set(ins_deps)
-            if ins_lineage:
-                materialized_output.lineage = ins_lineage
-        except Exception:
-            # Fallback: generic extractor; may include SELECT after INSERT
+        # Use the table name from materialized_output, not procedure_name, to match the INSERT INTO target
+        target_table_name = materialized_output.schema.name if materialized_output.schema else materialized_output.name
+        # If lineage was already extracted in _extract_materialized_output_from_procedure_string and has input_fields, use it
+        # Otherwise, try to extract lineage again
+        has_valid_lineage = materialized_output.lineage and any(lin.input_fields for lin in materialized_output.lineage)
+        if not has_valid_lineage:
             try:
-                lineage_sel, _, deps_sel = self._extract_procedure_lineage_string(sql_content, procedure_name)
-                if deps_sel:
-                    materialized_output.dependencies = set(deps_sel)
-                if lineage_sel:
-                    materialized_output.lineage = lineage_sel
+                ins_lineage, ins_deps = self._extract_insert_select_lineage_string(sql_content, target_table_name)
+                if ins_deps:
+                    materialized_output.dependencies = set(ins_deps)
+                if ins_lineage:
+                    materialized_output.lineage = ins_lineage
             except Exception:
-                basic_deps = self._extract_basic_dependencies(sql_content)
-                if basic_deps:
-                    materialized_output.dependencies = set(basic_deps)
+                # Fallback: generic extractor; may include SELECT after INSERT
+                try:
+                    lineage_sel, _, deps_sel = self._extract_procedure_lineage_string(sql_content, procedure_name)
+                    if deps_sel:
+                        materialized_output.dependencies = set(deps_sel)
+                    if lineage_sel:
+                        materialized_output.lineage = lineage_sel
+                except Exception:
+                    basic_deps = self._extract_basic_dependencies(sql_content)
+                    if basic_deps:
+                        materialized_output.dependencies = set(basic_deps)
 
         # Backfill schema from registry (handle names with/without DB prefix)
         ns = materialized_output.schema.namespace
@@ -121,7 +193,8 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
             seg_sql = self._preprocess_sql(self._normalize_tsql(src_text))
             import re as _re
             # SELECT ... INTO #temp ... segments
-            for m in _re.finditer(r"(?is)\bSELECT\s+.*?\bINTO\s+#(?P<tmp>[A-Za-z0-9_]+)\b.*?(?=;|\bINSERT\b|\bCREATE\b|\bALTER\b|\bUPDATE\b|\bDELETE\b|\bEND\b|\bGO\b|$)", src_text):
+            # Improved regex to handle multi-line SELECT ... INTO statements better
+            for m in _re.finditer(r"(?is)\bSELECT\s+.*?\bINTO\s+#(?P<tmp>[A-Za-z0-9_]+)\b.*?(?=;|\b(?:INSERT|CREATE|ALTER|UPDATE|DELETE|DROP|TRUNCATE|BEGIN|END|GO|COMMIT|ROLLBACK)\b|$)", src_text):
                 # Try AST on the normalized/preprocessed segment
                 raw_seg = m.group(0)
                 seg = self._preprocess_sql(self._normalize_tsql(raw_seg))
@@ -142,8 +215,28 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                             # Filter out self and temps
                             bases = {b for b in bases if '#' not in b and 'tempdb' not in str(b).lower()}
                             if bases:
-                                self.temp_sources[tkey] = set(bases)
-                    except Exception:
+                                # Update temp_sources (merge with existing if any)
+                                existing = self.temp_sources.get(tkey, set())
+                                existing.update(bases)
+                                self.temp_sources[tkey] = existing
+                                # Also register temp in temp_registry if not already there (for columns)
+                                if tkey not in self.temp_registry:
+                                    # Try to extract column names from SELECT
+                                    import re as _re2
+                                    select_match = _re2.search(r'(?is)SELECT\s+(.*?)\s+INTO', raw_seg)
+                                    if select_match:
+                                        select_list = select_match.group(1)
+                                        # Simple column extraction - take aliases or column names
+                                        cols = []
+                                        for col_match in _re2.finditer(r'(\w+)(?:\s+AS\s+(\w+))?', select_list):
+                                            alias = col_match.group(2) or col_match.group(1)
+                                            cols.append(alias)
+                                        if cols:
+                                            self.temp_registry[tkey] = cols
+                    except Exception as e:
+                        import traceback
+                        logger.debug(f"Error in regex fallback for {tmp}: {e}")
+                        traceback.print_exc()
                         pass
             # INSERT INTO #temp SELECT ... segments
             for m in _re.finditer(r"(?is)\bINSERT\s+INTO\s+#(?P<tmp>[A-Za-z0-9_]+)\b.*?\bSELECT\b.*?(?=;|\bINSERT\b|\bCREATE\b|\bALTER\b|\bUPDATE\b|\bDELETE\b|\bEND\b|\bGO\b|$)", src_text):
@@ -164,8 +257,25 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                             bases = self._extract_basic_dependencies(raw_seg) or set()
                             bases = {b for b in bases if '#' not in b and 'tempdb' not in str(b).lower()}
                             if bases:
-                                self.temp_sources[tkey] = set(bases)
-                    except Exception:
+                                # Update temp_sources (merge with existing if any)
+                                existing = self.temp_sources.get(tkey, set())
+                                existing.update(bases)
+                                self.temp_sources[tkey] = existing
+                                # Also register temp in temp_registry if not already there
+                                if tkey not in self.temp_registry:
+                                    # Try to extract column names from INSERT INTO ... SELECT
+                                    import re as _re2
+                                    insert_match = _re2.search(r'(?is)INSERT\s+INTO\s+#\w+.*?SELECT\s+(.*?)(?:\s+FROM|\s+WHERE|\s+GROUP|\s+ORDER|$)', raw_seg)
+                                    if insert_match:
+                                        select_list = insert_match.group(1)
+                                        cols = []
+                                        for col_match in _re2.finditer(r'(\w+)(?:\s+AS\s+(\w+))?', select_list):
+                                            alias = col_match.group(2) or col_match.group(1)
+                                            cols.append(alias)
+                                        if cols:
+                                            self.temp_registry[tkey] = cols
+                    except Exception as e:
+                        logger.debug(f"Error in INSERT fallback for {tmp}: {e}")
                         pass
         except Exception:
             pass
@@ -242,8 +352,16 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                 materialized_output.name = norm_name
         except Exception:
             pass
-        # restore context before returning
-        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+        # DON'T restore context before returning - it's needed for temp table canonical naming in engine.py
+        # The context will be restored when the next file is parsed (in parse_sql_file)
+        # IMPORTANT: Ensure context is set before returning, so engine.py can use it for canonical temp naming
+        # Context should already be set on lines 35-36, but ensure it's set here as well
+        # Force set context to ensure it's available after return
+        self._ctx_db = inferred_db or self.current_database or self.default_database
+        self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
+        # Debug: print context before returning (for immediate visibility)
+        logger.debug(f"_parse_procedure_string: Setting context before return: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}, procedure_name={procedure_name}")
+        # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return materialized_output
 
     # 2) MERGE INTO ... USING ... as materialized target
@@ -348,7 +466,6 @@ def _extract_procedure_name(self, sql_content: str) -> Optional[str]:
 
 def _extract_procedure_body(self, sql_content: str) -> Optional[str]:
     """Extract the body of a CREATE PROCEDURE (everything after AS keyword)."""
-    import re
     # Match CREATE PROCEDURE ... AS and extract everything after
     match = re.search(
         r'(?is)CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+\S+.*?\bAS\b\s*(.*)',
@@ -365,6 +482,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     Parse procedure body statements directly (fallback when CREATE PROCEDURE fails in sqlglot).
     Extracts INSERT INTO ... SELECT statements and builds lineage.
     """
+    logger.debug(f"_parse_procedure_body_statements: Called with object_hint={object_hint}")
     from ..openlineage_utils import sanitize_name
     
     procedure_name = self._extract_procedure_name(full_sql) or object_hint or "unknown_procedure"
@@ -379,27 +497,762 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         self._ctx_db = (namespace.rsplit('/', 1)[-1]) if isinstance(namespace, str) else (self.current_database or self.default_database)
     except Exception:
         self._ctx_db = (self.current_database or self.default_database)
-    self._ctx_obj = procedure_name
+    # Normalize procedure_name to ensure it's in schema.table format (without brackets)
+    self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
+    logger.debug(f"_parse_procedure_body_statements: Set context: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}, procedure_name={procedure_name}")
+    
+    # Before preprocessing, find all CTEs that are used before SELECT ... INTO statements
+    # This is needed because preprocessing may remove WITH clauses
+    # Find all "SELECT ... INTO #table" patterns in body_sql
+    into_temp_pattern = r'SELECT\s+.*?\bINTO\s+(#\w+)'
+    into_matches_in_body = list(re.finditer(into_temp_pattern, body_sql, re.IGNORECASE | re.DOTALL))
+    
+    # For each SELECT ... INTO, find CTEs before it
+    for into_match in into_matches_in_body:
+        temp_table = into_match.group(1)
+        into_pos = into_match.start()
+        
+        # Look backwards for WITH statements before this INTO (up to 10000 chars)
+        search_start = max(0, into_pos - 10000)
+        before_into_text = body_sql[search_start:into_pos]
+        
+        # Find all WITH ... AS (...) patterns before INTO
+        # Pattern: WITH name AS ( ... ) where closing paren is balanced
+        with_pattern = r'(?:^|;|\n)\s*WITH\s+(\w+)\s+AS\s*\('
+        with_matches = list(re.finditer(with_pattern, before_into_text, re.IGNORECASE | re.MULTILINE))
+        
+        for with_match in with_matches:
+            cte_name = with_match.group(1)
+            with_start_in_before = with_match.start()
+            # Find the actual start of WITH (skip semicolon and whitespace before WITH)
+            match_text = before_into_text[with_start_in_before:with_match.end()]
+            actual_with_start_in_match = len(match_text) - len(match_text.lstrip('; \n\r\t'))
+            with_start_absolute = search_start + with_start_in_before + actual_with_start_in_match
+            
+            # Find the matching closing paren for this CTE
+            # Start from the opening paren after "AS ("
+            paren_start = with_match.end() - 1  # Position of opening paren
+            paren_count = 0
+            paren_pos = paren_start
+            cte_end_pos = None
+            
+            # Count parentheses to find the matching closing paren
+            while paren_pos < len(before_into_text):
+                if before_into_text[paren_pos] == '(':
+                    paren_count += 1
+                elif before_into_text[paren_pos] == ')':
+                    paren_count -= 1
+                    if paren_count == 0:
+                        cte_end_pos = search_start + paren_pos + 1
+                        break
+                paren_pos += 1
+            
+            if cte_end_pos:
+                # Extract the CTE definition
+                cte_sql = body_sql[with_start_absolute:cte_end_pos]
+                # Remove leading semicolons and whitespace
+                cte_sql = cte_sql.lstrip('; \n\r\t')
+                logger.debug(f"_parse_procedure_body_statements: Found CTE {cte_name} before INTO {temp_table}, extracting from body_sql")
+                
+                # Try to parse and register the CTE
+                try:
+                    # Parse the CTE definition (WITH ... AS (...))
+                    # Add a dummy SELECT to make it valid SQL
+                    cte_parse_sql = cte_sql + " SELECT 1"
+                    parsed_cte = sqlglot.parse_one(cte_parse_sql, read=self.dialect)
+                    
+                    if isinstance(parsed_cte, exp.With) and hasattr(parsed_cte, 'expressions'):
+                        # Extract CTE from exp.With
+                        for cte_expr in parsed_cte.expressions:
+                            if hasattr(cte_expr, 'alias') and str(cte_expr.alias).upper() == cte_name.upper():
+                                # Register the CTE
+                                if isinstance(cte_expr.this, exp.Select):
+                                    self._process_ctes(cte_expr.this)
+                                    logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} from body_sql, cte_registry keys: {list(self.cte_registry.keys())}")
+                                break
+                    elif isinstance(parsed_cte, exp.Select):
+                        # If parsed as SELECT, try to extract columns
+                        cte_columns = []
+                        for proj in parsed_cte.expressions:
+                            col_name = None
+                            if isinstance(proj, exp.Alias):
+                                col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                if not col_name and hasattr(proj, 'alias_or_name'):
+                                    col_name = str(proj.alias_or_name)
+                            elif isinstance(proj, exp.Column):
+                                col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                            if col_name:
+                                cte_columns.append(col_name)
+                        # Register CTE
+                        self.cte_registry[cte_name] = {
+                            'columns': cte_columns,
+                            'definition': parsed_cte
+                        }
+                        logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} (parsed as SELECT) from body_sql, cte_registry keys: {list(self.cte_registry.keys())}")
+                except Exception as e:
+                    logger.debug(f"_parse_procedure_body_statements: Failed to parse CTE {cte_name} from body_sql: {e}")
+                    import traceback
+                    logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
     
     # Preprocess body (remove DECLARE, SET, etc.)
     preprocessed_body = self._preprocess_sql(body_sql)
+    logger.debug(f"_parse_procedure_body_statements: preprocessed_body length={len(preprocessed_body)}")
+    # Check if SELECT INTO is in preprocessed_body
+    if 'INTO #' in preprocessed_body or 'INTO #asefl_temp' in preprocessed_body:
+        logger.debug(f"_parse_procedure_body_statements: Found 'INTO #' in preprocessed_body")
+    if 'WITH' in preprocessed_body.upper():
+        logger.debug(f"_parse_procedure_body_statements: Found 'WITH' in preprocessed_body")
     
     # Register temp tables found in procedure body for proper namespace resolution
     # sqlglot drops '#' from temp table names, so we need to register them beforehand
-    import re
     temp_pattern = r'#(\w+)'
+    temp_tables_found = []
     for match in re.finditer(temp_pattern, preprocessed_body):
         temp_name = f"#{match.group(1)}"
         if temp_name not in self.temp_registry:
             # Register with placeholder schema (will be filled during actual INSERT parsing)
             self.temp_registry[temp_name] = []
+            temp_tables_found.append(temp_name)
+    if temp_tables_found:
+        logger.debug(f"_parse_procedure_body_statements: Found temp tables: {temp_tables_found}")
+    
+    # Initialize outputs and inputs before parsing
+    all_outputs = []
+    all_inputs: Set[str] = set()
     
     # Parse statements in body - use one_statement mode to be more forgiving
     try:
         statements = []
-        # Split by semicolon but also try to extract major DML statements
-        import sqlglot
-        import re
+        # sqlglot and exp are already imported at module level
+        
+        # First, try to parse the entire preprocessed_body to find WITH ... SELECT ... INTO in AST
+        # This is more reliable than regex extraction
+        try:
+            all_statements = sqlglot.parse(preprocessed_body, read=self.dialect) or []
+            logger.debug(f"_parse_procedure_body_statements: Parsed {len(all_statements)} statements from preprocessed_body")
+            
+            # Walk through AST to find WITH ... SELECT ... INTO
+            for stmt in all_statements:
+                # Check if this is a WITH statement containing SELECT ... INTO
+                if isinstance(stmt, exp.With) and hasattr(stmt, 'this'):
+                    if isinstance(stmt.this, exp.Select) and self._is_select_into(stmt.this):
+                        logger.debug(f"_parse_procedure_body_statements: Found WITH ... SELECT ... INTO in AST")
+                        statements.append(stmt)
+                        # Also process it directly
+                        obj = self._parse_select_into(stmt.this, object_hint)
+                        if obj:
+                            all_outputs.append(obj)
+                            all_inputs.update(obj.dependencies or [])
+                    elif isinstance(stmt.this, exp.Select) and not self._is_select_into(stmt.this):
+                        # This is a standalone WITH statement (CTE definition) - process CTEs and register them
+                        # This handles cases like "WITH MaxDates AS ... SELECT ... INTO #MaxLoadDate FROM MaxDates"
+                        # where WITH is a separate statement before SELECT INTO
+                        logger.debug(f"_parse_procedure_body_statements: Found standalone WITH statement (CTE definition), processing CTEs")
+                        self._process_ctes(stmt)
+                        logger.debug(f"_parse_procedure_body_statements: Processed CTEs from standalone WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+                # Check if this is a SELECT ... INTO (without WITH)
+                elif isinstance(stmt, exp.Select) and self._is_select_into(stmt):
+                    logger.debug(f"_parse_procedure_body_statements: Found SELECT ... INTO in AST")
+                    statements.append(stmt)
+                    obj = self._parse_select_into(stmt, object_hint)
+                    if obj:
+                        all_outputs.append(obj)
+                        all_inputs.update(obj.dependencies or [])
+        except Exception as e:
+            logger.debug(f"_parse_procedure_body_statements: Failed to parse preprocessed_body as whole: {e}")
+            # Fall back to regex-based extraction
+            pass
+        
+        # Before fallback extraction, try to find and parse standalone WITH statements
+        # This handles cases like "WITH MaxDates AS ... SELECT ... INTO #MaxLoadDate FROM MaxDates"
+        # where WITH is a separate statement before SELECT INTO
+        try:
+            # Find all "SELECT ... INTO #table" patterns first
+            into_temp_pattern = r'INTO\s+(#\w+)'
+            into_matches = list(re.finditer(into_temp_pattern, preprocessed_body, re.IGNORECASE))
+            
+            # For each INTO, look backwards for standalone WITH statements
+            for into_match in into_matches:
+                temp_table = into_match.group(1)
+                into_start = into_match.start()
+                # Look backwards for WITH statements (up to 10000 chars)
+                search_start = max(0, into_start - 10000)
+                before_text = preprocessed_body[search_start:into_start]
+                
+                # Find all WITH statements before this INTO
+                with_pattern = r'(?:^|;|\n)\s*WITH\s+(\w+)\s+AS\s*\([^)]*(?:\([^)]*\)[^)]*)*\)'
+                with_matches = list(re.finditer(with_pattern, before_text, re.IGNORECASE | re.MULTILINE | re.DOTALL))
+                
+                # Also try a simpler pattern that matches WITH ... AS (...) where the closing paren is balanced
+                if not with_matches:
+                    # Find WITH statements by looking for "WITH name AS (" and finding the matching closing paren
+                    simple_with_pattern = r'(?:^|;|\n)\s*WITH\s+(\w+)\s+AS\s*\('
+                    simple_with_matches = list(re.finditer(simple_with_pattern, before_text, re.IGNORECASE | re.MULTILINE))
+                    for simple_match in simple_with_matches:
+                        # Find the matching closing paren
+                        cte_name = simple_match.group(1)
+                        open_pos = simple_match.end() - 1  # Position of opening paren
+                        paren_count = 0
+                        found_close = False
+                        for i in range(open_pos, len(before_text)):
+                            if before_text[i] == '(':
+                                paren_count += 1
+                            elif before_text[i] == ')':
+                                paren_count -= 1
+                                if paren_count == 0:
+                                    # Found matching closing paren
+                                    with_start = simple_match.start() + search_start
+                                    with_end = i + search_start + 1
+                                    with_stmt_text = preprocessed_body[with_start:with_end].strip()
+                                    # Check if this WITH statement is followed by SELECT (not SELECT INTO)
+                                    after_with = preprocessed_body[with_end:into_start].strip()
+                                    if re.match(r'^\s*SELECT\s+', after_with, re.IGNORECASE) and 'INTO' not in after_with[:200]:
+                                        # This might be a standalone WITH statement
+                                        try:
+                                            parsed_with = sqlglot.parse_one(with_stmt_text, read=self.dialect)
+                                            if isinstance(parsed_with, exp.With):
+                                                if hasattr(parsed_with, 'this') and isinstance(parsed_with.this, exp.Select):
+                                                    if not self._is_select_into(parsed_with.this):
+                                                        # This is a standalone WITH statement (CTE definition)
+                                                        logger.debug(f"_parse_procedure_body_statements: Found standalone WITH statement {cte_name} before INTO {temp_table} in fallback, processing CTEs")
+                                                        self._process_ctes(parsed_with.this)
+                                                        logger.debug(f"_parse_procedure_body_statements: Processed CTEs from standalone WITH {cte_name} in fallback, cte_registry keys: {list(self.cte_registry.keys())}")
+                                                        break  # Process only the first/last WITH before this INTO
+                                        except Exception as parse_error:
+                                            logger.debug(f"_parse_procedure_body_statements: Failed to parse standalone WITH statement {cte_name} before INTO {temp_table}: {parse_error}")
+                                    found_close = True
+                                    break
+                        if found_close:
+                            break
+        except Exception as fallback_error:
+            logger.debug(f"_parse_procedure_body_statements: Failed to process standalone WITH statements in fallback: {fallback_error}")
+        
+        # Fallback: try to extract WITH ... SELECT ... INTO using regex
+        # Strategy: Find all "INTO #table" patterns, then look backwards for the nearest "WITH"
+        into_temp_pattern = r'INTO\s+(#\w+)'
+        into_matches = list(re.finditer(into_temp_pattern, preprocessed_body, re.IGNORECASE))
+        with_select_into_matches = []
+        select_into_without_with_matches = []  # For SELECT ... INTO without WITH
+        
+        for into_match in into_matches:
+            temp_table = into_match.group(1)
+            into_end = into_match.end()
+            # Look backwards for the start of this statement (WITH or SELECT)
+            # Search up to 10000 characters back (WITH statements can be very long)
+            search_start = max(0, into_match.start() - 10000)
+            before_text = preprocessed_body[search_start:into_match.start()]
+            
+            logger.debug(f"_parse_procedure_body_statements: Looking for WITH before INTO {temp_table}, searching {len(before_text)} chars back, search_start={search_start}, into_match.start()={into_match.start()}")
+            # Check if WITH is in preprocessed_body before into_match.start()
+            if into_match.start() > 0:
+                preprocessed_before_into = preprocessed_body[:into_match.start()]
+                has_with_in_preprocessed = 'WITH' in preprocessed_before_into.upper() or 'WITH' in preprocessed_before_into
+                logger.debug(f"_parse_procedure_body_statements: has_with_in_preprocessed={has_with_in_preprocessed} for {temp_table}, preprocessed_before_into length={len(preprocessed_before_into)}")
+                if not has_with_in_preprocessed:
+                    # Show first 500 chars of preprocessed_body to see what's at the start
+                    logger.debug(f"_parse_procedure_body_statements: First 500 chars of preprocessed_body: {preprocessed_body[:500]}")
+                    # Check if WITH is in entire preprocessed_body (maybe it's after into_match.start())
+                    has_with_anywhere = 'WITH' in preprocessed_body.upper() or 'WITH' in preprocessed_body
+                    logger.debug(f"_parse_procedure_body_statements: has_with_anywhere={has_with_anywhere} in entire preprocessed_body (length={len(preprocessed_body)})")
+                    if has_with_anywhere:
+                        # Find all WITH positions in preprocessed_body
+                        with_positions = []
+                        search_pos = 0
+                        while True:
+                            pos = preprocessed_body.upper().find('WITH', search_pos)
+                            if pos < 0:
+                                break
+                            with_positions.append(pos)
+                            search_pos = pos + 1
+                        logger.debug(f"_parse_procedure_body_statements: WITH found at positions {with_positions} in preprocessed_body")
+                        # Show context around first WITH
+                        if with_positions:
+                            first_with_pos = with_positions[0]
+                            context_start = max(0, first_with_pos - 50)
+                            context_end = min(len(preprocessed_body), first_with_pos + 200)
+                            logger.debug(f"_parse_procedure_body_statements: Context around first WITH in preprocessed_body: {preprocessed_body[context_start:context_end]}")
+                else:
+                    # Find WITH position in preprocessed_body
+                    with_pos = preprocessed_before_into.upper().find('WITH')
+                    if with_pos >= 0:
+                        logger.debug(f"_parse_procedure_body_statements: WITH found at position {with_pos} in preprocessed_body (before INTO {temp_table})")
+                        # Show context around WITH
+                        context_start = max(0, with_pos - 50)
+                        context_end = min(len(preprocessed_before_into), with_pos + 200)
+                        logger.debug(f"_parse_procedure_body_statements: Context around WITH in preprocessed_body: {preprocessed_before_into[context_start:context_end]}")
+            # Check if WITH is in before_text
+            if 'WITH' in before_text.upper() or 'WITH' in before_text:
+                logger.debug(f"_parse_procedure_body_statements: Found 'WITH' text in before_text for {temp_table}")
+                # Show first 200 chars to see if WITH is at the start
+                logger.debug(f"_parse_procedure_body_statements: First 200 chars of before_text: {before_text[:200]}")
+                # Show last 200 chars of before_text
+                logger.debug(f"_parse_procedure_body_statements: Last 200 chars before INTO {temp_table}: {before_text[-200:]}")
+            else:
+                logger.debug(f"_parse_procedure_body_statements: No 'WITH' text found in before_text for {temp_table}")
+                # Show first 200 chars to see what's at the start
+                logger.debug(f"_parse_procedure_body_statements: First 200 chars of before_text: {before_text[:200]}")
+                # Show last 200 chars of before_text to see what's there
+                logger.debug(f"_parse_procedure_body_statements: Last 200 chars before INTO {temp_table}: {before_text[-200:]}")
+                # Also check if WITH is in preprocessed_body before into_match.start() (maybe search_start is wrong)
+                # Always check extended range if WITH is not found in before_text
+                extended_search_start = max(0, into_match.start() - 20000)
+                extended_before_text = preprocessed_body[extended_search_start:into_match.start()]
+                logger.debug(f"_parse_procedure_body_statements: Checking extended_before_text for {temp_table}, length={len(extended_before_text)}, search_start={extended_search_start}, into_match.start()={into_match.start()}")
+                # Check if WITH is in extended_before_text
+                has_with_in_extended = 'WITH' in extended_before_text.upper() or 'WITH' in extended_before_text
+                logger.debug(f"_parse_procedure_body_statements: has_with_in_extended={has_with_in_extended} for {temp_table}")
+                if has_with_in_extended:
+                    logger.debug(f"_parse_procedure_body_statements: Found 'WITH' in extended_before_text (search_start={extended_search_start}), but not in before_text (search_start={search_start})")
+                    # Find WITH in extended_before_text
+                    with_pos_in_extended = extended_before_text.upper().find('WITH')
+                    if with_pos_in_extended >= 0:
+                        logger.debug(f"_parse_procedure_body_statements: WITH found at position {extended_search_start + with_pos_in_extended} in preprocessed_body")
+                        # Show context around WITH
+                        context_start = max(0, with_pos_in_extended - 50)
+                        context_end = min(len(extended_before_text), with_pos_in_extended + 200)
+                        logger.debug(f"_parse_procedure_body_statements: Context around WITH: {extended_before_text[context_start:context_end]}")
+                        # Use extended_before_text instead of before_text for finding WITH
+                        before_text = extended_before_text
+                        search_start = extended_search_start
+            
+            # Find the nearest WITH statement before this INTO
+            # Look for ;WITH or start of string or newline followed by WITH
+            # Also check for WITH at the start of the search area
+            with_start_pattern = r'(?:^|;|\n)\s*WITH\s+'
+            with_start_matches = list(re.finditer(with_start_pattern, before_text, re.IGNORECASE | re.MULTILINE))
+            
+            # Also try a simpler pattern - just look for WITH (might be at start of line)
+            if not with_start_matches:
+                simple_with_pattern = r'\bWITH\s+'
+                simple_matches = list(re.finditer(simple_with_pattern, before_text, re.IGNORECASE))
+                logger.debug(f"_parse_procedure_body_statements: Simple pattern found {len(simple_matches)} WITH matches in before_text for {temp_table}")
+                # Filter to only those that are at start of statement (after ; or at start of search area)
+                for simple_match in simple_matches:
+                    pos = simple_match.start()
+                    prev_char = before_text[pos-1] if pos > 0 else None
+                    logger.debug(f"_parse_procedure_body_statements: WITH match at pos {pos} in before_text, prev_char={repr(prev_char)}")
+                    # Check if this WITH is at start of statement
+                    if pos == 0 or (pos > 0 and before_text[pos-1] in (';', '\n')):
+                        with_start_matches.append(simple_match)
+                        logger.debug(f"_parse_procedure_body_statements: Found WITH at position {search_start + pos} using simple pattern")
+                    else:
+                        logger.debug(f"_parse_procedure_body_statements: WITH at pos {pos} is not at start of statement (prev_char={repr(prev_char)})")
+            
+            logger.debug(f"_parse_procedure_body_statements: Found {len(with_start_matches)} WITH matches before INTO {temp_table}")
+            
+            if not with_start_matches:
+                # No WITH found - this is a simple SELECT ... INTO #table (without WITH)
+                # Extract the SELECT statement that contains this INTO
+                # Look backwards for SELECT
+                select_start_pattern = r'(?:^|;|\n)\s*SELECT\s+'
+                select_start_matches = list(re.finditer(select_start_pattern, before_text, re.IGNORECASE | re.MULTILINE))
+                if select_start_matches:
+                    # Use the last (closest) SELECT match
+                    select_start_match = select_start_matches[-1]
+                    select_pos_in_before = select_start_match.start()
+                    actual_select_start = search_start + select_pos_in_before
+                    # Adjust if it starts with semicolon or newline
+                    while actual_select_start < len(preprocessed_body) and preprocessed_body[actual_select_start] in (';', '\n', '\r', ' '):
+                        actual_select_start += 1
+                    
+                    # Find the end of this statement
+                    # Look for semicolon, next SELECT, or control flow keywords (IF, BEGIN, etc.)
+                    search_end_pos = min(len(preprocessed_body), into_end + 1000)
+                    after_text = preprocessed_body[into_end:search_end_pos]
+                    
+                    # Look for semicolon first
+                    semicolon_pos = after_text.find(';')
+                    if semicolon_pos >= 0:
+                        # Check if semicolon is followed by SELECT or control flow
+                        after_semicolon = after_text[semicolon_pos+1:semicolon_pos+100].strip()
+                        if re.match(r'\s*(SELECT|IF|BEGIN|END|ELSE|WHILE|FOR)\s+', after_semicolon, re.IGNORECASE):
+                            actual_end = into_end + semicolon_pos + 1
+                        else:
+                            # Semicolon might be inside statement, continue searching
+                            semicolon_pos = -1
+                    
+                    if semicolon_pos < 0:
+                        # Look for next SELECT on a new line
+                        next_select_match = re.search(r'\n\s*SELECT\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                        if next_select_match:
+                            actual_end = into_end + next_select_match.start()
+                        else:
+                            # Look for control flow keywords (IF, BEGIN, etc.) on new line
+                            control_flow_match = re.search(r'\n\s*(IF|BEGIN|END|ELSE|WHILE|FOR)\s*\(', after_text, re.IGNORECASE | re.MULTILINE)
+                            if control_flow_match:
+                                actual_end = into_end + control_flow_match.start()
+                            else:
+                                # Use limit, but try to find end of FROM clause
+                                # Look for WHERE, GROUP BY, ORDER BY, or end of statement
+                                clause_match = re.search(r'\n\s*(WHERE|GROUP\s+BY|ORDER\s+BY|HAVING)\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                                if clause_match:
+                                    # Find end of this clause
+                                    clause_end = clause_match.end()
+                                    # Look for next keyword after this clause
+                                    next_keyword = re.search(r'\n\s*(SELECT|IF|BEGIN|END|ELSE|;)\s+', after_text[clause_end:], re.IGNORECASE | re.MULTILINE)
+                                    if next_keyword:
+                                        actual_end = into_end + clause_end + next_keyword.start()
+                                    else:
+                                        actual_end = min(len(preprocessed_body), into_end + 500)
+                                else:
+                                    actual_end = min(len(preprocessed_body), into_end + 500)
+                    
+                    # Extract the full statement
+                    full_stmt = preprocessed_body[actual_select_start:actual_end].strip()
+                    if full_stmt.endswith(';'):
+                        full_stmt = full_stmt[:-1].strip()
+                    
+                    if full_stmt:
+                        class MatchObj:
+                            def __init__(self, start, end, group_text):
+                                self._start = start
+                                self._end = end
+                                self._group_text = group_text
+                            def start(self):
+                                return self._start
+                            def end(self):
+                                return self._end
+                            def group(self, n):
+                                return self._group_text if n == 1 else None
+                        
+                        select_into_without_with_matches.append(MatchObj(actual_select_start, actual_end, full_stmt))
+                        logger.debug(f"_parse_procedure_body_statements: Found SELECT ... INTO {temp_table} (without WITH) (start={actual_select_start}, end={actual_end}, length={len(full_stmt)})")
+            
+            if with_start_matches:
+                # Use the last (closest) WITH match
+                with_start_match = with_start_matches[-1]
+                # Position in before_text
+                with_pos_in_before = with_start_match.start()
+                # Actual position in preprocessed_body
+                actual_with_start = search_start + with_pos_in_before
+                # Adjust if it starts with semicolon or newline
+                while actual_with_start < len(preprocessed_body) and preprocessed_body[actual_with_start] in (';', '\n', '\r', ' '):
+                    actual_with_start += 1
+                
+                # Check if this WITH statement is standalone (not part of WITH ... SELECT ... INTO)
+                # Look for the end of the WITH statement (should end before SELECT ... INTO)
+                # Try to parse the WITH statement separately to register CTEs
+                # Find where the WITH statement ends (should be before the SELECT that contains INTO)
+                select_before_into_pattern = r'(?:^|;|\n)\s*SELECT\s+'
+                select_before_into_matches = list(re.finditer(select_before_into_pattern, preprocessed_body[actual_with_start:into_match.start()], re.IGNORECASE | re.MULTILINE))
+                if select_before_into_matches:
+                    # There's a SELECT between WITH and INTO - this might be a standalone WITH statement
+                    # The WITH statement should end before this SELECT
+                    select_before_into_match = select_before_into_matches[-1]
+                    with_end_pos = actual_with_start + select_before_into_match.start()
+                    # Extract the WITH statement
+                    with_stmt_str = preprocessed_body[actual_with_start:with_end_pos].strip()
+                    # Try to parse it as a standalone WITH statement
+                    try:
+                        with_stmt_parsed = sqlglot.parse_one(with_stmt_str, read=self.dialect)
+                        if isinstance(with_stmt_parsed, exp.With):
+                            # This is a standalone WITH statement - process CTEs
+                            logger.debug(f"_parse_procedure_body_statements: Found standalone WITH statement before INTO {temp_table}, processing CTEs")
+                            self._process_ctes(with_stmt_parsed.this if hasattr(with_stmt_parsed, 'this') and isinstance(with_stmt_parsed.this, exp.Select) else with_stmt_parsed)
+                            logger.debug(f"_parse_procedure_body_statements: Processed CTEs from standalone WITH before INTO {temp_table}, cte_registry keys: {list(self.cte_registry.keys())}")
+                    except Exception as e:
+                        logger.debug(f"_parse_procedure_body_statements: Failed to parse standalone WITH statement before INTO {temp_table}: {e}")
+                
+                # Find the end of this statement - look for semicolon or next SELECT after INTO #table
+                # For #asefl_temp, the statement ends after the FROM clause (no semicolon, next statement is SELECT)
+                # Strategy: Find the end of the FROM clause by looking for the next SELECT on a new line
+                # that appears after all JOINs are done
+                search_end_pos = min(len(preprocessed_body), into_end + 500)
+                after_text = preprocessed_body[into_end:search_end_pos]
+                
+                logger.debug(f"_parse_procedure_body_statements: Looking for end of statement for {temp_table}, after_text length={len(after_text)}")
+                logger.debug(f"_parse_procedure_body_statements: First 300 chars after INTO {temp_table}: {after_text[:300]}")
+                
+                # For #asefl_temp, the statement ends after the FROM clause (no semicolon, next statement is SELECT)
+                # Strategy: Always look for next SELECT on a new line first, as it's more reliable than semicolon
+                # The semicolon might be inside the statement (e.g., after JOINs but before the actual end)
+                next_select_match = re.search(r'\n\s*SELECT\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                if next_select_match:
+                    select_pos = next_select_match.start()
+                    logger.debug(f"_parse_procedure_body_statements: Found SELECT at position {select_pos} after INTO {temp_table}")
+                    # Check what comes after this SELECT to see if it's part of the current statement
+                    select_context = after_text[select_pos:select_pos+100]
+                    logger.debug(f"_parse_procedure_body_statements: Context around SELECT: {select_context}")
+                    # For #asefl_temp, the next SELECT is the next statement, so end before it
+                    actual_end = into_end + select_pos
+                    logger.debug(f"_parse_procedure_body_statements: Ending statement at position {actual_end} (before SELECT)")
+                else:
+                    # No SELECT found, try to find a semicolon
+                    semicolon_pos = after_text.find(';')
+                    if semicolon_pos >= 0:
+                        logger.debug(f"_parse_procedure_body_statements: Found semicolon at position {semicolon_pos} after INTO {temp_table}")
+                        # Check if this semicolon is actually the end of the statement
+                        # Look at what comes after the semicolon
+                        after_semicolon = after_text[semicolon_pos+1:semicolon_pos+100].strip()
+                        logger.debug(f"_parse_procedure_body_statements: After semicolon: {after_semicolon[:50]}")
+                        # If the next thing is SELECT on a new line, this is likely the end
+                        if re.match(r'\s*SELECT\s+', after_semicolon, re.IGNORECASE):
+                            logger.debug(f"_parse_procedure_body_statements: Semicolon is followed by SELECT, using it as end")
+                            actual_end = into_end + semicolon_pos + 1
+                        else:
+                            # The semicolon might be inside the statement, use limit
+                            logger.debug(f"_parse_procedure_body_statements: Semicolon is not followed by SELECT, might be inside statement, using limit")
+                            actual_end = min(len(preprocessed_body), into_end + 500)
+                    else:
+                        # No SELECT and no semicolon found, use limit
+                        logger.debug(f"_parse_procedure_body_statements: No SELECT and no semicolon found after INTO {temp_table}, using limit")
+                        actual_end = min(len(preprocessed_body), into_end + 500)
+                
+                # Extract the full statement
+                full_stmt = preprocessed_body[actual_with_start:actual_end].strip()
+                # Remove trailing semicolon if present
+                if full_stmt.endswith(';'):
+                    full_stmt = full_stmt[:-1].strip()
+                
+                if full_stmt:
+                    # Create a match-like object
+                    class MatchObj:
+                        def __init__(self, start, end, group_text):
+                            self._start = start
+                            self._end = end
+                            self._group_text = group_text
+                        def start(self):
+                            return self._start
+                        def end(self):
+                            return self._end
+                        def group(self, n):
+                            return self._group_text if n == 1 else None
+                    
+                    with_select_into_matches.append(MatchObj(actual_with_start, actual_end, full_stmt))
+                    logger.debug(f"_parse_procedure_body_statements: Found WITH ... SELECT ... INTO {temp_table} (start={actual_with_start}, end={actual_end}, length={len(full_stmt)})")
+                    # Show first 100 chars of extracted statement
+                    logger.debug(f"_parse_procedure_body_statements: First 100 chars: {full_stmt[:100]}")
+                    # Show last 100 chars of extracted statement
+                    logger.debug(f"_parse_procedure_body_statements: Last 100 chars: {full_stmt[-100:]}")
+        if with_select_into_matches:
+            logger.debug(f"_parse_procedure_body_statements: Found {len(with_select_into_matches)} WITH ... SELECT ... INTO statements")
+            for match_idx, match in enumerate(with_select_into_matches):
+                with_stmt = match.group(1).strip()
+                # Remove leading semicolon if present
+                if with_stmt.startswith(';'):
+                    with_stmt = with_stmt[1:].strip()
+                logger.debug(f"_parse_procedure_body_statements: Trying to parse WITH ... SELECT ... INTO #{match_idx+1} (length={len(with_stmt)})")
+                try:
+                    parsed = sqlglot.parse_one(with_stmt, read=self.dialect)
+                    if parsed:
+                        statements.append(parsed)
+                        logger.debug(f"_parse_procedure_body_statements: Successfully parsed WITH ... SELECT ... INTO #{match_idx+1} as {type(parsed).__name__}")
+                        # If parsed as Select, check if it has WITH clause
+                        if isinstance(parsed, exp.Select):
+                            # Check if this SELECT has a WITH clause - if so, process CTEs first
+                            with_clause = parsed.args.get('with')
+                            if with_clause:
+                                logger.debug(f"_parse_procedure_body_statements: Parsed Select has WITH clause, processing CTEs first")
+                                self._process_ctes(parsed)
+                                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from SELECT WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+                            if self._is_select_into(parsed):
+                                logger.debug(f"_parse_procedure_body_statements: Parsed Select has INTO, processing it now...")
+                                try:
+                                    obj = self._parse_select_into(parsed, object_hint)
+                                    if obj:
+                                        all_outputs.append(obj)
+                                        all_inputs.update(obj.dependencies or [])
+                                        logger.debug(f"_parse_procedure_body_statements: Successfully processed SELECT INTO, got obj: {obj.name}")
+                                except Exception as e:
+                                    logger.debug(f"_parse_procedure_body_statements: Failed to process SELECT INTO: {e}")
+                                    import traceback
+                                    logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
+                        elif isinstance(parsed, exp.With):
+                            # If parsed as With, process CTEs first
+                            if hasattr(parsed, 'this') and isinstance(parsed.this, exp.Select):
+                                logger.debug(f"_parse_procedure_body_statements: Parsed With has SELECT, processing CTEs first")
+                                self._process_ctes(parsed.this)
+                                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from WITH statement, cte_registry keys: {list(self.cte_registry.keys())}")
+                                if self._is_select_into(parsed.this):
+                                    logger.debug(f"_parse_procedure_body_statements: Parsed With has SELECT INTO, processing it now...")
+                                    try:
+                                        obj = self._parse_select_into(parsed.this, object_hint)
+                                        if obj:
+                                            all_outputs.append(obj)
+                                            all_inputs.update(obj.dependencies or [])
+                                            logger.debug(f"_parse_procedure_body_statements: Successfully processed SELECT INTO from With, got obj: {obj.name}")
+                                    except Exception as e:
+                                        logger.debug(f"_parse_procedure_body_statements: Failed to process SELECT INTO from With: {e}")
+                                        import traceback
+                                        logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
+                except Exception as e:
+                    logger.debug(f"_parse_procedure_body_statements: Failed to parse WITH ... SELECT ... INTO #{match_idx+1}: {e}")
+                    # Fallback: try to register temp table with columns extracted from SQL string
+                    try:
+                        # Find the specific INTO #table in this match
+                        temp_match = re.search(r'INTO\s+(#\w+)', match.group(1), re.IGNORECASE)
+                        if temp_match:
+                            temp_name = temp_match.group(1)
+                            # Extract column names from SELECT clause - look for SELECT ... INTO #temp_name pattern
+                            # Find the SELECT that immediately precedes this INTO #temp_name
+                            # We need to find the SELECT that is closest to this INTO
+                            into_pos = temp_match.start()
+                            # Look backwards from INTO to find the SELECT
+                            before_into = match.group(1)[:into_pos]
+                            # Find the last SELECT before INTO
+                            select_matches = list(re.finditer(r'(?is)\bSELECT\s+', before_into))
+                            if select_matches:
+                                # Use the last SELECT (closest to INTO)
+                                last_select = select_matches[-1]
+                                select_start = last_select.end()
+                                # Extract everything from SELECT to INTO
+                                select_to_into = match.group(1)[select_start:into_pos]
+                                # Extract column names
+                                col_names = []
+                                for col_expr in re.split(r',\s*(?![^()]*\))', select_to_into):
+                                    col_expr = col_expr.strip()
+                                    # Skip if empty or too short
+                                    if not col_expr or len(col_expr) < 2:
+                                        continue
+                                    # Remove AS alias if present
+                                    if ' AS ' in col_expr.upper():
+                                        col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
+                                    elif ' ' in col_expr and not col_expr.startswith('['):
+                                        # Might be alias without AS - take last word only if it's a simple identifier
+                                        parts = col_expr.split()
+                                        if len(parts) > 1:
+                                            # Only use last part if it's a simple identifier (no special chars, no keywords)
+                                            last_part = parts[-1].strip('[]').strip()
+                                            if last_part and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_part) and len(last_part) >= 2:
+                                                col_expr = last_part
+                                            else:
+                                                # Skip this column - it's too complex
+                                                continue
+                                    # Remove brackets
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove SQL comments (-- and /* */)
+                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL).strip()
+                                    # Remove newlines and tabs - if there are newlines, it's probably not a column name
+                                    if '\n' in col_expr or '\t' in col_expr or '\r' in col_expr:
+                                        continue
+                                    # Remove leading/trailing invalid characters
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove patterns like "abl.[column" -> "column"
+                                    if '.' in col_expr and '[' in col_expr:
+                                        parts = col_expr.split('.')
+                                        col_expr = parts[-1].strip('[]').strip()
+                                    # Validate: must be a valid column name (not SQL expression)
+                                    # Must be a simple identifier (letters, numbers, underscore only)
+                                    if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
+                                       re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', col_expr) and \
+                                       not col_expr.upper().startswith('SELECT') and \
+                                       not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS', 'GROUP', 'BY', 'ORDER', 'HAVING']) and \
+                                       col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING'] and \
+                                       not col_expr.startswith('(') and not col_expr.endswith(')') and \
+                                       not col_expr.endswith('--') and not col_expr.startswith('['):
+                                        col_names.append(col_expr)
+                                # Register temp table with extracted columns
+                                if col_names:
+                                    self.temp_registry[temp_name] = col_names
+                                    logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from WITH ... SELECT ... INTO fallback: {col_names[:5]}")
+                    except Exception as fallback_error:
+                        logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from WITH ... SELECT ... INTO fallback: {fallback_error}")
+        
+        # Process SELECT ... INTO without WITH
+        # Remove duplicates - same temp table might be found multiple times
+        if select_into_without_with_matches:
+            # Deduplicate by temp table name
+            seen_tables = set()
+            unique_matches = []
+            for match in select_into_without_with_matches:
+                # Extract temp table name from the statement
+                temp_match = re.search(r'INTO\s+(#\w+)', match.group(1), re.IGNORECASE)
+                if temp_match:
+                    temp_name = temp_match.group(1)
+                    if temp_name not in seen_tables:
+                        seen_tables.add(temp_name)
+                        unique_matches.append(match)
+            select_into_without_with_matches = unique_matches
+            
+            logger.debug(f"_parse_procedure_body_statements: Found {len(select_into_without_with_matches)} SELECT ... INTO statements (without WITH) after deduplication")
+            for match_idx, match in enumerate(select_into_without_with_matches):
+                select_stmt = match.group(1).strip()
+                if select_stmt.startswith(';'):
+                    select_stmt = select_stmt[1:].strip()
+                logger.debug(f"_parse_procedure_body_statements: Trying to parse SELECT ... INTO (without WITH) #{match_idx+1} (length={len(select_stmt)})")
+                try:
+                    parsed = sqlglot.parse_one(select_stmt, read=self.dialect)
+                    if parsed:
+                        statements.append(parsed)
+                        logger.debug(f"_parse_procedure_body_statements: Successfully parsed SELECT ... INTO (without WITH) #{match_idx+1} as {type(parsed).__name__}")
+                        if isinstance(parsed, exp.Select):
+                            if self._is_select_into(parsed):
+                                logger.debug(f"_parse_procedure_body_statements: Parsed Select has INTO, processing it now...")
+                                try:
+                                    obj = self._parse_select_into(parsed, object_hint)
+                                    if obj:
+                                        all_outputs.append(obj)
+                                        all_inputs.update(obj.dependencies or [])
+                                        logger.debug(f"_parse_procedure_body_statements: Successfully processed SELECT INTO (without WITH), got obj: {obj.name}")
+                                except Exception as e:
+                                    logger.debug(f"_parse_procedure_body_statements: Failed to process SELECT INTO (without WITH): {e}")
+                                    import traceback
+                                    logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
+                except Exception as e:
+                    logger.debug(f"_parse_procedure_body_statements: Failed to parse SELECT ... INTO (without WITH) #{match_idx+1}: {e}")
+                    # Fallback: try to register temp table with columns extracted from SQL string
+                    try:
+                        temp_match = re.search(r'INTO\s+(#\w+)', match.group(1), re.IGNORECASE)
+                        if temp_match:
+                            temp_name = temp_match.group(1)
+                            # Extract column names from SELECT clause using simple regex
+                            select_part = match.group(1)
+                            # Find SELECT ... INTO pattern
+                            col_match = re.search(r'(?is)SELECT\s+(.*?)\s+INTO\s+', select_part)
+                            if col_match:
+                                col_list_str = col_match.group(1)
+                                # Extract column names (simple approach - split by comma and take last part after AS or space)
+                                col_names = []
+                                for col_expr in re.split(r',\s*(?![^()]*\))', col_list_str):
+                                    col_expr = col_expr.strip()
+                                    # Skip if empty or too short
+                                    if not col_expr or len(col_expr) < 2:
+                                        continue
+                                    # Remove AS alias if present
+                                    if ' AS ' in col_expr.upper():
+                                        col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
+                                    elif ' ' in col_expr and not col_expr.startswith('['):
+                                        # Might be alias without AS - take last word only if it's a simple identifier
+                                        parts = col_expr.split()
+                                        if len(parts) > 1:
+                                            # Only use last part if it's a simple identifier (no special chars, no keywords)
+                                            last_part = parts[-1].strip('[]').strip()
+                                            if last_part and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_part) and len(last_part) >= 2:
+                                                col_expr = last_part
+                                            else:
+                                                # Skip this column - it's too complex
+                                                continue
+                                    # Remove brackets
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove SQL comments (-- and /* */)
+                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL).strip()
+                                    # Remove newlines and tabs - if there are newlines, it's probably not a column name
+                                    if '\n' in col_expr or '\t' in col_expr or '\r' in col_expr:
+                                        continue
+                                    # Remove leading/trailing invalid characters
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove patterns like "abl.[column" -> "column"
+                                    if '.' in col_expr and '[' in col_expr:
+                                        parts = col_expr.split('.')
+                                        col_expr = parts[-1].strip('[]').strip()
+                                    # Validate: must be a valid column name (not SQL expression)
+                                    # Must be a simple identifier (letters, numbers, underscore only)
+                                    if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
+                                       re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', col_expr) and \
+                                       not col_expr.upper().startswith('SELECT') and \
+                                       not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS', 'GROUP', 'BY', 'ORDER', 'HAVING']) and \
+                                       col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING'] and \
+                                       not col_expr.startswith('(') and not col_expr.endswith(')') and \
+                                       not col_expr.endswith('--') and not col_expr.startswith('['):
+                                        col_names.append(col_expr)
+                                # Register temp table with extracted columns
+                                if col_names:
+                                    self.temp_registry[temp_name] = col_names
+                                    logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SQL fallback: {col_names[:5]}")
+                    except Exception as fallback_error:
+                        logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from SQL fallback: {fallback_error}")
         
         # First try splitting by semicolon
         chunks = preprocessed_body.split(';')
@@ -424,33 +1277,544 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 expanded_chunks.append(chunk)
         
         # Now parse each chunk
-        for stmt_sql in expanded_chunks:
+        for chunk_idx, stmt_sql in enumerate(expanded_chunks):
             stmt_sql = stmt_sql.strip()
             if not stmt_sql or stmt_sql.upper() in ('GO', 'END'):
                 continue
+            # Check if this chunk contains SELECT INTO or UPDATE ... OUTPUT ... INTO
+            if 'INTO #' in stmt_sql or 'INTO #asefl_temp' in stmt_sql:
+                logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} contains 'INTO #' (length={len(stmt_sql)})")
+            # Check if this chunk contains UPDATE ... OUTPUT ... INTO
+            if 'UPDATE' in stmt_sql.upper() and 'OUTPUT' in stmt_sql.upper() and 'INTO #' in stmt_sql:
+                logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} contains UPDATE ... OUTPUT ... INTO (length={len(stmt_sql)})")
+                # Try to extract UPDATE ... OUTPUT ... INTO using string fallback
+                try:
+                    u_lineage, u_cols, u_deps, u_target = self._extract_update_from_lineage_string(stmt_sql)
+                    if u_target:
+                        out_lineage, out_cols, out_deps, out_target = self._extract_output_into_lineage_string(stmt_sql)
+                        if out_target:
+                            # Create ObjectInfo for OUTPUT ... INTO target (temp table)
+                            ns_out, nm_out = self._ns_and_name(out_target, obj_type_hint="temp_table")
+                            out_schema = TableSchema(namespace=ns_out, name=nm_out, columns=out_cols or [])
+                            out_obj = ObjectInfo(
+                                name=nm_out,
+                                object_type="temp_table",
+                                schema=out_schema,
+                                lineage=out_lineage or [],
+                                dependencies=out_deps or set()
+                            )
+                            all_outputs.append(out_obj)
+                            all_inputs.update(out_deps or set())
+                            logger.debug(f"_parse_procedure_body_statements: Parsed UPDATE ... OUTPUT ... INTO from chunk {chunk_idx+1}, got obj: {out_obj.name}, dependencies={out_obj.dependencies}, lineage={len(out_obj.lineage)} columns")
+                        # Also create ObjectInfo for UPDATE target (persistent table)
+                        if u_target:
+                            ns_tgt, nm_tgt = self._ns_and_name(u_target, obj_type_hint="table")
+                            tgt_schema = TableSchema(namespace=ns_tgt, name=nm_tgt, columns=u_cols or [])
+                            tgt_obj = ObjectInfo(
+                                name=nm_tgt,
+                                object_type="table",
+                                schema=tgt_schema,
+                                lineage=u_lineage or [],
+                                dependencies=u_deps or set()
+                            )
+                            all_outputs.append(tgt_obj)
+                            all_inputs.update(u_deps or set())
+                            logger.debug(f"_parse_procedure_body_statements: Parsed UPDATE from chunk {chunk_idx+1}, got obj: {tgt_obj.name}, dependencies={tgt_obj.dependencies}, lineage={len(tgt_obj.lineage)} columns")
+                except Exception as e:
+                    logger.debug(f"_parse_procedure_body_statements: Failed to parse UPDATE ... OUTPUT ... INTO from chunk {chunk_idx+1}: {e}")
+                    # Fallback: try to register temp table with columns extracted from OUTPUT ... INTO
+                    try:
+                        # Extract OUTPUT ... INTO #table pattern
+                        output_into_match = re.search(r'(?is)OUTPUT\s+(.*?)\s+INTO\s+(#\w+)', stmt_sql, re.IGNORECASE)
+                        if output_into_match:
+                            temp_name = output_into_match.group(2)
+                            output_cols_str = output_into_match.group(1)
+                            # Extract column names from OUTPUT clause
+                            col_names = []
+                            for col_expr in re.split(r',\s*(?![^()]*\))', output_cols_str):
+                                col_expr = col_expr.strip()
+                                # Handle inserted.column or deleted.column
+                                if '.' in col_expr:
+                                    col_expr = col_expr.split('.')[-1]
+                                # Remove brackets
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove SQL comments (-- and /* */)
+                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL).strip()
+                                    # Remove leading/trailing invalid characters
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove patterns like "abl.[column" -> "column"
+                                    if '.' in col_expr and '[' in col_expr:
+                                        parts = col_expr.split('.')
+                                        col_expr = parts[-1].strip('[]').strip()
+                                    # Validate: must be a valid column name (not SQL expression)
+                                    if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
+                                       not col_expr.upper().startswith('SELECT') and \
+                                       not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS']) and \
+                                       col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE'] and \
+                                       not col_expr.startswith('(') and not col_expr.endswith(')') and \
+                                       not col_expr.endswith('--') and not col_expr.startswith('['):
+                                        col_names.append(col_expr)
+                            # Register temp table with extracted columns
+                            if col_names:
+                                self.temp_registry[temp_name] = col_names
+                                logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from UPDATE ... OUTPUT ... INTO fallback: {col_names[:5]}")
+                    except Exception as fallback_error:
+                        logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from UPDATE ... OUTPUT ... INTO fallback: {fallback_error}")
             try:
                 parsed = sqlglot.parse_one(stmt_sql, read=self.dialect)
                 if parsed:
                     statements.append(parsed)
-            except Exception:
+                    if chunk_idx < 5:  # Log first 5 parsed statements
+                        logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} parsed as {type(parsed).__name__}")
+                else:
+                    if 'INTO #' in stmt_sql:
+                        logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} with 'INTO #' failed to parse")
+            except Exception as e:
                 # Skip unparseable statements
+                if 'INTO #' in stmt_sql:
+                    logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} with 'INTO #' raised exception: {e}")
+                    # Fallback: try to register temp table with columns extracted from SQL
+                    try:
+                        # Try UPDATE ... OUTPUT ... INTO first
+                        if 'UPDATE' in stmt_sql.upper() and 'OUTPUT' in stmt_sql.upper():
+                            output_into_match = re.search(r'(?is)OUTPUT\s+(.*?)\s+INTO\s+(#\w+)', stmt_sql, re.IGNORECASE)
+                            if output_into_match:
+                                temp_name = output_into_match.group(2)
+                                output_cols_str = output_into_match.group(1)
+                                col_names = []
+                                for col_expr in re.split(r',\s*(?![^()]*\))', output_cols_str):
+                                    col_expr = col_expr.strip()
+                                    if '.' in col_expr:
+                                        col_expr = col_expr.split('.')[-1]
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove SQL comments (-- and /* */)
+                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL).strip()
+                                    # Remove leading/trailing invalid characters
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove patterns like "abl.[column" -> "column"
+                                    if '.' in col_expr and '[' in col_expr:
+                                        parts = col_expr.split('.')
+                                        col_expr = parts[-1].strip('[]').strip()
+                                    # Validate: must be a valid column name (not SQL expression)
+                                    if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
+                                       not col_expr.upper().startswith('SELECT') and \
+                                       not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS']) and \
+                                       col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE'] and \
+                                       not col_expr.startswith('(') and not col_expr.endswith(')') and \
+                                       not col_expr.endswith('--') and not col_expr.startswith('['):
+                                        col_names.append(col_expr)
+                                if col_names:
+                                    self.temp_registry[temp_name] = col_names
+                                    logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from UPDATE ... OUTPUT ... INTO fallback (chunk exception): {col_names[:5]}")
+                        # Try SELECT ... INTO
+                        else:
+                            select_into_match = re.search(r'(?is)SELECT\s+(.*?)\s+INTO\s+(#\w+)', stmt_sql, re.IGNORECASE)
+                            if select_into_match:
+                                temp_name = select_into_match.group(2)
+                                col_list_str = select_into_match.group(1)
+                                col_names = []
+                                for col_expr in re.split(r',\s*(?![^()]*\))', col_list_str):
+                                    col_expr = col_expr.strip()
+                                    # Skip if empty or too short
+                                    if not col_expr or len(col_expr) < 2:
+                                        continue
+                                    # Remove newlines and tabs - if there are newlines, it's probably not a column name
+                                    if '\n' in col_expr or '\t' in col_expr or '\r' in col_expr:
+                                        continue
+                                    # Remove AS alias if present
+                                    if ' AS ' in col_expr.upper():
+                                        col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
+                                    elif ' ' in col_expr and not col_expr.startswith('['):
+                                        # Might be alias without AS - take last word only if it's a simple identifier
+                                        parts = col_expr.split()
+                                        if len(parts) > 1:
+                                            # Only use last part if it's a simple identifier (no special chars, no keywords)
+                                            last_part = parts[-1].strip('[]').strip()
+                                            if last_part and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_part) and len(last_part) >= 2:
+                                                col_expr = last_part
+                                            else:
+                                                # Skip this column - it's too complex
+                                                continue
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove SQL comments (-- and /* */)
+                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL).strip()
+                                    # Remove leading/trailing invalid characters
+                                    col_expr = col_expr.strip('[]').strip()
+                                    # Remove patterns like "abl.[column" -> "column"
+                                    if '.' in col_expr and '[' in col_expr:
+                                        parts = col_expr.split('.')
+                                        col_expr = parts[-1].strip('[]').strip()
+                                    # Validate: must be a valid column name (not SQL expression)
+                                    # Must be a simple identifier (letters, numbers, underscore only)
+                                    if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
+                                       re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', col_expr) and \
+                                       not col_expr.upper().startswith('SELECT') and \
+                                       not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS', 'GROUP', 'BY', 'ORDER', 'HAVING']) and \
+                                       col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING'] and \
+                                       not col_expr.startswith('(') and not col_expr.endswith(')') and \
+                                       not col_expr.endswith('--') and not col_expr.startswith('['):
+                                        col_names.append(col_expr)
+                                if col_names:
+                                    self.temp_registry[temp_name] = col_names
+                                    logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SELECT ... INTO fallback (chunk exception): {col_names[:5]}")
+                    except Exception as fallback_error:
+                        logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from chunk exception fallback: {fallback_error}")
                 continue
-    except Exception:
+    except Exception as e:
+        logger.debug(f"_parse_procedure_body_statements: Exception during parsing: {e}")
         statements = []
     
-    all_outputs = []
-    all_inputs: Set[str] = set()
     last_persistent_output = None
     best_match_output = None
     
-    for statement in statements:
-        if isinstance(statement, exp.Insert):
+    logger.debug(f"_parse_procedure_body_statements: Parsed {len(statements)} statements from body")
+    
+    for i, statement in enumerate(statements):
+        stmt_type = type(statement).__name__
+        if i < 10:  # Log first 10 statements
+            logger.debug(f"_parse_procedure_body_statements: Statement {i+1}: {stmt_type}")
+        
+        # Handle WITH statement that contains SELECT INTO
+        if isinstance(statement, exp.With):
+            logger.debug(f"_parse_procedure_body_statements: Found WITH statement in body")
+            # Check if the SELECT inside WITH has INTO
+            if hasattr(statement, 'this') and isinstance(statement.this, exp.Select):
+                logger.debug(f"_parse_procedure_body_statements: WITH statement has SELECT as this, checking for INTO...")
+                if self._is_select_into(statement.this):
+                    logger.debug(f"_parse_procedure_body_statements: Found SELECT INTO inside WITH in body")
+                    obj = self._parse_select_into(statement.this, object_hint)
+                    if obj:
+                        all_outputs.append(obj)
+                        all_inputs.update(obj.dependencies or [])
+                else:
+                    logger.debug(f"_parse_procedure_body_statements: SELECT inside WITH does not have INTO")
+            # Check if WITH contains INSERT (WITH ... INSERT INTO ...)
+            elif hasattr(statement, 'this') and isinstance(statement.this, exp.Insert):
+                # Process CTEs from the WITH clause before parsing INSERT
+                self._process_ctes(statement)
+                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from WITH ... INSERT, cte_registry keys: {list(self.cte_registry.keys())}")
+                # Now parse the INSERT
+                if self._is_insert_exec(statement.this):
+                    obj = self._parse_insert_exec(statement.this, object_hint)
+                else:
+                    obj = self._parse_insert_select(statement.this, object_hint)
+                if obj:
+                    logger.debug(f"_parse_procedure_body_statements: Parsed INSERT INTO from WITH ... INSERT, got obj: {obj.name}, dependencies={obj.dependencies}, lineage={len(obj.lineage)} columns")
+                    all_outputs.append(obj)
+                    # Skip temp tables
+                    if obj.name.startswith("#") or "tempdb" in obj.name.lower():
+                        all_inputs.update(obj.dependencies or [])
+                        continue
+                    # Skip auxiliary tables
+                    table_basename = obj.name.split('.')[-1].lower()
+                    if any(suffix in table_basename for suffix in ['_ins_upd_results', '_results', '_log', '_audit']):
+                        all_inputs.update(obj.dependencies or [])
+                        continue
+                    # This is a candidate persistent table
+                    last_persistent_output = obj
+                    proc_basename = object_hint.split('.')[-1].lower() if object_hint else ""
+                    if proc_basename.startswith('update_') or proc_basename.startswith('load_'):
+                        expected_table = proc_basename.replace('update_', '').replace('load_', '')
+                        if table_basename == expected_table or table_basename.endswith(expected_table):
+                            best_match_output = obj
+                    all_inputs.update(obj.dependencies or [])
+                continue
+            else:
+                # WITH statement without SELECT INTO or INSERT - process CTEs for later use
+                self._process_ctes(statement)
+                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from standalone WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+        # Handle SELECT ... INTO #tmp
+        elif isinstance(statement, exp.Select) and self._is_select_into(statement):
+            logger.debug(f"_parse_procedure_body_statements: Found SELECT INTO in body")
+            obj = self._parse_select_into(statement, object_hint)
+            if obj:
+                all_outputs.append(obj)
+                all_inputs.update(obj.dependencies or [])
+        # Handle UPDATE ... OUTPUT ... INTO
+        elif isinstance(statement, exp.Update):
+            logger.debug(f"_parse_procedure_body_statements: Found UPDATE statement")
+            # Check if UPDATE has OUTPUT ... INTO clause
+            if hasattr(statement, 'returning') and statement.returning:
+                # Try to extract UPDATE ... OUTPUT ... INTO lineage
+                try:
+                    update_sql = str(statement)
+                    u_lineage, u_cols, u_deps, u_target = self._extract_update_from_lineage_string(update_sql)
+                    if u_target:
+                        # Also check for OUTPUT ... INTO
+                        out_lineage, out_cols, out_deps, out_target = self._extract_output_into_lineage_string(update_sql)
+                        if out_target:
+                            # Create ObjectInfo for OUTPUT ... INTO target (temp table)
+                            ns_out, nm_out = self._ns_and_name(out_target, obj_type_hint="temp_table")
+                            out_schema = TableSchema(namespace=ns_out, name=nm_out, columns=out_cols or [])
+                            out_obj = ObjectInfo(
+                                name=nm_out,
+                                object_type="temp_table",
+                                schema=out_schema,
+                                lineage=out_lineage or [],
+                                dependencies=out_deps or set()
+                            )
+                            all_outputs.append(out_obj)
+                            all_inputs.update(out_deps or set())
+                            logger.debug(f"_parse_procedure_body_statements: Parsed UPDATE ... OUTPUT ... INTO, got obj: {out_obj.name}, dependencies={out_obj.dependencies}, lineage={len(out_obj.lineage)} columns")
+                    # Also create ObjectInfo for UPDATE target (persistent table)
+                    if u_target:
+                        ns_tgt, nm_tgt = self._ns_and_name(u_target, obj_type_hint="table")
+                        tgt_schema = TableSchema(namespace=ns_tgt, name=nm_tgt, columns=u_cols or [])
+                        tgt_obj = ObjectInfo(
+                            name=nm_tgt,
+                            object_type="table",
+                            schema=tgt_schema,
+                            lineage=u_lineage or [],
+                            dependencies=u_deps or set()
+                        )
+                        all_outputs.append(tgt_obj)
+                        all_inputs.update(u_deps or set())
+                        # Check if this is a candidate persistent table
+                        table_basename = nm_tgt.split('.')[-1].lower()
+                        if not any(suffix in table_basename for suffix in ['_ins_upd_results', '_results', '_log', '_audit']):
+                            last_persistent_output = tgt_obj
+                            proc_basename = object_hint.split('.')[-1].lower() if object_hint else ""
+                            if proc_basename.startswith('update_') or proc_basename.startswith('load_'):
+                                expected_table = proc_basename.replace('update_', '').replace('load_', '')
+                                if table_basename == expected_table or table_basename.endswith(expected_table):
+                                    best_match_output = tgt_obj
+                        logger.debug(f"_parse_procedure_body_statements: Parsed UPDATE, got obj: {tgt_obj.name}, dependencies={tgt_obj.dependencies}, lineage={len(tgt_obj.lineage)} columns")
+                except Exception as e:
+                    logger.debug(f"_parse_procedure_body_statements: Failed to parse UPDATE: {e}")
+                    import traceback
+                    logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
+        # Handle INSERT INTO
+        elif isinstance(statement, exp.Insert):
+            logger.debug(f"_parse_procedure_body_statements: Found INSERT statement, target={self._get_table_name(statement.this, object_hint) if hasattr(statement, 'this') else 'unknown'}")
+            # Check if INSERT has a parent WITH clause (CTE defined before INSERT)
+            parent = getattr(statement, 'parent', None)
+            if isinstance(parent, exp.With):
+                # Process CTEs from the parent WITH clause before parsing INSERT
+                self._process_ctes(parent)
+                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from parent WITH for INSERT, cte_registry keys: {list(self.cte_registry.keys())}")
+            # Also check if previous statement was a WITH (CTE defined before INSERT in separate statement)
+            elif i > 0 and isinstance(statements[i-1], exp.With):
+                # Process CTEs from the previous WITH statement
+                self._process_ctes(statements[i-1])
+                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from previous WITH statement for INSERT, cte_registry keys: {list(self.cte_registry.keys())}")
+            # Also check if INSERT is inside a WITH statement (WITH ... INSERT INTO ...)
+            # This happens when SQLGlot parses "WITH ... INSERT INTO ..." as exp.With containing exp.Insert
+            # but the INSERT is not a direct child - we need to walk up the tree
+            else:
+                # Walk up the tree to find a WITH parent
+                current = statement
+                while current:
+                    current_parent = getattr(current, 'parent', None)
+                    if isinstance(current_parent, exp.With):
+                        # Process CTEs from the WITH clause
+                        self._process_ctes(current_parent)
+                        logger.debug(f"_parse_procedure_body_statements: Processed CTEs from WITH parent (walked up tree) for INSERT, cte_registry keys: {list(self.cte_registry.keys())}")
+                        break
+                    current = current_parent
+                # Fallback: if CTE registry is still empty, try to extract CTE from SQL string
+                if not self.cte_registry:
+                    logger.debug(f"_parse_procedure_body_statements: CTE registry is empty, trying SQL string fallback for INSERT")
+                    try:
+                        # Get the SQL string for this INSERT statement
+                        insert_sql = str(statement)
+                        logger.debug(f"_parse_procedure_body_statements: INSERT SQL (first 200 chars): {insert_sql[:200]}")
+                        # Check if INSERT SQL itself contains WITH clause
+                        if 'WITH' in insert_sql.upper() and 'AS' in insert_sql.upper():
+                            logger.debug(f"_parse_procedure_body_statements: INSERT SQL contains WITH clause, trying to parse it")
+                            # Try to parse the WITH clause from INSERT SQL
+                            try:
+                                # Find "WITH name AS (" pattern
+                                with_start_match = re.search(r'(?is)WITH\s+(\w+)\s+AS\s*\(', insert_sql)
+                                if with_start_match:
+                                    cte_name = with_start_match.group(1)
+                                    with_start_pos = with_start_match.start()
+                                    logger.debug(f"_parse_procedure_body_statements: Found WITH {cte_name} in INSERT SQL at position {with_start_pos}")
+                                    # Find the matching closing parenthesis
+                                    paren_count = 0
+                                    paren_pos = with_start_match.end() - 1  # Position of opening (
+                                    with_end_pos = -1
+                                    for i in range(paren_pos, len(insert_sql)):
+                                        if insert_sql[i] == '(':
+                                            paren_count += 1
+                                        elif insert_sql[i] == ')':
+                                            paren_count -= 1
+                                            if paren_count == 0:
+                                                # Found matching closing parenthesis
+                                                with_end_pos = i + 1
+                                                break
+                                    
+                                    if with_end_pos > 0:
+                                        with_stmt_str = insert_sql[with_start_pos:with_end_pos]
+                                        logger.debug(f"_parse_procedure_body_statements: Extracted WITH statement (length={len(with_stmt_str)}, first 200 chars: {with_stmt_str[:200]})")
+                                        # Try to parse the WITH statement
+                                        try:
+                                            # Add INSERT to make it a complete statement
+                                            complete_with = f"{with_stmt_str} INSERT INTO dummy SELECT * FROM {cte_name}"
+                                            parsed_stmt = sqlglot.parse_one(complete_with, read=self.dialect)
+                                            # SQLGlot may parse "WITH ... INSERT INTO ..." as exp.Insert with WITH clause
+                                            if isinstance(parsed_stmt, exp.With):
+                                                self._process_ctes(parsed_stmt)
+                                                logger.debug(f"_parse_procedure_body_statements: Processed CTEs from INSERT SQL WITH clause (exp.With), cte_registry keys: {list(self.cte_registry.keys())}")
+                                            elif isinstance(parsed_stmt, exp.Insert):
+                                                # Check if INSERT has a WITH clause
+                                                if hasattr(parsed_stmt, 'with') and getattr(parsed_stmt, 'with', None):
+                                                    self._process_ctes(parsed_stmt)
+                                                    logger.debug(f"_parse_procedure_body_statements: Processed CTEs from INSERT SQL WITH clause (exp.Insert.with), cte_registry keys: {list(self.cte_registry.keys())}")
+                                                else:
+                                                    # Try to extract WITH from the original statement
+                                                    logger.debug(f"_parse_procedure_body_statements: Parsed statement is exp.Insert but has no WITH clause, trying to extract FROM clause from CTE definition")
+                                                    # Extract FROM clause from CTE definition
+                                                    # Look for FROM followed by table name (may be temp table with or without #, with or without brackets)
+                                                    # Pattern: FROM [whitespace] [optional bracket] [optional #] table_name [optional bracket]
+                                                    from_match = re.search(rf'(?is)FROM\s+(\[?#?[\w]+\]?)', with_stmt_str, re.IGNORECASE)
+                                                    if from_match:
+                                                        from_table = from_match.group(1).strip().strip('[]')
+                                                        # Check if it's a temp table (starts with # or is in temp_registry)
+                                                        temp_table_name = from_table if from_table.startswith('#') else f"#{from_table}"
+                                                        if from_table.startswith('#') or (temp_table_name in self.temp_registry):
+                                                            logger.debug(f"_parse_procedure_body_statements: CTE {cte_name} sources temp table {temp_table_name} (from INSERT SQL string, with_stmt_str length={len(with_stmt_str)})")
+                                                            # Create a simple SELECT statement that references the temp table
+                                                            try:
+                                                                temp_select = sqlglot.parse_one(f"SELECT * FROM {temp_table_name}", read=self.dialect)
+                                                                if isinstance(temp_select, exp.Select):
+                                                                    # Store the CTE definition in registry
+                                                                    self.cte_registry[cte_name] = {
+                                                                        'columns': [],
+                                                                        'definition': temp_select
+                                                                    }
+                                                                    logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} with temp table {temp_table_name} dependency, cte_registry keys: {list(self.cte_registry.keys())}")
+                                                            except Exception as reg_error:
+                                                                logger.debug(f"_parse_procedure_body_statements: Failed to register CTE: {reg_error}")
+                                                        else:
+                                                            logger.debug(f"_parse_procedure_body_statements: FROM table {from_table} is not a temp table (not in temp_registry: {list(self.temp_registry.keys())[:5]})")
+                                                    else:
+                                                        logger.debug(f"_parse_procedure_body_statements: No FROM clause found in CTE definition for {cte_name}, with_stmt_str (last 200 chars): {with_stmt_str[-200:]}")
+                                            else:
+                                                logger.debug(f"_parse_procedure_body_statements: Parsed statement is not exp.With or exp.Insert, type: {type(parsed_stmt).__name__}")
+                                        except Exception as parse_error:
+                                            logger.debug(f"_parse_procedure_body_statements: Failed to parse WITH from INSERT SQL: {parse_error}")
+                                            # If parsing fails, try to extract CTE dependencies from the SQL string
+                                            # Look for FROM clause in the CTE definition
+                                            from_match = re.search(rf'(?is)FROM\s+([^\s\)]+)', with_stmt_str, re.IGNORECASE)
+                                            if from_match:
+                                                from_table = from_match.group(1).strip().strip('[]')
+                                                # Check if it's a temp table
+                                                if from_table.startswith('#'):
+                                                    logger.debug(f"_parse_procedure_body_statements: CTE {cte_name} sources temp table {from_table} (from INSERT SQL string)")
+                                                    # Try to create a minimal CTE definition for registry
+                                                    # We'll store just the temp table dependency
+                                                    try:
+                                                        # Create a simple SELECT statement that references the temp table
+                                                        temp_select = sqlglot.parse_one(f"SELECT * FROM {from_table}", read=self.dialect)
+                                                        if isinstance(temp_select, exp.Select):
+                                                            # Store the CTE definition in registry
+                                                            self.cte_registry[cte_name] = {
+                                                                'columns': [],
+                                                                'definition': temp_select
+                                                            }
+                                                            logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} with temp table {from_table} dependency")
+                                                    except Exception as reg_error:
+                                                        logger.debug(f"_parse_procedure_body_statements: Failed to register CTE: {reg_error}")
+                                    else:
+                                        logger.debug(f"_parse_procedure_body_statements: Could not find matching closing parenthesis for WITH {cte_name} in INSERT SQL")
+                            except Exception as e:
+                                logger.debug(f"_parse_procedure_body_statements: Exception extracting WITH from INSERT SQL: {e}")
+                        
+                        # Also try to find WITH in preprocessed_body before INSERT
+                        insert_target = self._get_table_name(statement.this, object_hint) if hasattr(statement, 'this') else 'unknown'
+                        # Try different search patterns
+                        search_patterns = [
+                            f"INSERT INTO {insert_target}",
+                            f"INSERT INTO [dbo].[{insert_target.split('.')[-1]}]",
+                            f"INSERT INTO dbo.{insert_target.split('.')[-1]}",
+                            insert_target.split('.')[-1] if '.' in insert_target else insert_target
+                        ]
+                        insert_pos = -1
+                        for pattern in search_patterns:
+                            insert_pos = preprocessed_body.find(pattern)
+                            if insert_pos > 0:
+                                logger.debug(f"_parse_procedure_body_statements: Found '{pattern}' at position: {insert_pos}")
+                                break
+                        
+                        if insert_pos > 0:
+                            # Look backwards for WITH clause
+                            before_insert = preprocessed_body[:insert_pos]
+                            logger.debug(f"_parse_procedure_body_statements: Before INSERT (last 500 chars): {before_insert[-500:]}")
+                            # Find the last WITH statement before this INSERT
+                            # Use a pattern that finds WITH ... AS (...) followed by INSERT
+                            # We need to handle nested parentheses, so we'll use a simpler approach:
+                            # Find "WITH name AS" and then find the matching closing parenthesis
+                            with_pattern = r'(?is);?\s*WITH\s+(\w+)\s+AS\s*\('
+                            with_start_match = re.search(with_pattern, before_insert)
+                            if with_start_match:
+                                cte_name = with_start_match.group(1)
+                                with_start_pos = with_start_match.start()
+                                logger.debug(f"_parse_procedure_body_statements: Found WITH {cte_name} at position {with_start_pos}")
+                                # Find the matching closing parenthesis
+                                # Count opening and closing parentheses
+                                paren_count = 0
+                                paren_pos = with_start_match.end() - 1  # Position of opening (
+                                for i in range(paren_pos, len(before_insert)):
+                                    if before_insert[i] == '(':
+                                        paren_count += 1
+                                    elif before_insert[i] == ')':
+                                        paren_count -= 1
+                                        if paren_count == 0:
+                                            # Found matching closing parenthesis
+                                            with_end_pos = i + 1
+                                            with_stmt_str = before_insert[with_start_pos:with_end_pos]
+                                            logger.debug(f"_parse_procedure_body_statements: Extracted WITH statement (length={len(with_stmt_str)}, first 200 chars: {with_stmt_str[:200]})")
+                                            with_match = True
+                                            break
+                                else:
+                                    # Didn't find matching closing parenthesis in before_insert, try to find it after INSERT
+                                    logger.debug(f"_parse_procedure_body_statements: Could not find matching closing parenthesis in before_insert, trying after INSERT")
+                                    with_match = False
+                            else:
+                                logger.debug(f"_parse_procedure_body_statements: No WITH pattern found before INSERT")
+                                with_match = False
+                            
+                            if with_match and 'with_stmt_str' in locals():
+                                logger.debug(f"_parse_procedure_body_statements: Found WITH {cte_name} before INSERT in SQL string, trying to parse it")
+                                # Try to parse the WITH statement
+                                try:
+                                    with_stmt = sqlglot.parse_one(with_stmt_str, read=self.dialect)
+                                    if isinstance(with_stmt, exp.With):
+                                        self._process_ctes(with_stmt)
+                                        logger.debug(f"_parse_procedure_body_statements: Processed CTEs from SQL string fallback, cte_registry keys: {list(self.cte_registry.keys())}")
+                                except Exception as parse_error:
+                                    logger.debug(f"_parse_procedure_body_statements: Failed to parse WITH from SQL string: {parse_error}")
+                                    # If parsing fails, try to extract CTE dependencies from the SQL string
+                                    # Look for FROM clause in the CTE definition
+                                    from_match = re.search(rf'(?is)WITH\s+{re.escape(cte_name)}\s+AS\s*\([^)]*FROM\s+([^\s\)]+)', with_stmt_str, re.IGNORECASE)
+                                    if from_match:
+                                        from_table = from_match.group(1).strip().strip('[]')
+                                        # Check if it's a temp table
+                                        if from_table.startswith('#'):
+                                            # Register the CTE with the temp table as source
+                                            logger.debug(f"_parse_procedure_body_statements: CTE {cte_name} sources temp table {from_table} (from SQL string)")
+                                            # We can't fully process the CTE without AST, but we can at least note the dependency
+                    except Exception as e:
+                        logger.debug(f"_parse_procedure_body_statements: Exception in CTE fallback: {e}")
+                        import traceback
+                        logger.debug(f"_parse_procedure_body_statements: CTE fallback traceback: {traceback.format_exc()}")
+                else:
+                    logger.debug(f"_parse_procedure_body_statements: CTE registry is not empty, skipping fallback. Keys: {list(self.cte_registry.keys())}")
             if self._is_insert_exec(statement):
                 obj = self._parse_insert_exec(statement, object_hint)
             else:
+                # Log details before parsing INSERT SELECT
+                raw_target = self._get_table_name(statement.this, object_hint) if hasattr(statement, 'this') else None
+                has_expression = hasattr(statement, 'expression') and statement.expression is not None
+                expr_type = type(statement.expression).__name__ if has_expression else 'None'
+                logger.debug(f"_parse_procedure_body_statements: About to parse INSERT SELECT, raw_target={raw_target}, has_expression={has_expression}, expr_type={expr_type}")
                 obj = self._parse_insert_select(statement, object_hint)
             
             if obj:
+                logger.debug(f"_parse_procedure_body_statements: Parsed INSERT INTO, got obj: {obj.name}, dependencies={obj.dependencies}, lineage={len(obj.lineage)} columns")
                 all_outputs.append(obj)
                 # Skip temp tables
                 if obj.name.startswith("#") or "tempdb" in obj.name.lower():
@@ -481,8 +1845,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     
     # If we found persistent outputs, return the best one
     if result_output:
-        # Restore context
-        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+        # DON'T restore context - it's needed for temp table canonical naming in engine.py Phase 3
+        # The context will be restored when the next file is parsed (in parse_sql_file)
+        # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return result_output
     
     # Fallback: return basic procedure info with dependencies from all statements
@@ -504,6 +1869,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     )
     obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
     
-    # Restore context
-    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+    # DON'T restore context before returning - it's needed for temp table canonical naming in engine.py
+    # The context will be restored when the next file is parsed (in parse_sql_file)
+    logger.debug(f"_parse_procedure_body_statements: Before return, context: _ctx_db={getattr(self, '_ctx_db', None)}, _ctx_obj={getattr(self, '_ctx_obj', None)}")
+    # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
     return obj

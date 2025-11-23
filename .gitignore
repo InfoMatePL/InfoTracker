@@ -40,3 +40,7 @@ examples/warehouse/sql2
 
 *.txt
 examples/warehouse/recursion
+
+# Katalogi Input i Output - nie commitujemy ich do git
+Input/
+Output/

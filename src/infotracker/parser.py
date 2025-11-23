@@ -273,12 +273,24 @@ class SqlParser:
         """Parse a SQL file and extract object information."""
         from .openlineage_utils import sanitize_name
         
+        logger.debug(f"parse_sql_file: Called with object_hint={object_hint}")
+        
         # Track current file for log context. If engine pre-set _current_file (real file path), keep it.
         prev_file = self._current_file
         if not self._current_file:
             self._current_file = object_hint or prev_file
-        # Reset current database to default for each file
-        self.current_database = self.default_database
+        # Extract and set database from USE statement BEFORE any parsing
+        # This ensures temp tables and other objects use the correct database context
+        try:
+            db_from_use = self._extract_database_from_use_statement(sql_content)
+            if db_from_use:
+                self.current_database = db_from_use
+            else:
+                # Reset current database to default for each file if no USE statement
+                self.current_database = self.default_database
+        except Exception:
+            # Reset current database to default for each file on error
+            self.current_database = self.default_database
         # Keep the raw SQL for DB inference when object name lacks explicit DB
         self._current_raw_sql = sql_content
         # Diagnostics: log RETURNS...AS window (escaped) after lightweight normalization
@@ -297,6 +309,10 @@ class SqlParser:
         self.temp_lineage.clear()
         self._proc_acc.clear()
         self._temp_version.clear()
+        # DON'T reset context here - it may be set by engine.py from Phase 1 and needed for Phase 3
+        # The context will be set by _parse_procedure_string or _parse_create_procedure if needed
+        # self._ctx_db = None
+        # self._ctx_obj = None
         
         try:
             # dbt mode: compiled SELECT-only models; derive target name from filename
@@ -417,6 +433,7 @@ class SqlParser:
             create_function_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\b"])
             create_procedure_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\b", r"\bCREATE\s+(?:OR\s+ALTER\s+)?PROC\b"])
             create_table_count = _count([r"\bCREATE\s+(?:OR\s+ALTER\s+)?TABLE\b"])
+            logger.debug(f"parse_sql_file: create_function_count={create_function_count}, create_procedure_count={create_procedure_count}, create_table_count={create_table_count}")
 
             if create_table_count == 1 and all(x == 0 for x in [create_function_count, create_procedure_count]):
                 # spróbuj najpierw AST; jeśli SQLGlot zwróci Command albo None — fallback stringowy
@@ -440,16 +457,21 @@ class SqlParser:
                     stmts = sqlglot.parse(preprocessed_sql, read=self.dialect) or []
                     st = stmts[0] if stmts else None
                     if st and isinstance(st, exp.Create) and (getattr(st, "kind", "") or "").upper() == "PROCEDURE":
+                        logger.debug(f"parse_sql_file: Using AST parsing for procedure")
                         return self._parse_create_procedure(st, object_hint)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"parse_sql_file: AST parsing failed for procedure: {e}")
                 # AST failed - try extracting procedure body and parsing statements directly
                 try:
                     body_sql = self._extract_procedure_body(sql_content)
                     if body_sql:
-                        return self._parse_procedure_body_statements(body_sql, object_hint, sql_content)
-                except Exception:
-                    pass
+                        logger.debug(f"parse_sql_file: Using _parse_procedure_body_statements fallback")
+                        result = self._parse_procedure_body_statements(body_sql, object_hint, sql_content)
+                        logger.debug(f"parse_sql_file: After _parse_procedure_body_statements, context: _ctx_db={getattr(self, '_ctx_db', None)}, _ctx_obj={getattr(self, '_ctx_obj', None)}")
+                        return result
+                except Exception as e:
+                    logger.debug(f"parse_sql_file: _parse_procedure_body_statements failed: {e}")
+                logger.debug(f"parse_sql_file: Falling back to _parse_procedure_string")
                 return self._parse_procedure_string(sql_content, object_hint)
             
             # If it's multiple functions but no procedures, process the first function as primary
@@ -467,6 +489,8 @@ class SqlParser:
             # This will also extract and set current_database from USE statements
             normalized_sql = self._normalize_tsql(sql_content)
             preprocessed_sql = self._preprocess_sql(normalized_sql)
+            
+            logger.debug(f"parse_sql_file: Multi-statement processing path")
             
             # For files with complex IF/ELSE blocks, also try string-based extraction
             # This is needed for demo scripts like 96_demo_usage_tvf_and_proc.sql
@@ -505,6 +529,19 @@ class SqlParser:
             for statement in statements:
                 if isinstance(statement, exp.Create):
                     # This is the main object being created
+                    # IMPORTANT: Set context for procedures before parsing, so temp tables can use it
+                    if (getattr(statement, "kind", "") or "").upper() == "PROCEDURE":
+                        # Extract procedure name and set context
+                        try:
+                            raw_proc = self._get_table_name(statement.this, object_hint)
+                            ns, nm = self._ns_and_name(raw_proc, obj_type_hint="procedure")
+                            procedure_name = nm
+                            # Set context before parsing procedure
+                            self._ctx_db = self.current_database or self.default_database
+                            self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
+                            logger.debug(f"parse_sql_file: Set context for procedure in multi-statement: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}")
+                        except Exception:
+                            pass
                     obj = self._parse_create_statement(statement, object_hint)
                     if obj.object_type in ["table", "view", "function", "procedure"]:
                         last_persistent_output = obj
@@ -669,6 +706,7 @@ class SqlParser:
                 pass
             # Restore previous file context before returning
             self._current_file = prev_file
+            logger.debug(f"parse_sql_file: Before return, context: _ctx_db={getattr(self, '_ctx_db', None)}, _ctx_obj={getattr(self, '_ctx_obj', None)}")
             return obj
     
     def _is_select_into(self, statement: exp.Select) -> bool:
@@ -698,6 +736,7 @@ class SqlParser:
     
     def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE TABLE, CREATE VIEW, CREATE FUNCTION, or CREATE PROCEDURE statement."""
+        logger.debug(f"_parse_create_statement: kind={getattr(statement, 'kind', '')}, object_hint={object_hint}")
         if statement.kind == "TABLE":
             return self._parse_create_table(statement, object_hint)
         elif statement.kind == "VIEW":
@@ -705,7 +744,10 @@ class SqlParser:
         elif statement.kind == "FUNCTION":
             return self._parse_create_function(statement, object_hint)
         elif statement.kind == "PROCEDURE":
-            return self._parse_create_procedure(statement, object_hint)
+            logger.debug(f"_parse_create_statement: Calling _parse_create_procedure")
+            result = self._parse_create_procedure(statement, object_hint)
+            logger.debug(f"_parse_create_statement: After _parse_create_procedure, context: _ctx_db={getattr(self, '_ctx_db', None)}, _ctx_obj={getattr(self, '_ctx_obj', None)}")
+            return result
         else:
             raise ValueError(f"Unsupported CREATE statement: {statement.kind}")
     

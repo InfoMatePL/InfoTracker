@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import logging
 from typing import Optional, List, Set
 
 import sqlglot
 from sqlglot import expressions as exp
 
 from ..models import TableSchema, ColumnSchema, ObjectInfo, ColumnLineage, TransformationType
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -320,6 +323,7 @@ def _parse_create_function(self, statement: exp.Create, object_hint: Optional[st
 
 
 def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
+    logger.debug(f"_parse_create_procedure: Called with object_hint={object_hint}")
     raw_proc = self._get_table_name(statement.this, object_hint)
     ns, nm = self._ns_and_name(raw_proc, obj_type_hint="procedure")
     namespace = ns
@@ -348,12 +352,15 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     except Exception:
         pass
 
-    # Update context after potential namespace adjustment
+    # Update context BEFORE extracting procedure outputs, so temp tables can use it
+    # This ensures temp tables get proper canonical names like DB.schema.procedure.#temp
     try:
         self._ctx_db = (namespace.rsplit('/', 1)[-1]) if isinstance(namespace, str) else (self.current_database or self.default_database)
     except Exception:
         self._ctx_db = (self.current_database or self.default_database)
-    self._ctx_obj = procedure_name
+    # Normalize procedure_name to ensure it's in schema.table format
+    self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
+    logger.debug(f"_parse_create_procedure: Set context: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}, procedure_name={procedure_name}")
 
     materialized_outputs = self._extract_procedure_outputs(statement)
     if not materialized_outputs:
@@ -365,8 +372,9 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
             ns_tgt, nm_tgt = self._ns_and_name(m_target, obj_type_hint="table")
             schema = TableSchema(namespace=namespace or ns_tgt, name=nm_tgt, columns=m_cols)
             out_obj = ObjectInfo(name=nm_tgt, object_type="table", schema=schema, lineage=m_lineage, dependencies=m_deps)
-            # Restore context before returning
-            self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+            # DON'T restore context before returning - it's needed for temp table canonical naming in engine.py
+            # The context will be restored when the next file is parsed (in parse_sql_file)
+            # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
             return out_obj
 
     if materialized_outputs:
@@ -438,8 +446,9 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
             last_output.dependencies = deps_expanded
         except Exception:
             pass
-        # Restore context before returning
-        self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+        # DON'T restore context before returning - it's needed for temp table canonical naming in engine.py
+        # The context will be restored when the next file is parsed (in parse_sql_file)
+        # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return last_output
 
     lineage, output_columns, dependencies = self._extract_procedure_lineage(statement, procedure_name)
@@ -447,8 +456,9 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     self.schema_registry.register(schema)
     obj = ObjectInfo(name=procedure_name, object_type="procedure", schema=schema, lineage=lineage, dependencies=dependencies)
     obj.no_output_reason = "ONLY_PROCEDURE_RESULTSET"
-    # Restore context before returning
-    self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+    # DON'T restore context before returning - it's needed for temp table canonical naming in engine.py
+    # The context will be restored when the next file is parsed (in parse_sql_file)
+    # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
     return obj
 
 
@@ -491,6 +501,7 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
     outputs: List[ObjectInfo] = []
 
     # First try AST walk to find SELECT ... INTO and INSERT ... (SELECT|EXEC)
+    found_inserts = set()  # Track which INSERT INTO were found by AST walk
     try:
         for node in statement.walk():
             # SELECT ... INTO ...
@@ -504,6 +515,10 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
             # INSERT ... (SELECT | EXEC)
             elif isinstance(node, exp.Insert):
                 try:
+                    # Get the target table name for tracking
+                    raw_target = self._get_table_name(node.this, None) if hasattr(node, 'this') else None
+                    if raw_target:
+                        found_inserts.add(raw_target.lower().strip('[]'))
                     if self._is_insert_exec(node):
                         obj = self._parse_insert_exec(node)
                     else:
@@ -515,10 +530,8 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
     except Exception:
         pass
 
-    if outputs:
-        return outputs
-
-    # Fallback to previous regex-based heuristic (persistent tables only)
+    # Fallback to regex-based heuristic for INSERT INTO that weren't found by AST walk
+    # This handles cases where INSERT INTO are inside blocks (TRY-CATCH, IF, etc.) that AST walk doesn't find
     sql_text = str(statement)
 
     try:
@@ -544,27 +557,86 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
                 ))
 
         # Look for INSERT INTO patterns (non-temp tables)
-        insert_into_pattern = r'INSERT\s+INTO\s+([^\s,\(]+)'
-        insert_into_matches = re.findall(insert_into_pattern, sql_text, flags=re.IGNORECASE)
-        for table_match in insert_into_matches:
-            table_name = table_match.strip()
+        # Use a more comprehensive pattern that captures the full INSERT INTO ... SELECT statement
+        insert_into_pattern = r'INSERT\s+INTO\s+([^\s,\(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b'
+        insert_into_matches = list(re.finditer(insert_into_pattern, sql_text, flags=re.IGNORECASE | re.DOTALL))
+        for match in insert_into_matches:
+            # Extract table name and properly handle square brackets
+            # e.g., [dbo].[AccountBalance_LNK_BV] -> dbo.AccountBalance_LNK_BV
+            # or dbo.TrialBalance_asefl_BV -> dbo.TrialBalance_asefl_BV
+            raw_table_name = match.group(1).strip()
+            # Remove square brackets but preserve the structure
+            table_name = re.sub(r'\[([^\]]+)\]', r'\1', raw_table_name)
             # Skip temp tables in fallback
             if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
+                # Check if this INSERT was already found by AST walk
+                table_name_lower = table_name.lower()
+                # Extract just the table name part (without schema) for comparison
+                table_simple = table_name_lower.split('.')[-1] if '.' in table_name_lower else table_name_lower
+                # Check if any found_inserts contains this table name
+                already_found = any(table_simple in found or found in table_simple for found in found_inserts)
+                if already_found:
+                    continue  # Skip if already found by AST walk
                 normalized_name = self._normalize_table_name_for_output(table_name)
-                # Avoid duplicates from SELECT INTO detection
+                # Avoid duplicates from SELECT INTO detection and AST walk
                 if not any(output.name == normalized_name for output in outputs):
                     db = self.current_database or self.default_database or "InfoTrackerDW"
-                    outputs.append(ObjectInfo(
-                        name=normalized_name,
-                        object_type="table",
-                        schema=TableSchema(
+                    # Try to extract lineage using string fallback
+                    try:
+                        # Extract the full INSERT INTO ... SELECT statement
+                        insert_start = match.start()
+                        # Find the end of the SELECT statement (look for semicolon or end of statement)
+                        insert_end = sql_text.find(';', insert_start)
+                        if insert_end == -1:
+                            insert_end = len(sql_text)
+                        insert_sql = sql_text[insert_start:insert_end]
+                        # Use _extract_insert_select_lineage_string to get lineage
+                        # This method is available on the parser instance
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"_extract_procedure_outputs: Trying to extract lineage for INSERT INTO {table_name}, insert_sql length={len(insert_sql)}, first 200 chars: {insert_sql[:200]}")
+                        lineage, deps = self._extract_insert_select_lineage_string(insert_sql, table_name)
+                        logger.debug(f"_extract_procedure_outputs: Extracted {len(lineage)} columns, {len(deps)} dependencies for INSERT INTO {table_name}")
+                        # Get output columns from INSERT column list or infer from lineage
+                        output_columns = []
+                        if lineage:
+                            output_columns = [ColumnSchema(name=lin.output_column, data_type='unknown', nullable=True, ordinal=i) for i, lin in enumerate(lineage)]
+                        else:
+                            # Try to extract columns from INSERT column list
+                            cols_match = re.search(r'INSERT\s+INTO\s+[^\s(]+\s*\(([^)]+)\)', insert_sql, re.IGNORECASE)
+                            if cols_match:
+                                cols = [col.strip().strip('[]') for col in cols_match.group(1).split(',')]
+                                output_columns = [ColumnSchema(name=col, data_type='unknown', nullable=True, ordinal=i) for i, col in enumerate(cols)]
+                        schema = TableSchema(
                             namespace=self._canonical_namespace(db),
                             name=normalized_name,
-                            columns=[]
-                        ),
-                        lineage=[],
-                        dependencies=set()
-                    ))
+                            columns=output_columns
+                        )
+                        self.schema_registry.register(schema)
+                        outputs.append(ObjectInfo(
+                            name=normalized_name,
+                            object_type="table",
+                            schema=schema,
+                            lineage=lineage,
+                            dependencies=deps
+                        ))
+                    except Exception as e:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"_extract_procedure_outputs: Failed to extract lineage for INSERT INTO {table_name}: {e}")
+                        # Fallback to object without lineage
+                        db = self.current_database or self.default_database or "InfoTrackerDW"
+                        outputs.append(ObjectInfo(
+                            name=normalized_name,
+                            object_type="table",
+                            schema=TableSchema(
+                                namespace=self._canonical_namespace(db),
+                                name=normalized_name,
+                                columns=[]
+                            ),
+                            lineage=[],
+                            dependencies=set()
+                        ))
     except Exception:
         pass
 

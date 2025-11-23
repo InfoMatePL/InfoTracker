@@ -176,10 +176,15 @@ def _cut_to_first_statement(self, sql: str) -> str:
 
 
 def _preprocess_sql(self, sql: str) -> str:
+    # Only set current_database from USE if it's not already set
+    # This preserves the database set by parse_sql_file before preprocessing
     db_from_use = _extract_database_from_use_statement(self, sql)
     if db_from_use:
-        self.current_database = db_from_use
-    else:
+        # Only update if not already set (preserve from parse_sql_file)
+        if not self.current_database:
+            self.current_database = db_from_use
+    elif not self.current_database:
+        # Only reset to default if not already set
         self.current_database = self.default_database
 
     lines = (sql or "").split('\n')

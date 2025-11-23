@@ -21,11 +21,49 @@ def _is_insert_exec(self, statement: exp.Insert) -> bool:
 
 
 def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] = None) -> ObjectInfo:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.debug(f"_parse_select_into: Called with object_hint={object_hint}")
+    
     into_expr = statement.args.get('into')
     if not into_expr:
         raise ValueError("SELECT INTO requires INTO clause")
 
-    raw_target = self._get_table_name(into_expr, object_hint)
+    # Handle exp.Into - extract the table name from .this
+    # SQLGlot parses INTO #table as INTO TEMPORARY table (drops the #)
+    # We need to check the original SQL to detect # prefix
+    raw_target = None
+    is_temp = False
+    
+    # Check original SQL string for # symbol (SQLGlot drops it)
+    try:
+        original_sql = str(statement.sql(dialect=self.dialect))
+        # Look for INTO #pattern in original SQL
+        import re as _re
+        into_match = _re.search(r'\bINTO\s+#(\w+)', original_sql, _re.IGNORECASE)
+        if into_match:
+            is_temp = True
+            temp_name = into_match.group(1)
+            raw_target = f"#{temp_name}"
+    except Exception:
+        pass
+    
+    # If not found in SQL, try to extract from AST
+    if not raw_target:
+        if hasattr(into_expr, 'this'):
+            raw_target = self._get_table_name(into_expr.this, object_hint)
+            # Check if it's a temp table by checking if name matches temp pattern
+            # SQLGlot may have converted #table to TEMPORARY table
+            if hasattr(into_expr, 'temporary') and getattr(into_expr, 'temporary', False):
+                is_temp = True
+                if not raw_target.startswith('#') and 'tempdb' not in raw_target.lower():
+                    raw_target = f"#{raw_target.split('.')[-1]}"
+        else:
+            raw_target = object_hint or "unknown"
+    
+    # Final check: if raw_target doesn't start with # but we detected it as temp, add #
+    if is_temp and raw_target and not raw_target.startswith('#') and 'tempdb' not in raw_target.lower():
+        raw_target = f"#{raw_target.split('.')[-1]}"
     try:
         parts = (raw_target or "").split('.')
         if len(parts) >= 3 and self.registry:
@@ -33,12 +71,45 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
             self.registry.learn_from_targets(f"{sch}.{tbl}", db)
     except Exception:
         pass
-    ns, nm = self._ns_and_name(raw_target, obj_type_hint="table")
+    # Use correct obj_type_hint based on whether it's a temp table
+    obj_type = "temp_table" if (is_temp or (raw_target and (raw_target.startswith('#') or 'tempdb' in raw_target.lower()))) else "table"
+    ns, nm = self._ns_and_name(raw_target, obj_type_hint=obj_type)
     namespace = ns
     table_name = nm
 
+    # Process CTEs before extracting lineage (CTEs need to be registered for column lineage extraction)
+    # Check if this SELECT is part of a WITH statement (parent is exp.With)
+    # If so, process CTEs from the parent
+    parent = getattr(statement, 'parent', None)
+    if isinstance(parent, exp.With):
+        # If parent is exp.With, the actual SELECT is in parent.this
+        if hasattr(parent, 'this') and isinstance(parent.this, exp.Select):
+            self._process_ctes(parent.this)
+    elif isinstance(statement, exp.Select):
+        # Check if statement has CTEs directly using args.get('with')
+        with_clause = statement.args.get('with')
+        if with_clause:
+            self._process_ctes(statement)
+    elif isinstance(statement, exp.With) and hasattr(statement, 'this'):
+        # If statement itself is exp.With, process CTEs from the SELECT inside
+        if isinstance(statement.this, exp.Select):
+            self._process_ctes(statement.this)
+
     dependencies = self._extract_dependencies(statement)
-    lineage, output_columns = self._extract_column_lineage(statement, table_name)
+    logger.debug(f"_parse_select_into: dependencies={dependencies}, raw_target={raw_target}")
+    
+    # Use the actual SELECT statement for lineage extraction (handle WITH clause)
+    select_stmt = statement.this if isinstance(statement, exp.With) else statement
+    logger.debug(f"_parse_select_into: select_stmt type={type(select_stmt).__name__}, has_with={bool(select_stmt.args.get('with') if isinstance(select_stmt, exp.Select) else False)}")
+    
+    logger.debug(f"_parse_select_into: About to extract column lineage for {table_name}, select_stmt type: {type(select_stmt).__name__}")
+    lineage, output_columns = self._extract_column_lineage(select_stmt, table_name)
+    logger.debug(f"_parse_select_into: lineage count={len(lineage or [])}, output_columns count={len(output_columns or [])}")
+    if lineage:
+        for lin in lineage[:3]:  # Show first 3 lineage items
+            logger.debug(f"_parse_select_into: lineage item: {lin.output_column} -> {len(lin.input_fields or [])} input_fields")
+    else:
+        logger.debug(f"_parse_select_into: No lineage extracted for {table_name}")
 
     if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
         simple_key = self._extract_temp_name(raw_target if '#' in raw_target else '#' + raw_target)
@@ -66,14 +137,53 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
         self.temp_sources[simple_key] = base_sources
         try:
             col_map = {lin.output_column: list(lin.input_fields or []) for lin in (lineage or [])}
+            logger.debug(f"_parse_select_into: temp_lineage for {simple_key}: {len(col_map)} columns")
+            for col_name, refs in list(col_map.items())[:3]:  # Show first 3 columns
+                logger.debug(f"_parse_select_into: temp_lineage[{simple_key}][{col_name}]: {len(refs)} references")
             self.temp_lineage[ver_key] = col_map
             self.temp_lineage[simple_key] = col_map
-        except Exception:
+            logger.debug(f"_parse_select_into: Stored temp_lineage for {simple_key}: {len(col_map)} columns, ver_key={ver_key}")
+        except Exception as e:
+            logger.debug(f"_parse_select_into: Exception storing temp_lineage: {e}")
+            logger.debug(f"_parse_select_into: Exception storing temp_lineage for {simple_key}: {e}")
             pass
 
     final_dependencies: Set[str] = set()
     for d in dependencies:
         is_dep_temp = ('#' in d or 'tempdb' in d.lower())
+        # Check if this dependency is a CTE (should not be added as a dependency)
+        # Only check if cte_registry exists and is not empty
+        is_cte = False
+        if hasattr(self, 'cte_registry') and self.cte_registry:
+            dep_simple = d.split('.')[-1] if '.' in d else d
+            # Only treat as CTE if it's explicitly in cte_registry (case-insensitive)
+            cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
+            is_cte = dep_simple and dep_simple.lower() in cte_registry_lower
+        if is_cte:
+            # This is a CTE - don't add it as a dependency, expand it to base sources instead
+            dep_simple = d.split('.')[-1] if '.' in d else d
+            logger.debug(f"_parse_select_into: Skipping CTE {dep_simple} from dependencies, will expand to base sources")
+            cte_name = cte_registry_lower.get(dep_simple.lower())
+            if cte_name:
+                cte_info = self.cte_registry.get(cte_name)
+                if cte_info:
+                    if isinstance(cte_info, dict) and 'definition' in cte_info:
+                        cte_def = cte_info['definition']
+                    elif isinstance(cte_info, exp.Select):
+                        cte_def = cte_info
+                    else:
+                        cte_def = None
+                    if cte_def and isinstance(cte_def, exp.Select):
+                        cte_deps = self._extract_dependencies(cte_def)
+                        # Add base sources from CTE (excluding temp tables and CTEs)
+                        for cte_dep in cte_deps:
+                            cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
+                            is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in self.temp_registry)
+                            is_cte_dep_cte = cte_dep_simple and cte_dep_simple.lower() in cte_registry_lower
+                            if not is_cte_dep_temp and not is_cte_dep_cte:
+                                final_dependencies.add(cte_dep)
+                                logger.debug(f"_parse_select_into: Added base source {cte_dep} from CTE {cte_name}")
+            continue
         if not is_dep_temp:
             final_dependencies.add(d)
         else:
@@ -177,6 +287,8 @@ def _parse_insert_exec(self, statement: exp.Insert, object_hint: Optional[str] =
 
 
 def _parse_insert_select(self, statement: exp.Insert, object_hint: Optional[str] = None) -> Optional[ObjectInfo]:
+    import logging
+    logger = logging.getLogger(__name__)
     from ..openlineage_utils import sanitize_name
     raw_target = self._get_table_name(statement.this, object_hint)
     try:
@@ -191,9 +303,100 @@ def _parse_insert_select(self, statement: exp.Insert, object_hint: Optional[str]
     table_name = nm
     select_expr = statement.expression
     if not isinstance(select_expr, exp.Select):
-        return None
+        logger.debug(f"_parse_insert_select: select_expr is not a Select, type={type(select_expr).__name__}")
+        # Try to get SELECT from statement.args if expression is None
+        if select_expr is None:
+            select_expr = statement.args.get('expression')
+            if isinstance(select_expr, exp.Select):
+                logger.debug(f"_parse_insert_select: Found SELECT in statement.args.expression")
+            else:
+                # Try to get SELECT from statement.args.get('this') or statement.args.get('query')
+                select_expr = statement.args.get('this') or statement.args.get('query')
+                if isinstance(select_expr, exp.Select):
+                    logger.debug(f"_parse_insert_select: Found SELECT in statement.args.this/query")
+        if not isinstance(select_expr, exp.Select):
+            # Fallback: try to extract lineage from SQL string
+            logger.debug(f"_parse_insert_select: Still no Select found, trying string fallback")
+            try:
+                insert_sql = str(statement)
+                logger.debug(f"_parse_insert_select: INSERT SQL (first 200 chars): {insert_sql[:200]}")
+                # Use string-based fallback
+                # Use raw_target for matching (actual table name from SQL) instead of table_name (which may have procedure prefix)
+                logger.debug(f"_parse_insert_select: Calling _extract_insert_select_lineage_string with table_name={table_name}, raw_target={raw_target}")
+                # Try with raw_target first (actual table name from SQL), then fallback to table_name
+                lineage, deps = self._extract_insert_select_lineage_string(insert_sql, raw_target or table_name)
+                logger.debug(f"_parse_insert_select: _extract_insert_select_lineage_string returned {len(lineage)} columns, {len(deps)} dependencies")
+                if lineage or deps:
+                    logger.debug(f"_parse_insert_select: String fallback found {len(lineage)} columns, {len(deps)} dependencies")
+                    # Get output columns from INSERT column list or infer from lineage
+                    output_columns = []
+                    if hasattr(statement, 'this') and hasattr(statement.this, 'expressions'):
+                        # Try to get columns from INSERT column list
+                        for col_expr in statement.this.expressions:
+                            if hasattr(col_expr, 'name'):
+                                output_columns.append(ColumnSchema(name=col_expr.name, data_type='unknown', nullable=True, ordinal=len(output_columns)))
+                    if not output_columns:
+                        # Infer from lineage
+                        output_columns = [ColumnSchema(name=lin.output_column, data_type='unknown', nullable=True, ordinal=i) for i, lin in enumerate(lineage)]
+                    if not output_columns:
+                        # Last resort: try to extract from SQL
+                        from ..parser_modules import string_fallbacks as _sf
+                        output_columns = _sf._extract_basic_select_columns(insert_sql)
+                    schema = TableSchema(namespace=namespace, name=table_name, columns=output_columns)
+                    self.schema_registry.register(schema)
+                    return ObjectInfo(
+                        name=table_name,
+                        object_type="table",
+                        schema=schema,
+                        lineage=lineage,
+                        dependencies=deps
+                    )
+            except Exception as fallback_error:
+                logger.debug(f"_parse_insert_select: String fallback failed: {fallback_error}")
+                import traceback
+                logger.debug(f"_parse_insert_select: Traceback: {traceback.format_exc()}")
+            logger.debug(f"_parse_insert_select: Still no Select found, returning None")
+            return None
+    
+    # Check if INSERT statement has a parent WITH clause (CTE defined before INSERT)
+    # SQLGlot may parse "WITH ... INSERT INTO ..." as exp.With containing exp.Insert
+    parent = getattr(statement, 'parent', None)
+    if isinstance(parent, exp.With):
+        # Process CTEs from the parent WITH clause
+        self._process_ctes(parent.this if hasattr(parent, 'this') and isinstance(parent.this, exp.Select) else parent)
+        logger.debug(f"_parse_insert_select: Processed CTEs from parent WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+    # Also check if the INSERT statement itself has a WITH clause
+    elif hasattr(statement, 'with') and getattr(statement, 'with', None):
+        self._process_ctes(statement)
+        logger.debug(f"_parse_insert_select: Processed CTEs from INSERT WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+    
     dependencies = self._extract_dependencies(select_expr)
+    logger.debug(f"_parse_insert_select: target={table_name}, dependencies={dependencies}")
+    
+    # Process CTEs before extracting lineage (CTEs need to be registered for column lineage extraction)
+    if isinstance(select_expr, exp.Select):
+        # Check if statement has CTEs directly using args.get('with')
+        with_clause = select_expr.args.get('with')
+        if with_clause:
+            self._process_ctes(select_expr)
+            logger.debug(f"_parse_insert_select: Processed CTEs from SELECT WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+    elif isinstance(select_expr, exp.With) and hasattr(select_expr, 'this'):
+        # If statement itself is exp.With, process CTEs from the SELECT inside
+        if isinstance(select_expr.this, exp.Select):
+            self._process_ctes(select_expr.this)
+            logger.debug(f"_parse_insert_select: Processed CTEs from SELECT WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+    
+    # For INSERT INTO, we need to use direct sources from FROM clause, not expanded temp_lineage
+    # Set flag to use direct references for temp tables
+    old_use_direct_ref = getattr(self, '_use_direct_temp_ref', False)
+    self._use_direct_temp_ref = True
+    
     lineage, output_columns = self._extract_column_lineage(select_expr, table_name)
+    logger.debug(f"_parse_insert_select: lineage has {len(lineage)} columns, first few: {[(l.output_column, [str(f) for f in (l.input_fields or [])[:3]]) for l in lineage[:5]]}")
+    
+    # Restore flag
+    self._use_direct_temp_ref = old_use_direct_ref
+    
     table_name = sanitize_name(table_name)
     raw_is_temp = bool(raw_target and (str(raw_target).startswith('#') or 'tempdb' in str(raw_target)))
     if raw_is_temp:

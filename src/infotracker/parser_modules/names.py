@@ -44,25 +44,59 @@ def _split_fqn(self, fqn: str) -> Tuple[Optional[str], Optional[str], Optional[s
 
 def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
     if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
-        # Extract clean temp table name (remove context like DB.procedure.#temp or DB.[procedure].#temp)
-        # Use current database context, not tempdb
-        db = self.current_database or self.default_database or "InfoTrackerDW"
+        # Use canonical temp name which includes procedure context when available
+        # Format: DB.schema.object.#temp[@v] or just #temp[@v] if no context
+        try:
+            canonical = self._canonical_temp_name(table_name)
+        except Exception:
+            canonical = table_name
         
-        # Find the temp table name
-        if '.' in table_name:
-            parts = table_name.split('.')
-            for part in reversed(parts):
+        # Parse canonical name to extract DB, schema, object, and temp name
+        # Format: EDW_CORE.dbo.update_asefl_TrialBalance_BV.#asefl_temp
+        # Or: #asefl_temp (if no context)
+        if '.' in canonical:
+            parts = canonical.split('.')
+            # Find the part with '#' (temp table name)
+            temp_idx = -1
+            for i, part in enumerate(parts):
+                if '#' in part:
+                    temp_idx = i
+                    break
+            
+            if temp_idx >= 0:
+                # Extract temp name (may include version like #temp@1)
+                temp_part = parts[temp_idx]
                 # Remove square brackets if present
-                clean_part = part.strip('[]')
-                if '#' in clean_part:
-                    clean_temp = clean_part if clean_part.startswith('#') else f"#{clean_part.lstrip('#')}"
-                    return f"mssql://localhost/{db}", f"dbo.{clean_temp}"
+                temp_part = temp_part.strip('[]')
+                if not temp_part.startswith('#'):
+                    temp_part = f"#{temp_part.lstrip('#')}"
+                
+                if temp_idx >= 2:
+                    # Full format: DB.schema.object.#temp or DB.schema.#temp
+                    db = parts[0]
+                    schema = parts[1]
+                    # If temp_idx > 2, there's an object name between schema and temp
+                    if temp_idx > 2:
+                        obj_name = '.'.join(parts[2:temp_idx])
+                        # Combine schema.object#temp (without dot before #)
+                        name = f"{schema}.{obj_name}{temp_part}"
+                    else:
+                        # Format: DB.schema.#temp (no object name)
+                        name = f"{schema}.{temp_part}"
+                    return f"mssql://localhost/{db.upper()}", name
+                elif temp_idx == 1:
+                    # Format: schema.#temp
+                    db = self.current_database or self.default_database or "InfoTrackerDW"
+                    schema = parts[0]
+                    name = f"{schema}.{temp_part}"
+                    return f"mssql://localhost/{db.upper()}", name
         
-        # Simple case: #temp
-        clean_temp = table_name.strip('[]')
+        # Simple case: #temp (no context or parsing failed)
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        clean_temp = canonical.strip('[]')
         if not clean_temp.startswith('#'):
             clean_temp = f"#{clean_temp.lstrip('#')}"
-        return f"mssql://localhost/{db}", f"dbo.{clean_temp}"
+        return f"mssql://localhost/{db.upper()}", f"dbo.{clean_temp}"
     raw_parts = (table_name or "").split('.')
     parts = [p for p in raw_parts if p != ""]
     pseudo = {"view", "function", "procedure", "table", "storedprocedure"}

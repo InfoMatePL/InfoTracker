@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import re
+import logging
 import sqlglot
 from sqlglot import expressions as exp
 from typing import List, Set, Optional, Dict
 from ..models import ColumnLineage, ColumnSchema, ColumnReference, TransformationType, ObjectInfo, TableSchema
+
+logger = logging.getLogger(__name__)
 
 
 def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
@@ -51,51 +54,238 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
     Searches for ALL INSERT INTO patterns and matches against object_name to handle
     procedures with multiple INSERT statements (temp tables + persistent tables).
     """
+    import logging
+    logger = logging.getLogger(__name__)
     lineage: List[ColumnLineage] = []
     dependencies: Set[str] = set()
     s = self._strip_sql_comments(self._normalize_tsql(sql_content))
     
     # Normalize object_name for comparison (strip schema/db prefix if present)
-    target_simple = object_name.split('.')[-1].lower()
+    # Remove square brackets from target
+    target_simple = object_name.split('.')[-1].lower().strip('[]')
+    # target_simple might contain procedure prefix like "update_asefl_TrialBalance_BV"
+    # We need to extract just the table name part for comparison
+    # Try to find the actual table name by checking if target_simple ends with a known table pattern
+    # For now, we'll use a flexible matching approach: check if table_simple matches the end of target_simple
+    
+    logger.debug(f"_extract_insert_select_lineage_string: Looking for INSERT INTO target={target_simple}, object_name={object_name}")
+    logger.debug(f"_extract_insert_select_lineage_string: SQL (first 500 chars): {sql_content[:500]}")
     
     # Find ALL INSERT INTO ... SELECT patterns (using finditer instead of search)
     pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
     
-    for match in re.finditer(pattern_with_terminator, s):
+    matches = list(re.finditer(pattern_with_terminator, s))
+    logger.debug(f"_extract_insert_select_lineage_string: Found {len(matches)} INSERT INTO ... SELECT patterns")
+    
+    for match_idx, match in enumerate(matches):
         table_ref = match.group(1).strip()
         select_part = match.group(2)
         
         # Normalize table reference for comparison
         table_simple = table_ref.split('.')[-1].lower().strip('[]')
+        logger.debug(f"_extract_insert_select_lineage_string: Match {match_idx+1}: table_ref={table_ref}, table_simple={table_simple}, target_simple={target_simple}")
         
         # Skip temp tables (unless target is also temp)
         if table_simple.startswith('#') and not target_simple.startswith('#'):
+            logger.debug(f"_extract_insert_select_lineage_string: Skipping temp table {table_simple}")
             continue
         
         # Check if this INSERT matches our target table
-        if table_simple != target_simple:
+        # Try exact match first, then check if table_simple is at the end of target_simple
+        # (to handle cases where target_simple has procedure prefix like "update_asefl_TrialBalance_BV")
+        # Since we now use raw_target (actual table name from SQL), exact match should work in most cases
+        # Also handle cases where target_simple might be missing parts (e.g., "update_asefl_accountbalance_bv" vs "accountbalance_lnk_bv")
+        # or where table names differ slightly (e.g., "AccountBalance_LNK_BV" vs "AccountBalance_BV")
+        matches_target = (table_simple == target_simple or 
+                         target_simple.endswith('_' + table_simple) or
+                         target_simple.endswith(table_simple) or
+                         # Check if table_simple is contained in target_simple (for cases like "update_asefl_accountbalance_bv" containing "accountbalance_lnk_bv")
+                         (table_simple in target_simple and len(table_simple) > 5) or
+                         # Check if they share a common suffix (for cases like "accountbalance_lnk_bv" vs "accountbalance_bv")
+                         (len(table_simple) > 5 and len(target_simple) > 5 and 
+                          (table_simple[-5:] in target_simple or target_simple[-5:] in table_simple)))
+        if not matches_target:
+            logger.debug(f"_extract_insert_select_lineage_string: Table {table_simple} doesn't match target {target_simple}, skipping")
             continue
         
+        logger.debug(f"_extract_insert_select_lineage_string: Found matching INSERT INTO {table_simple}, extracting lineage from SELECT (first 200 chars): {select_part[:200]}")
+        
         # Found matching INSERT - extract lineage from SELECT
-        select_sql = "SELECT " + select_part
+        # Check if there's a WITH clause before this specific INSERT (CTE defined before INSERT INTO)
+        # Find the position of this specific INSERT INTO in the original SQL
+        insert_pos = match.start()
+        select_sql = None
+        cte_sql = None
+        cte_name = None
+        if insert_pos > 0:
+            # Look for WITH clause before this INSERT, but only within reasonable distance (5000 chars)
+            search_start = max(0, insert_pos - 5000)
+            before_insert = sql_content[search_start:insert_pos]
+            # Look for WITH clause that might be used in the SELECT (e.g., HashesCalculated)
+            # Try to find the most recent WITH clause before this INSERT
+            with_pattern = r'(?is)(WITH\s+(\w+)\s+AS\s*\()'
+            with_matches = list(re.finditer(with_pattern, before_insert))
+            if with_matches:
+                # Use the last (most recent) WITH clause before this INSERT
+                with_match = with_matches[-1]
+                cte_name = with_match.group(2)
+                # Check if the SELECT uses this CTE (check if CTE name appears in FROM clause)
+                if cte_name.lower() in select_part.lower():
+                    # Extract the full CTE definition by finding matching closing parenthesis
+                    cte_start = with_match.start() + search_start
+                    # Find the matching closing parenthesis
+                    paren_count = 0
+                    cte_end = cte_start
+                    for i, char in enumerate(sql_content[cte_start:], start=cte_start):
+                        if char == '(':
+                            paren_count += 1
+                        elif char == ')':
+                            paren_count -= 1
+                            if paren_count == 0:
+                                cte_end = i + 1
+                                break
+                    if cte_end > cte_start:
+                        # Extract full CTE SQL and combine with SELECT to create valid SQL
+                        cte_sql = sql_content[cte_start:cte_end]
+                        # Combine CTE with SELECT to create valid SQL that can be parsed
+                        select_sql = cte_sql + " SELECT " + select_part
+                        logger.debug(f"_extract_insert_select_lineage_string: Found WITH clause {cte_name} before INSERT, combining with SELECT")
+        
+        # If no CTE found, use just SELECT
+        if not select_sql:
+            select_sql = "SELECT " + select_part
+        
+        logger.debug(f"_extract_insert_select_lineage_string: About to parse SQL (first 300 chars): {select_sql[:300]}")
         try:
             parsed = sqlglot.parse(select_sql, read=self.dialect)
-            if parsed and isinstance(parsed[0], exp.Select):
-                lineage, _out_cols = self._extract_column_lineage(parsed[0], object_name)
-                deps = self._extract_dependencies(parsed[0])
+            logger.debug(f"_extract_insert_select_lineage_string: Parsed result: {parsed is not None}, length: {len(parsed) if parsed else 0}")
+            # Handle both exp.Select and exp.With (WITH ... SELECT)
+            select_stmt = None
+            if parsed and len(parsed) > 0:
+                logger.debug(f"_extract_insert_select_lineage_string: Parsed statement type: {type(parsed[0]).__name__}")
+                if isinstance(parsed[0], exp.With) and hasattr(parsed[0], 'this'):
+                    select_stmt = parsed[0].this
+                    logger.debug(f"_extract_insert_select_lineage_string: Parsed as exp.With, has expressions: {hasattr(parsed[0], 'expressions')}")
+                    # Process CTEs from exp.With - CTEs are in exp.With, not in exp.Select
+                    # We need to manually extract CTEs from exp.With and register them
+                    if hasattr(parsed[0], 'expressions'):
+                        logger.debug(f"_extract_insert_select_lineage_string: Processing {len(parsed[0].expressions)} CTEs from exp.With")
+                        for cte in parsed[0].expressions:
+                            if hasattr(cte, 'alias') and hasattr(cte, 'this'):
+                                cte_name = str(cte.alias)
+                                cte_columns = []
+                                if isinstance(cte.this, exp.Select):
+                                    for proj in cte.this.expressions:
+                                        col_name = None
+                                        if isinstance(proj, exp.Alias):
+                                            col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                            if not col_name and hasattr(proj, 'alias_or_name'):
+                                                col_name = str(proj.alias_or_name)
+                                        elif isinstance(proj, exp.Column):
+                                            col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                        if col_name:
+                                            cte_columns.append(col_name)
+                                # Register CTE
+                                if isinstance(cte.this, exp.Select):
+                                    self.cte_registry[cte_name] = {
+                                        'columns': cte_columns,
+                                        'definition': cte.this
+                                    }
+                                else:
+                                    self.cte_registry[cte_name] = cte_columns
+                    logger.debug(f"_extract_insert_select_lineage_string: Processed CTEs from exp.With, cte_registry keys: {list(self.cte_registry.keys())}")
+                elif isinstance(parsed[0], exp.Select):
+                    select_stmt = parsed[0]
+                    # Process CTEs if present
+                    with_clause = select_stmt.args.get('with')
+                    logger.debug(f"_extract_insert_select_lineage_string: exp.Select has with clause: {with_clause is not None}")
+                    if with_clause:
+                        self._process_ctes(select_stmt)
+                        logger.debug(f"_extract_insert_select_lineage_string: Processed CTEs from SELECT WITH, cte_registry keys: {list(self.cte_registry.keys())}")
+                    else:
+                        # If SELECT doesn't have with clause but we combined CTE with SELECT,
+                        # SQLGlot might have parsed it incorrectly. Manually parse and register CTE
+                        if cte_sql and cte_name:
+                            logger.debug(f"_extract_insert_select_lineage_string: SELECT has no with clause, but we have CTE SQL - manually parsing CTE: {cte_name}")
+                            try:
+                                # Parse the full WITH ... AS (...) SELECT ... to extract CTE definition
+                                # SQLGlot requires SELECT after CTE, so we need to parse the full statement
+                                full_sql = cte_sql + " SELECT 1"  # Dummy SELECT to make it valid
+                                cte_parsed = sqlglot.parse_one(full_sql, read=self.dialect)
+                                logger.debug(f"_extract_insert_select_lineage_string: CTE parsed, type: {type(cte_parsed).__name__ if cte_parsed else 'None'}")
+                                if isinstance(cte_parsed, exp.With) and hasattr(cte_parsed, 'expressions'):
+                                    # Extract CTE from exp.With
+                                    for cte in cte_parsed.expressions:
+                                        if hasattr(cte, 'alias') and hasattr(cte, 'this'):
+                                            parsed_cte_name = str(cte.alias)
+                                            if parsed_cte_name.lower() == cte_name.lower():
+                                                cte_columns = []
+                                                if isinstance(cte.this, exp.Select):
+                                                    for proj in cte.this.expressions:
+                                                        col_name = None
+                                                        if isinstance(proj, exp.Alias):
+                                                            col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                                            if not col_name and hasattr(proj, 'alias_or_name'):
+                                                                col_name = str(proj.alias_or_name)
+                                                        elif isinstance(proj, exp.Column):
+                                                            col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                                        if col_name:
+                                                            cte_columns.append(col_name)
+                                                # Register CTE
+                                                if isinstance(cte.this, exp.Select):
+                                                    self.cte_registry[cte_name] = {
+                                                        'columns': cte_columns,
+                                                        'definition': cte.this
+                                                    }
+                                                else:
+                                                    self.cte_registry[cte_name] = cte_columns
+                                                logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} with {len(cte_columns)} columns")
+                                                break
+                                elif isinstance(cte_parsed, exp.Select):
+                                    # If CTE was parsed as SELECT, try to extract columns from it
+                                    cte_columns = []
+                                    for proj in cte_parsed.expressions:
+                                        col_name = None
+                                        if isinstance(proj, exp.Alias):
+                                            col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                            if not col_name and hasattr(proj, 'alias_or_name'):
+                                                col_name = str(proj.alias_or_name)
+                                        elif isinstance(proj, exp.Column):
+                                            col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                        if col_name:
+                                            cte_columns.append(col_name)
+                                    # Register CTE
+                                    self.cte_registry[cte_name] = {
+                                        'columns': cte_columns,
+                                        'definition': cte_parsed
+                                    }
+                                    logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} (parsed as SELECT) with {len(cte_columns)} columns")
+                                logger.debug(f"_extract_insert_select_lineage_string: CTE registry keys after manual parsing: {list(self.cte_registry.keys())}")
+                            except Exception as e:
+                                import traceback
+                                logger.debug(f"_extract_insert_select_lineage_string: Failed to parse CTE manually: {e}, traceback: {traceback.format_exc()}")
+            if select_stmt:
+                logger.debug(f"_extract_insert_select_lineage_string: Successfully parsed SELECT, extracting lineage")
+                lineage, _out_cols = self._extract_column_lineage(select_stmt, object_name)
+                deps = self._extract_dependencies(select_stmt)
                 dependencies.update(deps)
+                logger.debug(f"_extract_insert_select_lineage_string: Extracted {len(lineage)} columns, {len(deps)} dependencies")
                 break  # Found target, stop searching
             else:
+                logger.debug(f"_extract_insert_select_lineage_string: Failed to parse SELECT as exp.Select, using basic dependencies")
                 dependencies.update(self._extract_basic_dependencies(select_sql))
                 break
-        except Exception:
+        except Exception as parse_error:
+            logger.debug(f"_extract_insert_select_lineage_string: Exception parsing SELECT: {parse_error}, using basic dependencies")
             dependencies.update(self._extract_basic_dependencies(select_sql))
             break
     
+    logger.debug(f"_extract_insert_select_lineage_string: Returning {len(lineage)} columns, {len(dependencies)} dependencies")
     return lineage, dependencies
 
 
 def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> Optional[ObjectInfo]:
+    logger.debug(f"_extract_materialized_output_from_procedure_string: Called")
     s = self._normalize_tsql(sql_content)
     s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
     lines = s.splitlines()
@@ -129,10 +319,45 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
     for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
         obj = _to_obj(m.group(1))
         if obj:
+            # Try to extract lineage for SELECT INTO
+            try:
+                select_into_sql = s[max(0, m.start()-1000):m.end()+5000]  # Get context around SELECT INTO
+                lineage, deps = self._extract_insert_select_lineage_string(select_into_sql, obj.name)
+                if lineage:
+                    obj.lineage = lineage
+                if deps:
+                    obj.dependencies = deps
+            except Exception as e:
+                logger.debug(f"_extract_materialized_output_from_procedure_string: Failed to extract lineage for SELECT INTO {obj.name}: {e}")
             return obj
     for m in re.finditer(r'(?is)\bINSERT\s+INTO\s+([^\s,()\r\n;]+)', s):
-        obj = _to_obj(m.group(1))
+        table_token = m.group(1).strip().rstrip(';')
+        # Skip temp tables
+        if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            continue
+        obj = _to_obj(table_token)
         if obj:
+            # Try to extract lineage for INSERT INTO
+            try:
+                # Extract the full INSERT INTO ... SELECT statement
+                insert_start = m.start()
+                insert_end = s.find(';', insert_start)
+                if insert_end == -1:
+                    insert_end = len(s)
+                insert_sql = s[insert_start:insert_end]
+                # Use the actual table name from SQL, not the normalized one
+                table_name_from_sql = table_token.strip().strip('[]')
+                # Remove square brackets properly
+                table_name_clean = re.sub(r'\[([^\]]+)\]', r'\1', table_name_from_sql)
+                logger.debug(f"_extract_materialized_output_from_procedure_string: Extracting lineage for INSERT INTO {table_name_clean}, obj.name={obj.name}")
+                lineage, deps = self._extract_insert_select_lineage_string(insert_sql, table_name_clean)
+                if lineage:
+                    obj.lineage = lineage
+                if deps:
+                    obj.dependencies = deps
+                logger.debug(f"_extract_materialized_output_from_procedure_string: Extracted {len(lineage)} columns, {len(deps)} dependencies for INSERT INTO {table_name_clean}")
+            except Exception as e:
+                logger.debug(f"_extract_materialized_output_from_procedure_string: Failed to extract lineage for INSERT INTO {obj.name}: {e}")
             return obj
     return None
 
@@ -418,6 +643,9 @@ def _extract_update_from_lineage_string(self, sql_content: str) -> tuple[List[Co
         if _noise_token(raw_tok):
             continue
         tbl = self._normalize_table_ident(raw_tok)
+        # For temp tables, use _ns_and_name to get proper format with procedure context
+        if tbl and (tbl.startswith('#') or 'tempdb' in tbl.lower()):
+            _, tbl = self._ns_and_name(tbl, obj_type_hint="temp_table")
         al = (m.group(2) or m.group(3) or '').strip()
         if al:
             alias_map[al.lower()] = tbl
@@ -428,6 +656,9 @@ def _extract_update_from_lineage_string(self, sql_content: str) -> tuple[List[Co
         if _noise_token(raw_tok):
             continue
         tbl = self._normalize_table_ident(raw_tok)
+        # For temp tables, use _ns_and_name to get proper format with procedure context
+        if tbl and (tbl.startswith('#') or 'tempdb' in tbl.lower()):
+            _, tbl = self._ns_and_name(tbl, obj_type_hint="temp_table")
         al = (m.group(2) or m.group(3) or '').strip()
         if al:
             alias_map[al.lower()] = tbl
@@ -472,10 +703,21 @@ def _extract_update_from_lineage_string(self, sql_content: str) -> tuple[List[Co
                 continue
             base = alias_map.get(al)
             if base:
-                ns, nm = self._ns_and_name(base)
+                # base is already normalized (including temp tables with procedure context)
+                # Extract namespace and name - if base already has schema.object#temp format, use it directly
+                if base and (base.startswith('#') or 'tempdb' in base.lower()):
+                    # This is a temp table that was already normalized in alias_map
+                    ns, nm = self._ns_and_name(base, obj_type_hint="temp_table")
+                else:
+                    ns, nm = self._ns_and_name(base)
                 refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=col))
         if not refs and default_src:
-            ns, nm = self._ns_and_name(default_src)
+            # default_src is already normalized (including temp tables with procedure context)
+            if default_src and (default_src.startswith('#') or 'tempdb' in default_src.lower()):
+                # This is a temp table that was already normalized in alias_map
+                ns, nm = self._ns_and_name(default_src, obj_type_hint="temp_table")
+            else:
+                ns, nm = self._ns_and_name(default_src)
             mlast = re.search(r'(?i)\b([A-Za-z_][\w]*)\b$', expr)
             if mlast:
                 refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=mlast.group(1)))
@@ -850,11 +1092,11 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
                                 refs.append(br)
                                 seen_keys.add(key)
                         # Also include the temp itself explicitly if not already
-                        temp_ns = self._canonical_namespace(self.current_database or self.default_database or 'InfoTrackerDW')
-                        temp_canon = self._canonical_temp_name(temp_simple)
-                        temp_key = (temp_ns, temp_canon, t_col)
+                        # Use _ns_and_name to get proper format with procedure context: schema.object#temp
+                        temp_ns, temp_table_name = self._ns_and_name(temp_simple, obj_type_hint="temp_table")
+                        temp_key = (temp_ns, temp_table_name, t_col)
                         if temp_key not in seen_keys:
-                            refs.append(ColumnReference(namespace=temp_ns, table_name=temp_canon, column_name=t_col))
+                            refs.append(ColumnReference(namespace=temp_ns, table_name=temp_table_name, column_name=t_col))
             except Exception:
                 pass
             lineage.append(ColumnLineage(

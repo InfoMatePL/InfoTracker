@@ -195,6 +195,8 @@ class Engine:
             return s
 
         # Phase 1: Parse all SQL files and collect objects
+        # Store context for each object name to restore in Phase 3
+        context_map: Dict[str, Dict[Path, Dict[str, Optional[str]]]] = {}
         for sql_path in sql_files:
             try:
                 sql_text = read_text_safely(sql_path, encoding=req.encoding)
@@ -205,12 +207,32 @@ class Engine:
                     parser._current_file = str(sql_path)
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
                 
+                # IMPORTANT: Save context AFTER parsing in Phase 1, so it can be used in Phase 3
+                # Context is set by _parse_procedure_string or _parse_create_procedure during parsing
+                # But it may be reset after return, so we need to check if it's still set
+                saved_ctx_db_phase1 = getattr(parser, '_ctx_db', None)
+                saved_ctx_obj_phase1 = getattr(parser, '_ctx_obj', None)
+                saved_current_db_phase1 = getattr(parser, 'current_database', None)
+                
+                # Debug: print context after parsing (for immediate visibility)
+                # DEBUG: Uncomment to see context tracking
+                # print(f"DEBUG Phase 1: After parsing {sql_path.stem}, context: _ctx_db={saved_ctx_db_phase1}, _ctx_obj={saved_ctx_obj_phase1}, current_database={saved_current_db_phase1}")
+                
                 # Store mapping for later processing
                 raw_name = getattr(getattr(obj_info, "schema", None), "name", None) or getattr(obj_info, "name", None)
                 obj_name = _canon_key(raw_name) if raw_name else None
                 if obj_name:
                     # Allow multiple files to produce the same logical object (e.g., MERGE in SP outputs a table)
                     sql_file_map.setdefault(obj_name, []).append(sql_path)
+                    
+                    # Store context for this object name, so it can be restored in Phase 3
+                    if obj_name not in context_map:
+                        context_map[obj_name] = {}
+                    context_map[obj_name][sql_path] = {
+                        'ctx_db': saved_ctx_db_phase1,
+                        'ctx_obj': saved_ctx_obj_phase1,
+                        'current_db': saved_current_db_phase1
+                    }
                     
                     # Skip ignored objects
                     if ignore_patterns and any(fnmatch(obj_name, pat) for pat in ignore_patterns):
@@ -255,7 +277,43 @@ class Engine:
                         parser._current_file = sql_path.relative_to(sql_root).as_posix()
                     except Exception:
                         parser._current_file = str(sql_path)
+                    # IMPORTANT: Restore context from Phase 1 for this object name
+                    saved_current_db = None
+                    saved_ctx_db = None
+                    saved_ctx_obj = None
+                    if obj_name in context_map and sql_path in context_map[obj_name]:
+                        ctx_info = context_map[obj_name][sql_path]
+                        saved_current_db = ctx_info.get('current_db')
+                        saved_ctx_db = ctx_info.get('ctx_db')
+                        saved_ctx_obj = ctx_info.get('ctx_obj')
+                        # DEBUG: Uncomment to see context restoration
+                        # logger.debug(f"Phase 3: Restoring context for {sql_path.stem}: _ctx_db={saved_ctx_db}, _ctx_obj={saved_ctx_obj}, current_database={saved_current_db}")
+                    
+                    # Reset temp registries before parsing to avoid contamination from previous passes
+                    parser.temp_registry.clear()
+                    parser.temp_sources.clear()
+                    parser.temp_lineage.clear()
+                    parser._temp_version.clear()
+                    # DON'T reset context - we need it for canonical temp naming
+                    # The context will be set by parse_sql_file if needed, but we preserve it from Phase 1
+                    
+                    # Parse the file - this will re-detect USE statement and set current_database
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                    
+                    # Restore saved context after parse_sql_file (which may reset it)
+                    # First, try to restore from Phase 1 context_map
+                    if saved_current_db:
+                        parser.current_database = saved_current_db
+                    # Restore context for canonical temp naming
+                    # parse_sql_file may set context via _parse_procedure_string or _parse_create_procedure,
+                    # but if it doesn't, restore from Phase 1
+                    # IMPORTANT: Always restore from Phase 1, as parse_sql_file may reset context
+                    if saved_ctx_db:
+                        parser._ctx_db = saved_ctx_db
+                    if saved_ctx_obj:
+                        parser._ctx_obj = saved_ctx_obj
+                    # DEBUG: Uncomment to see context restoration
+                    # logger.debug(f"Phase 3: After restoring context for {sql_path.stem}: _ctx_db={getattr(parser, '_ctx_db', None)}, _ctx_obj={getattr(parser, '_ctx_obj', None)}")
                     group_infos.append(obj_info)
                     group_paths.append(sql_path)
                 except Exception as e:
@@ -321,32 +379,215 @@ class Engine:
                     outputs.append([str(sql_path), str(target)])
 
                     # Additionally, emit separate OL events for temp tables created in this file
+                    # Use a set to deduplicate temp table keys (avoid duplicates from different parsing passes)
                     try:
-                        temp_keys = [k for k in (parser.temp_registry.keys()) if isinstance(k, str) and k.startswith('#') and '@' not in k]
+                        temp_keys_set = set()
+                        for k in parser.temp_registry.keys():
+                            if isinstance(k, str) and k.startswith('#') and '@' not in k:
+                                # Use simple temp name (without version) as unique key
+                                temp_keys_set.add(k)
+                        temp_keys = sorted(list(temp_keys_set))
                     except Exception:
                         temp_keys = []
                     for tmp in temp_keys:
                         try:
+                            # Debug: check context before canonicalization
+                            ctx_db_before = getattr(parser, '_ctx_db', None)
+                            ctx_obj_before = getattr(parser, '_ctx_obj', None)
+                            current_db_before = parser.current_database
+                            logger.debug(f"Phase 3: Before _canonical_temp_name for {tmp}: _ctx_db={ctx_db_before}, _ctx_obj={ctx_obj_before}, current_database={current_db_before}")
+                            
                             # Canonicalize temp name and derive ns
                             canonical = parser._canonical_temp_name(tmp)
-                            db_ctx = getattr(parser, '_ctx_db', None) or getattr(parser, 'current_database', None) or getattr(parser, 'default_database', None) or 'InfoTrackerDW'
-                            ns_tmp = f"mssql://localhost/{str(db_ctx).upper()}"
+                            logger.debug(f"Phase 3: After _canonical_temp_name for {tmp}: canonical={canonical}")
+                            # Use _ns_and_name to get proper namespace and name format (schema.object#temp without dot before #)
+                            ns_tmp, table_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
+                            logger.debug(f"Phase 3: After _ns_and_name for {tmp}: namespace={ns_tmp}, name={table_name}")
                             # Build schema
-                            schema = parser.schema_registry.get(ns_tmp, canonical)
-                            if not schema:
+                            schema = parser.schema_registry.get(ns_tmp, table_name)
+                            if schema:
+                                logger.debug(f"Phase 3: Found schema in registry for {tmp}: namespace={schema.namespace}, name={schema.name}")
+                                # Ensure schema.name matches table_name (might be different if registered earlier)
+                                if schema.name != table_name:
+                                    logger.debug(f"Phase 3: Schema name mismatch! schema.name={schema.name}, table_name={table_name}, updating schema.name")
+                                    schema.name = table_name
+                            else:
+                                logger.debug(f"Phase 3: No schema in registry for {tmp}, creating new schema with name={table_name}")
                                 cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(parser.temp_registry.get(tmp, []) or [])]
-                                schema = TableSchema(namespace=ns_tmp, name=canonical, columns=cols)
+                                schema = TableSchema(namespace=ns_tmp, name=table_name, columns=cols)
                             # Build lineage
                             lin_list = []
                             col_map = parser.temp_lineage.get(tmp) or {}
+                            logger.debug(f"Phase 3: temp_lineage for {tmp}: {len(col_map)} columns, keys={list(col_map.keys())[:5] if col_map else []}")
+                            # If temp_lineage is empty, or if it contains CTE references instead of real tables, try to extract sources from SQL
+                            # Check if temp_lineage contains CTE references (not real tables) or if all references are empty
+                            has_cte_refs = False
+                            all_refs_empty = True
+                            if col_map:
+                                for col_name, refs in col_map.items():
+                                    if refs and len(refs) > 0:
+                                        all_refs_empty = False
+                                    for ref in refs:
+                                        # Check if ref points to a CTE (CTEs don't have namespace or have special format)
+                                        # CTEs are typically not in temp_registry and don't have # prefix
+                                        if ref.table_name and not ref.table_name.startswith('#') and '.' not in ref.table_name:
+                                            # Might be a CTE, check if it's in cte_registry
+                                            if ref.table_name in parser.cte_registry or ref.table_name.lower() in [k.lower() for k in parser.cte_registry.keys()]:
+                                                has_cte_refs = True
+                                                break
+                                    if has_cte_refs:
+                                        break
+                            else:
+                                all_refs_empty = True
+                            
+                            if (not col_map or has_cte_refs or all_refs_empty) and schema.columns:
+                                # Fallback: try to extract basic lineage from SQL string for this temp table
+                                logger.debug(f"Phase 3: Starting fallback for {tmp}, col_map empty={not col_map}, has_cte_refs={has_cte_refs}, schema.columns={len(schema.columns)}")
+                                try:
+                                    import re
+                                    temp_name_simple = tmp.lstrip('#')
+                                    logger.debug(f"Phase 3: Looking for SELECT ... INTO #{temp_name_simple} ... FROM ...")
+                                    for sql_path in group_paths:
+                                        sql_text = read_text_safely(sql_path)
+                                        match = None
+                                        from_table = None
+                                        # Try UPDATE ... OUTPUT ... INTO #tmp pattern first (for temp tables created by UPDATE)
+                                        pattern_update_output = rf'(?is)UPDATE\s+.*?\bOUTPUT\s+.*?\bINTO\s+#{re.escape(temp_name_simple)}\b[^;]*?\bFROM\s+([#\w]+(?:\.[#\w]+)*)'
+                                        match_update = re.search(pattern_update_output, sql_text)
+                                        if match_update:
+                                            from_table = match_update.group(1).strip('[]')
+                                            logger.debug(f"Phase 3: Found UPDATE ... OUTPUT ... INTO pattern for {tmp}, FROM={from_table}")
+                                        else:
+                                            # Try SELECT ... INTO #tmp ... FROM ... pattern
+                                            # Handle both WITH ... SELECT ... INTO and plain SELECT ... INTO
+                                            # First try to find SELECT ... INTO #tmp ... FROM ... (may be after WITH clause)
+                                            pattern_select = rf'(?is)SELECT\s+.*?\bINTO\s+#{re.escape(temp_name_simple)}\b[^;]*?\bFROM\s+([#\w]+(?:\.[#\w]+)*)'
+                                            match = re.search(pattern_select, sql_text)
+                                            if match:
+                                                from_table = match.group(1).strip('[]')
+                                        logger.debug(f"Phase 3: Pattern match for {tmp}: {match is not None or match_update is not None}")
+                                        if from_table:
+                                            # If FROM points to a CTE (not a table), look deeper in SQL for the actual source
+                                            # Check if this is a CTE by looking for it in WITH clause
+                                            if not from_table.startswith('#') and '.' not in from_table:
+                                                # Might be a CTE, look for its definition in WITH clause
+                                                # CTE definition: WITH CTEName AS (SELECT ... FROM ...)
+                                                # For complex CTEs with nested parentheses, we need to find the actual table source
+                                                # Strategy: find the CTE definition start, then look for FROM/JOIN with [dbo].TableName
+                                                cte_start_pattern = rf'(?is)WITH\s+{re.escape(from_table)}\s+AS\s*\('
+                                                cte_start_match = re.search(cte_start_pattern, sql_text)
+                                                if cte_start_match:
+                                                    # Find the matching closing parenthesis for the CTE definition
+                                                    # This is tricky with nested parentheses, so we'll use a simpler approach:
+                                                    # Look for FROM/JOIN [dbo].TableName after the CTE definition starts
+                                                    cte_start_pos = cte_start_match.end()
+                                                    # Look for FROM [dbo].TableName in the CTE definition (handle nested subqueries)
+                                                    # Use a pattern that finds FROM/JOIN followed by [dbo].TableName
+                                                    cte_from_pattern = rf'(?is)(?:FROM|JOIN)\s+\[?dbo\]?\.(\w+)'
+                                                    # Search in the text after CTE definition start, but limit to reasonable length
+                                                    cte_section = sql_text[cte_start_pos:cte_start_pos+2000]  # Limit search to 2000 chars
+                                                    cte_from_match = re.search(cte_from_pattern, cte_section)
+                                                    if cte_from_match:
+                                                        from_table = f"dbo.{cte_from_match.group(1)}"
+                                                        logger.debug(f"Phase 3: Found CTE, actual source is {from_table} (from CTE definition)")
+                                                    else:
+                                                        # Last resort: find any [dbo].TableName after CTE definition start
+                                                        cte_any_pattern = rf'\[?dbo\]?\.(\w+)'
+                                                        cte_any_match = re.search(cte_any_pattern, cte_section)
+                                                        if cte_any_match:
+                                                            from_table = f"dbo.{cte_any_match.group(1)}"
+                                                            logger.debug(f"Phase 3: Found CTE, actual source is {from_table} (from CTE, any table found)")
+                                                # Also check if from_table is in cte_registry and expand it
+                                                if from_table and from_table.lower() in [k.lower() for k in parser.cte_registry.keys()]:
+                                                    # This is a CTE - expand it to base sources
+                                                    cte_name_lower = from_table.lower()
+                                                    cte_name = next((k for k in parser.cte_registry.keys() if k.lower() == cte_name_lower), None)
+                                                    if cte_name:
+                                                        cte_info = parser.cte_registry[cte_name]
+                                                        from sqlglot import expressions as exp
+                                                        if isinstance(cte_info, dict) and 'definition' in cte_info:
+                                                            cte_def = cte_info['definition']
+                                                        elif isinstance(cte_info, exp.Select):
+                                                            cte_def = cte_info
+                                                        else:
+                                                            cte_def = None
+                                                        if cte_def and isinstance(cte_def, exp.Select):
+                                                            cte_deps = parser._extract_dependencies(cte_def)
+                                                            # Find first non-temp, non-CTE dependency
+                                                            for cte_dep in cte_deps:
+                                                                cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
+                                                                is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in parser.temp_registry)
+                                                                is_cte_dep_cte = cte_dep_simple and cte_dep_simple.lower() in [k.lower() for k in parser.cte_registry.keys()]
+                                                                if not is_cte_dep_temp and not is_cte_dep_cte:
+                                                                    from_table = cte_dep
+                                                                    logger.debug(f"Phase 3: Expanded CTE {cte_name} to base source {from_table}")
+                                                                    break
+                                            # Normalize table name
+                                            if '.' not in from_table and not from_table.startswith('#'):
+                                                from_table = f"dbo.{from_table}"
+                                            # Create basic lineage for all columns
+                                            ns_from, nm_from = parser._ns_and_name(from_table, obj_type_hint="table")
+                                            for col in schema.columns:
+                                                ref = ColumnReference(namespace=ns_from, table_name=nm_from, column_name=col.name)
+                                                lin_list.append(ColumnLineage(
+                                                    output_column=col.name,
+                                                    input_fields=[ref],
+                                                    transformation_type=TransformationType.IDENTITY,
+                                                    transformation_description=f"from {nm_from}"
+                                                ))
+                                            logger.debug(f"Phase 3: Created fallback lineage for {tmp} from pattern: {nm_from}: {len(lin_list)} columns")
+                                            break
+                                            logger.debug(f"Phase 3: Created fallback lineage for {tmp} from UPDATE ... OUTPUT ... INTO: {nm_from}: {len(lin_list)} columns")
+                                            break
+                                except Exception as e:
+                                    logger.debug(f"Phase 3: Failed to create fallback lineage for {tmp}: {e}")
+                                    import traceback
+                                    logger.debug(f"Phase 3: Traceback: {traceback.format_exc()}")
+                            
                             for i, col in enumerate(schema.columns or []):
+                                if not col_map:
+                                    # No temp_lineage, but we might have created fallback lineage above
+                                    # Check if we already added lineage for this column
+                                    existing_lineage = [lin for lin in lin_list if lin.output_column == col.name]
+                                    if not existing_lineage:
+                                        # No lineage found, create empty lineage so object is included in graph
+                                        lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column (no lineage)"))
+                                    continue
                                 refs = list(col_map.get(col.name, []))
-                                if refs:
-                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
+                                # DEBUG: Uncomment to see temp table processing
+                                # logger.debug(f"Phase 3: refs for {tmp}.{col.name}: {len(refs)} references")
+                                # Normalize temp table references to use new format (schema.object#temp)
+                                normalized_refs = []
+                                for ref in refs:
+                                    # If this reference points to the same temp table, update it to new format
+                                    # Check if ref.table_name contains the temp table name (e.g., "dbo.#asefl_temp" contains "#asefl_temp")
+                                    temp_name_simple = tmp.lstrip('#')  # Remove # for comparison
+                                    should_normalize = False
+                                    if ref.table_name:
+                                        # Check various formats: "dbo.#asefl_temp", "#asefl_temp", "dbo.asefl_temp", etc.
+                                        if tmp in ref.table_name or f"#{temp_name_simple}" in ref.table_name or ref.table_name.endswith(tmp):
+                                            should_normalize = True
+                                        # Also check if it's just the temp name without schema
+                                        elif ref.table_name == tmp or ref.table_name == temp_name_simple:
+                                            should_normalize = True
+                                    if should_normalize:
+                                        # Update to new format
+                                        ref_ns, ref_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
+                                        # DEBUG: Uncomment to see temp table processing
+                                        # logger.debug(f"Phase 3: Normalizing ref {ref.table_name} -> {ref_name} for temp {tmp}")
+                                        normalized_refs.append(ColumnReference(namespace=ref_ns, table_name=ref_name, column_name=ref.column_name))
+                                    else:
+                                        # Keep other references as-is
+                                        # DEBUG: Uncomment to see temp table processing
+                                        # logger.debug(f"Phase 3: Keeping ref as-is: {ref.table_name} (temp: {tmp})")
+                                        normalized_refs.append(ref)
+                                if normalized_refs:
+                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=normalized_refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
                                 else:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
                             deps = set(parser.temp_sources.get(tmp, set()) or set())
-                            temp_obj = ObjectInfo(name=canonical, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
+                            temp_obj = ObjectInfo(name=table_name, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
+                            logger.debug(f"Phase 3: Created temp_obj for {tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
                             # Include in graph
                             resolved_objects.append(temp_obj)
                             # Write OL JSON
@@ -455,7 +696,15 @@ class Engine:
                             "transformation": key[2],
                             "description": key[3],
                         })
-                graph_path.write_text(json.dumps({"edges": edges_dump}, indent=2, ensure_ascii=False), encoding="utf-8")
+                # Also include nodes (columns) even if they don't have edges
+                nodes_dump = []
+                for node in graph._nodes.values():
+                    nodes_dump.append({
+                        "namespace": node.namespace,
+                        "table": node.table_name,
+                        "column": node.column_name,
+                    })
+                graph_path.write_text(json.dumps({"edges": edges_dump, "nodes": nodes_dump}, indent=2, ensure_ascii=False), encoding="utf-8")
                 # Persist learned object→DB mapping for future runs
                 try:
                     registry.save(db_map_path)

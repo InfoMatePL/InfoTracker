@@ -326,6 +326,27 @@ class ColumnGraph:
     
     def build_from_object_lineage(self, objects: List[ObjectInfo]) -> None:
         """Build column graph from object lineage information."""
+        # Build a map of old temp table names to new ones (e.g., "dbo.#asefl_temp" -> "dbo.update_asefl_TrialBalance_BV#asefl_temp")
+        temp_name_map: Dict[str, str] = {}
+        for obj in objects:
+            if obj.object_type == "temp_table" and obj.schema.name:
+                # obj.schema.name is in new format: "dbo.update_asefl_TrialBalance_BV#asefl_temp" (or with DB prefix)
+                # Normalize: strip leading '<DB>.' from table name if it matches namespace DB
+                normalized_name = obj.schema.name
+                try:
+                    ns_db = obj.schema.namespace.rsplit('/', 1)[1] if obj.schema.namespace else None
+                    if ns_db and normalized_name.startswith(f"{ns_db}."):
+                        normalized_name = normalized_name[len(ns_db) + 1:]
+                except Exception:
+                    pass
+                # Extract temp table name (part after last '#')
+                if '#' in normalized_name:
+                    temp_part = normalized_name.split('#')[-1]
+                    old_name = f"dbo.#{temp_part}"
+                    temp_name_map[old_name] = normalized_name
+                    # Also map without schema
+                    temp_name_map[f"#{temp_part}"] = normalized_name
+        
         for obj in objects:
             output_namespace = obj.schema.namespace
             output_table = obj.schema.name
@@ -337,6 +358,15 @@ class ColumnGraph:
                 ns_db = None
             if ns_db and output_table and output_table.startswith(f"{ns_db}."):
                 output_table = output_table[len(ns_db) + 1:]
+            
+            # Add nodes for all columns, even if they don't have edges
+            for col in obj.schema.columns or []:
+                output_column = ColumnNode(
+                    namespace=output_namespace,
+                    table_name=output_table,
+                    column_name=col.name
+                )
+                self.add_node(output_column)
             
             for lineage in obj.lineage:
                 # Create output column node
@@ -357,6 +387,11 @@ class ColumnGraph:
                         in_db = None
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
                         in_tbl = in_tbl[len(in_db) + 1:]
+                    
+                    # Normalize temp table names: if in_tbl is old format (e.g., "dbo.#asefl_temp"), 
+                    # replace with new format from temp_name_map
+                    if in_tbl in temp_name_map:
+                        in_tbl = temp_name_map[in_tbl]
 
                     input_column = ColumnNode(
                         namespace=in_ns,
