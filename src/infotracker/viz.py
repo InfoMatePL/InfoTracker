@@ -1590,7 +1590,17 @@ document.getElementById('stage').addEventListener('contextmenu', (e)=>{
     ]);
   } else if (card){
     const tid = card.getAttribute('data-id'); if (!tid) return;
+    const fullName = card.getAttribute('data-full') || '';
     openCtx(px, py, [
+      { label: 'Copy name', onClick: ()=>{ 
+          if (navigator.clipboard && fullName) {
+            navigator.clipboard.writeText(fullName).then(()=>{
+              console.log('Copied to clipboard:', fullName);
+            }).catch(err=>{ console.error('Failed to copy:', err); });
+          }
+        } 
+      },
+      'sep',
       { label: 'Show downstream (object)', onClick: ()=>{ applyTableIsolationCollapsed(tid,'down'); } },
       { label: 'Show upstream (object)',   onClick: ()=>{ applyTableIsolationCollapsed(tid,'up'); } },
       { label: 'Show both (object)',       onClick: ()=>{ applyTableIsolationCollapsed(tid,'both'); } },
