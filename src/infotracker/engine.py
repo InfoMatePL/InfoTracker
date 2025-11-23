@@ -196,10 +196,14 @@ class Engine:
 
         # Phase 1: Parse all SQL files and collect objects
         # Store context for each object name to restore in Phase 3
+        # OPTIMIZATION: Cache SQL text to avoid re-reading from disk in Phase 3
+        sql_text_cache: Dict[Path, str] = {}
         context_map: Dict[str, Dict[Path, Dict[str, Optional[str]]]] = {}
         for sql_path in sql_files:
             try:
                 sql_text = read_text_safely(sql_path, encoding=req.encoding)
+                # Cache SQL text for Phase 3 to avoid re-reading from disk
+                sql_text_cache[sql_path] = sql_text
                 # set current file for logging context (relative to sql_root)
                 try:
                     parser._current_file = sql_path.relative_to(sql_root).as_posix()
@@ -261,6 +265,9 @@ class Engine:
         # Phase 2: Build dependency graph and resolve schemas in topological order
         dependency_graph = self._build_dependency_graph(parsed_objects)
         processing_order = self._topological_sort(dependency_graph)
+        # OPTIMIZATION: Clear parsed_objects after building dependency graph to free memory
+        # We only need the graph structure, not the full ObjectInfo objects
+        del parsed_objects
         
         # Phase 3: Process objects in dependency order, building up schema registry
         resolved_objects: List[ObjectInfo] = []
@@ -282,7 +289,11 @@ class Engine:
             saved_temp_registry: Dict[str, List[str]] = {}
             for sql_path in sql_file_map[obj_name]:
                 try:
-                    sql_text = read_text_safely(sql_path, encoding=req.encoding)
+                    # OPTIMIZATION: Use cached SQL text from Phase 1 instead of re-reading from disk
+                    sql_text = sql_text_cache.get(sql_path)
+                    if sql_text is None:
+                        sql_text = read_text_safely(sql_path, encoding=req.encoding)
+                        sql_text_cache[sql_path] = sql_text
                     try:
                         parser._current_file = sql_path.relative_to(sql_root).as_posix()
                     except Exception:
@@ -412,18 +423,30 @@ class Engine:
                     # This ensures temp tables from procedures are included even when CREATE TABLE is processed after
                     try:
                         temp_keys_set = set()
-                        # First, try saved_temp_lineage (local to this obj_name)
+                        # Helper function to extract base temp name (without version suffix)
+                        def get_base_temp_name(k: str) -> str:
+                            if '@' in k:
+                                return k.split('@')[0]
+                            return k
+                        
+                        # Temp tables are LOCAL to the procedure where they were created
+                        # Only use saved_temp_* (local to this obj_name) and parser.temp_registry (from current file)
+                        # Do NOT use global_saved_temp_* for creating outputs - they are only for source JSON (dependencies)
+                        # First, try saved_temp_lineage (local to this obj_name) - these definitely belong
                         for k in saved_temp_lineage.keys():
-                            if isinstance(k, str) and k.startswith('#') and '@' not in k:
-                                temp_keys_set.add(k)
-                        # Also check global_saved_temp_lineage (for temp tables from other procedures)
-                        for k in global_saved_temp_lineage.keys():
-                            if isinstance(k, str) and k.startswith('#') and '@' not in k:
-                                temp_keys_set.add(k)
+                            if isinstance(k, str) and k.startswith('#'):
+                                base_name = get_base_temp_name(k)
+                                temp_keys_set.add(base_name)
+                        # Also check saved_temp_registry (for temp tables that may not have lineage, e.g., from UPDATE OUTPUT INTO)
+                        for k in saved_temp_registry.keys():
+                            if isinstance(k, str) and k.startswith('#'):
+                                base_name = get_base_temp_name(k)
+                                temp_keys_set.add(base_name)
                         # Fallback to parser.temp_registry if available (for temp tables created in this file)
                         for k in parser.temp_registry.keys():
-                            if isinstance(k, str) and k.startswith('#') and '@' not in k:
-                                temp_keys_set.add(k)
+                            if isinstance(k, str) and k.startswith('#'):
+                                base_name = get_base_temp_name(k)
+                                temp_keys_set.add(base_name)
                         temp_keys = sorted(list(temp_keys_set))
                     except Exception:
                         temp_keys = []
@@ -451,16 +474,26 @@ class Engine:
                                     schema.name = table_name
                             else:
                                 logger.debug(f"Phase 3: No schema in registry for {tmp}, creating new schema with name={table_name}")
-                                # Use saved_temp_registry/global_saved_temp_registry instead of parser.temp_registry
+                                # Use saved_temp_registry instead of parser.temp_registry
                                 # because parser.temp_registry is cleared before each parsing (line 301)
-                                col_names = saved_temp_registry.get(tmp, []) or global_saved_temp_registry.get(tmp, []) or parser.temp_registry.get(tmp, []) or []
+                                # Try both with and without version suffix (e.g., #tmp and #tmp@1)
+                                # Do NOT use global_saved_temp_registry - temp tables are local to procedure
+                                col_names = (saved_temp_registry.get(tmp, []) or 
+                                           parser.temp_registry.get(tmp, []) or
+                                           saved_temp_registry.get(f"{tmp}@1", []) or
+                                           parser.temp_registry.get(f"{tmp}@1", []) or [])
                                 cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(col_names)]
                                 schema = TableSchema(namespace=ns_tmp, name=table_name, columns=cols)
                             # Build lineage
                             lin_list = []
-                            # Use saved_temp_lineage/global_saved_temp_lineage instead of parser.temp_lineage
+                            # Use saved_temp_lineage instead of parser.temp_lineage
                             # because parser.temp_lineage is cleared before each parsing (line 303)
-                            col_map = saved_temp_lineage.get(tmp) or global_saved_temp_lineage.get(tmp) or parser.temp_lineage.get(tmp) or {}
+                            # Try both with and without version suffix (e.g., #tmp and #tmp@1)
+                            # Do NOT use global_saved_temp_lineage - temp tables are local to procedure
+                            col_map = (saved_temp_lineage.get(tmp) or 
+                                      parser.temp_lineage.get(tmp) or
+                                      saved_temp_lineage.get(f"{tmp}@1") or
+                                      parser.temp_lineage.get(f"{tmp}@1") or {})
                             logger.debug(f"Phase 3: temp_lineage for {tmp}: {len(col_map)} columns, keys={list(col_map.keys())[:5] if col_map else []}")
                             # If temp_lineage is empty, or if it contains CTE references instead of real tables, try to extract sources from SQL
                             # Check if temp_lineage contains CTE references (not real tables) or if all references are empty
@@ -491,7 +524,11 @@ class Engine:
                                     temp_name_simple = tmp.lstrip('#')
                                     logger.debug(f"Phase 3: Looking for SELECT ... INTO #{temp_name_simple} ... FROM ...")
                                     for sql_path in group_paths:
-                                        sql_text = read_text_safely(sql_path)
+                                        # OPTIMIZATION: Use cached SQL text instead of re-reading from disk
+                                        sql_text = sql_text_cache.get(sql_path)
+                                        if sql_text is None:
+                                            sql_text = read_text_safely(sql_path)
+                                            sql_text_cache[sql_path] = sql_text
                                         match = None
                                         from_table = None
                                         # Try UPDATE ... OUTPUT ... INTO #tmp pattern first (for temp tables created by UPDATE)
@@ -674,9 +711,14 @@ class Engine:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=normalized_refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
                                 else:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
-                            # Use saved_temp_sources/global_saved_temp_sources instead of parser.temp_sources
+                            # Use saved_temp_sources instead of parser.temp_sources
                             # because parser.temp_sources is cleared before each parsing (line 302)
-                            deps = set(saved_temp_sources.get(tmp, set()) or global_saved_temp_sources.get(tmp, set()) or parser.temp_sources.get(tmp, set()) or set())
+                            # Try both with and without version suffix (e.g., #tmp and #tmp@1)
+                            # Do NOT use global_saved_temp_sources - temp tables are local to procedure
+                            deps = set(saved_temp_sources.get(tmp, set()) or 
+                                     parser.temp_sources.get(tmp, set()) or
+                                     saved_temp_sources.get(f"{tmp}@1", set()) or
+                                     parser.temp_sources.get(f"{tmp}@1", set()) or set())
                             temp_obj = ObjectInfo(name=table_name, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
                             logger.debug(f"Phase 3: Created temp_obj for {tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
                             # Include in graph
@@ -886,6 +928,27 @@ class Engine:
                 except Exception as e:
                     warnings += 1
                     logger.warning("failed to process %s: %s", sql_path, e)
+            
+            # OPTIMIZATION: Clear context_map for this obj_name after processing to free memory
+            if obj_name in context_map:
+                del context_map[obj_name]
+            
+            # OPTIMIZATION: Clear parser registries after processing this object to free memory
+            # These are re-populated for each file, so we can clear them between objects
+            parser.cte_registry.clear()
+            # Note: temp_registry, temp_sources, temp_lineage are already cleared before each file (line 303-306)
+            # But we can also clear _proc_acc and _temp_version to be safe
+            parser._proc_acc.clear()
+            parser._temp_version.clear()
+            
+            # OPTIMIZATION: Clear local saved_temp_* after processing this obj_name to free memory
+            # They are already merged into global_saved_temp_*, so we don't need local copies
+            saved_temp_lineage.clear()
+            saved_temp_sources.clear()
+            saved_temp_registry.clear()
+
+        # OPTIMIZATION: Clear SQL text cache after Phase 3 to free memory
+        del sql_text_cache
 
         # 4) Build column graph from resolved objects (second pass)
         if resolved_objects:
