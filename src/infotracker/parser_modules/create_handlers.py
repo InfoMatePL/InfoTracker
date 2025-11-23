@@ -133,9 +133,13 @@ def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None
     table_name = nm
 
     cols: List[ColumnSchema] = []
-    body_match = re.search(r'(?is)CREATE\s+TABLE\s+[^\(]+\((.*)\)', sql)
-    if body_match:
-        inner = body_match.group(1)
+    # Find CREATE TABLE and extract only the table definition, stopping before any CREATE INDEX
+    # Match CREATE TABLE ... ( ... ) and stop before ON [PRIMARY], WITH, or CREATE INDEX
+    # Use non-greedy match to stop at the first closing paren that completes the column list
+    table_match = re.search(r'(?is)CREATE\s+TABLE\s+[^\(]+\((.*?)\)(?:\s+ON\s+\[PRIMARY\]|\s+WITH\s+\(|\s*GO\s|(?=\s*CREATE\s+(?:CLUSTERED\s+|NONCLUSTERED\s+)?INDEX))', sql)
+    if table_match:
+        inner = table_match.group(1)
+        # Split by comma, but respect nested parentheses (for data types like DECIMAL(18,2))
         parts = re.split(r',(?![^\(]*\))', inner)
         col_lines = [p.strip() for p in parts if p.strip() and not re.match(r'(?i)CONSTRAINT\b', p.strip())]
         for i, ln in enumerate(col_lines):
@@ -144,6 +148,10 @@ def _parse_create_table_string(self, sql: str, object_hint: Optional[str] = None
                 continue
             col_name = next(g for g in m2.groups()[:3] if g)
             rest = m2.group(4)
+            # Skip if this looks like an INDEX option (SORT_IN_TEMPDB, ALLOW_ROW_LOCKS, etc.)
+            # These should not appear in CREATE TABLE column definitions
+            if re.match(r'(?i)^(PAD_INDEX|STATISTICS_NORECOMPUTE|SORT_IN_TEMPDB|DROP_EXISTING|ONLINE|ALLOW_ROW_LOCKS|ALLOW_PAGE_LOCKS|FILLFACTOR|OPTIMIZE_FOR_SEQUENTIAL_KEY|DATA_COMPRESSION)\s*=', rest):
+                continue
             t = re.match(r'(?i)\s*(?:\[(?P<t1>[^\]]+)\]|(?P<t2>[A-Za-z_][\w$]*))\s*(?:\(\s*(?P<args>[^)]*?)\s*\))?', rest)
             if t:
                 tname = (t.group('t1') or t.group('t2') or '').upper()

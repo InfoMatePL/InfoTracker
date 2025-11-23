@@ -175,7 +175,33 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
             known = self.schema_registry.get((ns, name_key))
 
         if known and getattr(known, "columns", None):
-            materialized_output.schema = known
+            # CREATE TABLE should only affect column order (ordinal), not lineage
+            # Update column ordinals from CREATE TABLE, but preserve lineage
+            # Map lineage columns to CREATE TABLE columns by name to update ordinals
+            lineage_by_col = {col.output_column.lower(): col for col in (materialized_output.lineage or [])}
+            
+            # Update column ordinals from CREATE TABLE
+            updated_columns = []
+            for i, known_col in enumerate(known.columns):
+                # Update ordinal in lineage if column exists
+                lineage_col = lineage_by_col.get(known_col.name.lower())
+                if lineage_col:
+                    # Ensure output_column name matches (case may differ)
+                    lineage_col.output_column = known_col.name
+                
+                # Create column schema with ordinal from CREATE TABLE
+                updated_columns.append(ColumnSchema(
+                    name=known_col.name,
+                    data_type=known_col.data_type,
+                    nullable=known_col.nullable,
+                    ordinal=i  # Use ordinal from CREATE TABLE
+                ))
+            
+            # Update schema columns but preserve lineage and other schema properties
+            materialized_output.schema.columns = updated_columns
+            # Keep namespace and name from materialized_output (may have been resolved differently)
+            materialized_output.schema.namespace = ns
+            materialized_output.schema.name = name_key
         else:
             # Fallback: columns from INSERT INTO column list
             cols = self._extract_insert_into_columns(sql_content)
@@ -281,8 +307,11 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
             pass
 
         # Expand temp dependencies on the final output, if any
+        # Keep temp tables in dependencies AND expand them to base sources
         try:
             deps_expanded = set(materialized_output.dependencies or [])
+            # Collect all temp tables found in dependencies
+            temp_tables_found = set()
             # String-derived temp base map: #temp -> base deps
             temp_base_map: dict[str, Set[str]] = {}
             try:
@@ -291,8 +320,20 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                     raw_seg2 = m2.group(0)
                     tname2 = m2.group('tmp')
                     if tname2:
+                        tkey = f"#{tname2}"
+                        temp_tables_found.add(tkey)
                         bases2 = self._extract_basic_dependencies(raw_seg2) or set()
-                        temp_base_map[f"#{tname2}"] = {b for b in bases2 if '#' not in b and 'tempdb' not in str(b).lower()}
+                        temp_base_map[tkey] = {b for b in bases2 if '#' not in b and 'tempdb' not in str(b).lower()}
+            except Exception:
+                pass
+            # Also collect temp tables from INSERT INTO #temp
+            try:
+                import re as _re
+                for m3 in _re.finditer(r"(?is)\bINSERT\s+INTO\s+#(?P<tmp>[A-Za-z0-9_]+)\b.*?(?=;|\bINSERT\b|\bCREATE\b|\bALTER\b|\bUPDATE\b|\bDELETE\b|\bEND\b|\bGO\b|$)", src_text):
+                    tname3 = m3.group('tmp')
+                    if tname3:
+                        tkey = f"#{tname3}"
+                        temp_tables_found.add(tkey)
             except Exception:
                 pass
             for d in list(deps_expanded):
@@ -311,11 +352,25 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                     else:
                         simple = d.split('.')[-1]
                         tkey = f"#{simple}"
+                # Keep the temp table in dependencies
+                temp_tables_found.add(tkey)
                 bases = set(self.temp_sources.get(tkey, set()))
                 if not bases and tkey in temp_base_map:
                     bases = set(temp_base_map[tkey])
                 if bases:
                     deps_expanded.update(bases)
+            # Add all temp tables found to dependencies (with canonical names)
+            for tkey in temp_tables_found:
+                # Use canonical temp table name if available
+                ctx_db = getattr(self, '_ctx_db', None) or self.current_database or self.default_database
+                ctx_obj = getattr(self, '_ctx_obj', None) or procedure_name
+                if ctx_db and ctx_obj:
+                    # Normalize procedure name for canonical temp naming
+                    norm_proc = self._normalize_table_name_for_output(ctx_obj) if hasattr(self, '_normalize_table_name_for_output') else ctx_obj.split('.')[-1]
+                    canonical_name = f"{ctx_db}.dbo.{norm_proc}#{tkey.lstrip('#')}"
+                    deps_expanded.add(canonical_name)
+                else:
+                    deps_expanded.add(tkey)
             materialized_output.dependencies = deps_expanded
         except Exception:
             pass
@@ -1289,9 +1344,57 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} contains UPDATE ... OUTPUT ... INTO (length={len(stmt_sql)})")
                 # Try to extract UPDATE ... OUTPUT ... INTO using string fallback
                 try:
+                    # Try to extract UPDATE ... FROM ... (may have OUTPUT ... INTO between SET and FROM)
                     u_lineage, u_cols, u_deps, u_target = self._extract_update_from_lineage_string(stmt_sql)
+                    logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} UPDATE extraction: u_target={u_target}, u_lineage={len(u_lineage)} columns, u_deps={len(u_deps)} deps")
+                    # If _extract_update_from_lineage_string failed, try to extract target table manually
+                    if not u_target:
+                        # Try to find UPDATE target table manually (before OUTPUT ... INTO)
+                        update_match = re.search(r'(?is)\bUPDATE\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?\s+SET\b', stmt_sql)
+                        if update_match:
+                            update_target_or_alias = self._normalize_table_ident(update_match.group(1))
+                            update_alias = (update_match.group(2) or update_match.group(3) or '').strip() or update_target_or_alias
+                            logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} UPDATE target/alias: {update_target_or_alias}, alias: {update_alias}")
+                            # Extract dependencies and find actual table from FROM clause and JOINs
+                            # Find FROM clause (may be before or after OUTPUT)
+                            from_match = re.search(r'(?is)\bFROM\b(.*?)(?:\bOUTPUT\b|\bWHERE\b|$)', stmt_sql)
+                            if from_match:
+                                from_clause = from_match.group(1)
+                                # Extract table names from FROM clause and JOINs, find table matching UPDATE alias
+                                # Search in FROM and all JOIN types (INNER JOIN, LEFT JOIN, etc.)
+                                for tbl_match in re.finditer(r'(?is)(?:FROM|(?:INNER|LEFT|RIGHT|FULL)?\s*JOIN)\s+([^\s,;()]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', ' ' + from_clause):
+                                    tbl = self._normalize_table_ident(tbl_match.group(1))
+                                    tbl_alias = (tbl_match.group(2) or tbl_match.group(3) or '').strip() or tbl
+                                    if tbl and not tbl.startswith('@') and '+' not in tbl:
+                                        # Check if this table matches UPDATE alias
+                                        if tbl_alias.lower() == update_alias.lower():
+                                            # This is the UPDATE target table
+                                            parts = tbl.split('.')
+                                            if len(parts) >= 3:
+                                                u_target = f"{parts[-2]}.{parts[-1]}"
+                                            elif len(parts) == 2:
+                                                u_target = tbl
+                                            else:
+                                                u_target = f"dbo.{tbl}"
+                                            logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} Manually extracted UPDATE target: {u_target} (from alias {update_alias}, table={tbl})")
+                                        # Add to dependencies (for temp tables, use canonical name)
+                                        if tbl.startswith('#'):
+                                            _, tbl = self._ns_and_name(tbl, obj_type_hint="temp_table")
+                                        u_deps.add(tbl)
+                            # If still no target found, use update_target_or_alias directly (might be table name, not alias)
+                            if not u_target:
+                                parts = update_target_or_alias.split('.')
+                                if len(parts) >= 3:
+                                    u_target = f"{parts[-2]}.{parts[-1]}"
+                                elif len(parts) == 2:
+                                    u_target = update_target_or_alias
+                                else:
+                                    u_target = f"dbo.{update_target_or_alias}"
+                                logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} Manually extracted UPDATE target (direct): {u_target}")
+                            logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} Extracted dependencies: {u_deps}")
                     if u_target:
                         out_lineage, out_cols, out_deps, out_target = self._extract_output_into_lineage_string(stmt_sql)
+                        logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} OUTPUT INTO extraction: out_target={out_target}, out_lineage={len(out_lineage)} columns, out_deps={len(out_deps)} deps")
                         if out_target:
                             # Create ObjectInfo for OUTPUT ... INTO target (temp table)
                             ns_out, nm_out = self._ns_and_name(out_target, obj_type_hint="temp_table")
@@ -1359,6 +1462,22 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             if col_names:
                                 self.temp_registry[temp_name] = col_names
                                 logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from UPDATE ... OUTPUT ... INTO fallback: {col_names[:5]}")
+                                # Also create ObjectInfo for this temp table so it can be found in all_outputs
+                                try:
+                                    ns_out, nm_out = self._ns_and_name(temp_name, obj_type_hint="temp_table")
+                                    out_cols = [ColumnSchema(name=col, data_type=None, nullable=True, ordinal=i) for i, col in enumerate(col_names)]
+                                    out_schema = TableSchema(namespace=ns_out, name=nm_out, columns=out_cols)
+                                    out_obj = ObjectInfo(
+                                        name=nm_out,
+                                        object_type="temp_table",
+                                        schema=out_schema,
+                                        lineage=[],  # No lineage for OUTPUT INTO temp tables
+                                        dependencies=set()  # Will be populated from UPDATE dependencies
+                                    )
+                                    all_outputs.append(out_obj)
+                                    logger.debug(f"_parse_procedure_body_statements: Created ObjectInfo for {temp_name} from fallback: {out_obj.name}, columns={len(out_cols)}")
+                                except Exception as obj_error:
+                                    logger.debug(f"_parse_procedure_body_statements: Failed to create ObjectInfo for {temp_name} from fallback: {obj_error}")
                     except Exception as fallback_error:
                         logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from UPDATE ... OUTPUT ... INTO fallback: {fallback_error}")
             try:
@@ -1535,9 +1654,13 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 all_inputs.update(obj.dependencies or [])
         # Handle UPDATE ... OUTPUT ... INTO
         elif isinstance(statement, exp.Update):
-            logger.debug(f"_parse_procedure_body_statements: Found UPDATE statement")
+            logger.debug(f"_parse_procedure_body_statements: Found UPDATE statement (AST-based)")
             # Check if UPDATE has OUTPUT ... INTO clause
-            if hasattr(statement, 'returning') and statement.returning:
+            # In T-SQL, OUTPUT ... INTO is not always in 'returning' attribute, so check SQL string too
+            update_sql = str(statement)
+            has_output_into = (hasattr(statement, 'returning') and statement.returning) or ('OUTPUT' in update_sql.upper() and 'INTO' in update_sql.upper())
+            logger.debug(f"_parse_procedure_body_statements: UPDATE has_output_into={has_output_into}, returning={hasattr(statement, 'returning') and statement.returning}, SQL contains OUTPUT/INTO={'OUTPUT' in update_sql.upper() and 'INTO' in update_sql.upper()}")
+            if has_output_into:
                 # Try to extract UPDATE ... OUTPUT ... INTO lineage
                 try:
                     update_sql = str(statement)
@@ -1840,11 +1963,168 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 
                 all_inputs.update(obj.dependencies or [])
     
+    # Create ObjectInfo for temp tables from temp_registry that are not in all_outputs
+    # This ensures temp tables like #insert_update_temp_asefl, #MaxLoadDate, #MinAccountingPeriod are available
+    for tkey in self.temp_registry.keys():
+        if tkey.startswith('#'):
+            # Check if this temp table is already in all_outputs
+            temp_already_in_outputs = False
+            for obj in all_outputs:
+                if (obj and obj.object_type == "temp_table" and obj.schema and obj.schema.name):
+                    # Check if schema.name ends with tkey (e.g., "dbo.PROC#insert_update_temp_asefl" ends with "#insert_update_temp_asefl")
+                    if obj.schema.name.endswith(tkey) or obj.schema.name.endswith(tkey.lstrip('#')):
+                        temp_already_in_outputs = True
+                        logger.debug(f"_parse_procedure_body_statements: Temp table {tkey} already in all_outputs as {obj.schema.name}")
+                        break
+            if not temp_already_in_outputs:
+                try:
+                    ns_out, nm_out = self._ns_and_name(tkey, obj_type_hint="temp_table")
+                    col_names = self.temp_registry[tkey]
+                    out_cols = [ColumnSchema(name=col, data_type=None, nullable=True, ordinal=i) for i, col in enumerate(col_names)]
+                    out_schema = TableSchema(namespace=ns_out, name=nm_out, columns=out_cols)
+                    out_obj = ObjectInfo(
+                        name=nm_out,
+                        object_type="temp_table",
+                        schema=out_schema,
+                        lineage=[],  # No lineage for temp tables from temp_registry
+                        dependencies=set()  # Will be populated from temp_sources if available
+                    )
+                    # Try to get dependencies from temp_sources
+                    if tkey in self.temp_sources:
+                        out_obj.dependencies = self.temp_sources[tkey]
+                    all_outputs.append(out_obj)
+                    logger.debug(f"_parse_procedure_body_statements: Created ObjectInfo for {tkey} from temp_registry: {out_obj.name}, columns={len(out_cols)}, dependencies={len(out_obj.dependencies)}")
+                except Exception as obj_error:
+                    logger.debug(f"_parse_procedure_body_statements: Failed to create ObjectInfo for {tkey} from temp_registry: {obj_error}")
+    
     # Prefer best match (procedure name → table name), otherwise use last persistent
     result_output = best_match_output or last_persistent_output
     
-    # If we found persistent outputs, return the best one
+    # If we found persistent outputs, merge lineage from UPDATE if it targets the same table
     if result_output:
+        # Check if there's an UPDATE that targets the same table
+        result_table_name = result_output.schema.name if result_output.schema else result_output.name
+        update_obj = None
+        insert_update_temp_obj = None
+        logger.debug(f"_parse_procedure_body_statements: Looking for UPDATE and #insert_update_temp_asefl for {result_table_name}, all_outputs count: {len(all_outputs)}")
+        for obj in all_outputs:
+            if obj and obj.schema:
+                logger.debug(f"_parse_procedure_body_statements: Checking obj: {obj.object_type}, name={obj.schema.name}")
+            if (obj and obj.object_type == "table" and obj.schema and 
+                obj.schema.name == result_table_name and obj != result_output):
+                # This is an UPDATE targeting the same table
+                update_obj = obj
+                logger.debug(f"_parse_procedure_body_statements: Found update_obj: {update_obj.name}, lineage={len(update_obj.lineage)} columns")
+            elif (obj and obj.object_type == "temp_table" and obj.schema and
+                  'insert_update_temp_asefl' in obj.schema.name.lower()):
+                # Found #insert_update_temp_asefl
+                insert_update_temp_obj = obj
+                logger.debug(f"_parse_procedure_body_statements: Found insert_update_temp_obj: {insert_update_temp_obj.name}, dependencies={insert_update_temp_obj.dependencies}")
+        
+        # If UPDATE exists and #insert_update_temp_asefl exists, merge lineage
+        # UPDATE modifies TrialBalance_asefl_BV and OUTPUT INTO #insert_update_temp_asefl
+        # So columns updated by UPDATE should have lineage through #insert_update_temp_asefl
+        if update_obj and insert_update_temp_obj and update_obj.lineage:
+            if not result_output.lineage:
+                result_output.lineage = []
+            # For columns updated by UPDATE, lineage should go through #insert_update_temp_asefl
+            for lin in update_obj.lineage:
+                # Replace input_fields to point to #insert_update_temp_asefl instead of direct sources
+                from ..models import ColumnLineage, ColumnReference, TransformationType
+                updated_input_fields = []
+                # If lineage has input_fields pointing to #asefl_temp or other sources,
+                # replace them with #insert_update_temp_asefl
+                if lin.input_fields:
+                    for input_field in lin.input_fields:
+                        # Replace with #insert_update_temp_asefl reference
+                        updated_input_fields.append(ColumnReference(
+                            namespace=insert_update_temp_obj.schema.namespace,
+                            table_name=insert_update_temp_obj.schema.name,
+                            column_name=input_field.column_name
+                        ))
+                else:
+                    # No input_fields, use column name from output
+                    updated_input_fields.append(ColumnReference(
+                        namespace=insert_update_temp_obj.schema.namespace,
+                        table_name=insert_update_temp_obj.schema.name,
+                        column_name=lin.output_column
+                    ))
+                
+                # Check if this column already exists in result_output.lineage
+                existing = next((l for l in result_output.lineage if l.output_column == lin.output_column), None)
+                if existing:
+                    # Merge input_fields - add #insert_update_temp_asefl as source
+                    if not existing.input_fields:
+                        existing.input_fields = []
+                    existing.input_fields.extend(updated_input_fields)
+                else:
+                    # Add new lineage entry
+                    result_output.lineage.append(ColumnLineage(
+                        output_column=lin.output_column,
+                        input_fields=updated_input_fields,
+                        transformation_type=lin.transformation_type,
+                        transformation_description=f"from UPDATE through {insert_update_temp_obj.schema.name}"
+                    ))
+        # Expand temp dependencies on the final output, if any
+        # Keep temp tables in dependencies AND expand them to base sources
+        try:
+            deps_expanded = set(result_output.dependencies or [])
+            # Collect all temp tables found in dependencies
+            temp_tables_found = set()
+            for d in list(deps_expanded):
+                low = str(d).lower()
+                is_temp = ('#' in d) or ('tempdb' in low)
+                if is_temp:
+                    if '#' in d:
+                        tname = d.split('#', 1)[1]
+                        tname = tname.split('.')[0]
+                        tkey = f"#{tname}"
+                    else:
+                        simple = d.split('.')[-1]
+                        tkey = f"#{simple}"
+                    # Keep the temp table in dependencies
+                    temp_tables_found.add(tkey)
+                    bases = set(self.temp_sources.get(tkey, set()))
+                    if bases:
+                        deps_expanded.update(bases)
+            # Add all temp tables from all_outputs to dependencies (with canonical names)
+            for obj in all_outputs:
+                if obj and obj.name and (obj.name.startswith("#") or "tempdb" in obj.name.lower()):
+                    # Extract simple temp name
+                    if '#' in obj.name:
+                        tname = obj.name.split('#', 1)[1]
+                        tname = tname.split('.')[0]
+                        tkey = f"#{tname}"
+                    else:
+                        tkey = f"#{obj.name.split('.')[-1]}"
+                    temp_tables_found.add(tkey)
+                    # Use canonical temp table name if available
+                    ctx_db = getattr(self, '_ctx_db', None) or self.current_database or self.default_database
+                    ctx_obj = getattr(self, '_ctx_obj', None) or (object_hint or "unknown_procedure")
+                    if ctx_db and ctx_obj:
+                        # Normalize procedure name for canonical temp naming
+                        norm_proc = self._normalize_table_name_for_output(ctx_obj) if hasattr(self, '_normalize_table_name_for_output') else ctx_obj.split('.')[-1]
+                        canonical_name = f"{ctx_db}.dbo.{norm_proc}#{tkey.lstrip('#')}"
+                        deps_expanded.add(canonical_name)
+                    else:
+                        deps_expanded.add(tkey)
+            # Also add temp tables from temp_registry that might not be in all_outputs
+            for tkey in self.temp_registry.keys():
+                if tkey.startswith('#'):
+                    temp_tables_found.add(tkey)
+                    # Use canonical temp table name if available
+                    ctx_db = getattr(self, '_ctx_db', None) or self.current_database or self.default_database
+                    ctx_obj = getattr(self, '_ctx_obj', None) or (object_hint or "unknown_procedure")
+                    if ctx_db and ctx_obj:
+                        # Normalize procedure name for canonical temp naming
+                        norm_proc = self._normalize_table_name_for_output(ctx_obj) if hasattr(self, '_normalize_table_name_for_output') else ctx_obj.split('.')[-1]
+                        canonical_name = f"{ctx_db}.dbo.{norm_proc}#{tkey.lstrip('#')}"
+                        deps_expanded.add(canonical_name)
+                    else:
+                        deps_expanded.add(tkey)
+            result_output.dependencies = deps_expanded
+        except Exception:
+            pass
         # DON'T restore context - it's needed for temp table canonical naming in engine.py Phase 3
         # The context will be restored when the next file is parsed (in parse_sql_file)
         # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj

@@ -111,43 +111,7 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     else:
         logger.debug(f"_parse_select_into: No lineage extracted for {table_name}")
 
-    if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
-        simple_key = self._extract_temp_name(raw_target if '#' in raw_target else '#' + raw_target)
-        if not simple_key.startswith('#'):
-            simple_key = f"#{simple_key}"
-        namespace, table_name = self._ns_and_name(simple_key, obj_type_hint="temp_table")
-        temp_cols = [col.name for col in output_columns]
-        ver_key = self._temp_next(simple_key)
-        self.temp_registry[ver_key] = temp_cols
-        self.temp_registry[simple_key] = temp_cols
-        base_sources: Set[str] = set()
-        for d in dependencies:
-            is_dep_temp = ('#' in d or 'tempdb' in d.lower())
-            if not is_dep_temp:
-                base_sources.add(d)
-            else:
-                dep_simple = self._extract_temp_name(d) if '#' in d else d.split('.')[-1]
-                if not dep_simple.startswith('#'):
-                    dep_simple = f"#{dep_simple}"
-                dep_bases = self.temp_sources.get(dep_simple, set())
-                if dep_bases:
-                    base_sources.update(dep_bases)
-                else:
-                    base_sources.add(d)
-        self.temp_sources[simple_key] = base_sources
-        try:
-            col_map = {lin.output_column: list(lin.input_fields or []) for lin in (lineage or [])}
-            logger.debug(f"_parse_select_into: temp_lineage for {simple_key}: {len(col_map)} columns")
-            for col_name, refs in list(col_map.items())[:3]:  # Show first 3 columns
-                logger.debug(f"_parse_select_into: temp_lineage[{simple_key}][{col_name}]: {len(refs)} references")
-            self.temp_lineage[ver_key] = col_map
-            self.temp_lineage[simple_key] = col_map
-            logger.debug(f"_parse_select_into: Stored temp_lineage for {simple_key}: {len(col_map)} columns, ver_key={ver_key}")
-        except Exception as e:
-            logger.debug(f"_parse_select_into: Exception storing temp_lineage: {e}")
-            logger.debug(f"_parse_select_into: Exception storing temp_lineage for {simple_key}: {e}")
-            pass
-
+    # Build final_dependencies first (with CTE expansion) before using it for temp_sources
     final_dependencies: Set[str] = set()
     for d in dependencies:
         is_dep_temp = ('#' in d or 'tempdb' in d.lower())
@@ -175,12 +139,22 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
                         cte_def = None
                     if cte_def and isinstance(cte_def, exp.Select):
                         cte_deps = self._extract_dependencies(cte_def)
-                        # Add base sources from CTE (excluding temp tables and CTEs)
+                        # Add base sources from CTE (expand temp tables to their base sources, exclude CTEs)
                         for cte_dep in cte_deps:
                             cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
                             is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in self.temp_registry)
                             is_cte_dep_cte = cte_dep_simple and cte_dep_simple.lower() in cte_registry_lower
-                            if not is_cte_dep_temp and not is_cte_dep_cte:
+                            if is_cte_dep_temp:
+                                # Expand temp table to its base sources
+                                temp_key = cte_dep_simple if cte_dep_simple.startswith('#') else f"#{cte_dep_simple}"
+                                temp_bases = self.temp_sources.get(temp_key, set())
+                                if temp_bases:
+                                    final_dependencies.update(temp_bases)
+                                    logger.debug(f"_parse_select_into: Expanded temp table {cte_dep} to base sources: {temp_bases}")
+                                else:
+                                    # If no base sources found, add temp table itself
+                                    final_dependencies.add(cte_dep)
+                            elif not is_cte_dep_cte:
                                 final_dependencies.add(cte_dep)
                                 logger.debug(f"_parse_select_into: Added base source {cte_dep} from CTE {cte_name}")
             continue
@@ -194,6 +168,44 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
             dep_bases = self.temp_sources.get(dep_simple, set())
             if dep_bases:
                 final_dependencies.update(dep_bases)
+
+    if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
+        simple_key = self._extract_temp_name(raw_target if '#' in raw_target else '#' + raw_target)
+        if not simple_key.startswith('#'):
+            simple_key = f"#{simple_key}"
+        namespace, table_name = self._ns_and_name(simple_key, obj_type_hint="temp_table")
+        temp_cols = [col.name for col in output_columns]
+        ver_key = self._temp_next(simple_key)
+        self.temp_registry[ver_key] = temp_cols
+        self.temp_registry[simple_key] = temp_cols
+        base_sources: Set[str] = set()
+        # Use final_dependencies (with CTE expansion) instead of dependencies
+        for d in final_dependencies:
+            is_dep_temp = ('#' in d or 'tempdb' in d.lower())
+            if not is_dep_temp:
+                base_sources.add(d)
+            else:
+                dep_simple = self._extract_temp_name(d) if '#' in d else d.split('.')[-1]
+                if not dep_simple.startswith('#'):
+                    dep_simple = f"#{dep_simple}"
+                dep_bases = self.temp_sources.get(dep_simple, set())
+                if dep_bases:
+                    base_sources.update(dep_bases)
+                else:
+                    base_sources.add(d)
+        self.temp_sources[simple_key] = base_sources
+        try:
+            col_map = {lin.output_column: list(lin.input_fields or []) for lin in (lineage or [])}
+            logger.debug(f"_parse_select_into: temp_lineage for {simple_key}: {len(col_map)} columns")
+            for col_name, refs in list(col_map.items())[:3]:  # Show first 3 columns
+                logger.debug(f"_parse_select_into: temp_lineage[{simple_key}][{col_name}]: {len(refs)} references")
+            self.temp_lineage[ver_key] = col_map
+            self.temp_lineage[simple_key] = col_map
+            logger.debug(f"_parse_select_into: Stored temp_lineage for {simple_key}: {len(col_map)} columns, ver_key={ver_key}")
+        except Exception as e:
+            logger.debug(f"_parse_select_into: Exception storing temp_lineage: {e}")
+            logger.debug(f"_parse_select_into: Exception storing temp_lineage for {simple_key}: {e}")
+            pass
 
     schema = TableSchema(namespace=namespace, name=table_name, columns=output_columns)
     self.schema_registry.register(schema)

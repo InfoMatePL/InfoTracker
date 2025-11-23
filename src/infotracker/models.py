@@ -327,7 +327,9 @@ class ColumnGraph:
     def build_from_object_lineage(self, objects: List[ObjectInfo]) -> None:
         """Build column graph from object lineage information."""
         # Build a map of old temp table names to new ones (e.g., "dbo.#asefl_temp" -> "dbo.update_asefl_TrialBalance_BV#asefl_temp")
+        # Also build a map of temp table names to their ObjectInfo for lineage expansion
         temp_name_map: Dict[str, str] = {}
+        temp_obj_map: Dict[str, ObjectInfo] = {}  # temp table name -> ObjectInfo
         for obj in objects:
             if obj.object_type == "temp_table" and obj.schema.name:
                 # obj.schema.name is in new format: "dbo.update_asefl_TrialBalance_BV#asefl_temp" (or with DB prefix)
@@ -342,10 +344,18 @@ class ColumnGraph:
                 # Extract temp table name (part after last '#')
                 if '#' in normalized_name:
                     temp_part = normalized_name.split('#')[-1]
+                    # Map various old formats to new canonical format
                     old_name = f"dbo.#{temp_part}"
                     temp_name_map[old_name] = normalized_name
+                    temp_obj_map[normalized_name] = obj
                     # Also map without schema
                     temp_name_map[f"#{temp_part}"] = normalized_name
+                    # Map with DB prefix if namespace has DB
+                    if ns_db:
+                        temp_name_map[f"{ns_db}.dbo.#{temp_part}"] = normalized_name
+                        temp_name_map[f"{ns_db}.#{temp_part}"] = normalized_name
+                        # Also map with DB prefix for temp_obj_map
+                        temp_obj_map[f"{ns_db}.{normalized_name}"] = obj
         
         for obj in objects:
             output_namespace = obj.schema.namespace
@@ -385,13 +395,114 @@ class ColumnGraph:
                         in_db = in_ns.rsplit('/', 1)[1] if in_ns else None
                     except Exception:
                         in_db = None
+                    
+                    # Check temp_name_map BEFORE normalizing DB prefix, as map may contain DB-prefixed keys
+                    # Try multiple variants: with DB prefix, without DB prefix, with schema, without schema
+                    original_tbl = in_tbl
+                    temp_obj = None
+                    if in_tbl and '#' in in_tbl:
+                        # Try different variants to find mapping
+                        variants = [in_tbl]
+                        if in_db:
+                            # Try with DB prefix
+                            if not in_tbl.startswith(f"{in_db}."):
+                                variants.append(f"{in_db}.{in_tbl}")
+                            # Try without DB prefix (after normalization)
+                            if in_tbl.startswith(f"{in_db}."):
+                                variants.append(in_tbl[len(in_db) + 1:])
+                        # Try without schema (just #temp)
+                        if '.' in in_tbl:
+                            temp_part = in_tbl.split('#')[-1] if '#' in in_tbl else None
+                            if temp_part:
+                                variants.append(f"#{temp_part}")
+                                if in_db:
+                                    variants.append(f"{in_db}.#{temp_part}")
+                        
+                        # Check each variant for temp_name_map
+                        mapped_tbl = None
+                        for variant in variants:
+                            if variant in temp_name_map:
+                                mapped_tbl = temp_name_map[variant]
+                                break
+                        
+                        # If we found a mapping, also check if we have temp_obj for lineage expansion
+                        if mapped_tbl:
+                            in_tbl = mapped_tbl
+                            # Try to find temp_obj for this temp table - try multiple variants
+                            search_variants = [mapped_tbl]
+                            if in_db:
+                                search_variants.append(f"{in_db}.{mapped_tbl}")
+                            # Also try with original_tbl variants if they map to the same temp
+                            if original_tbl and original_tbl != mapped_tbl:
+                                search_variants.append(original_tbl)
+                                if in_db:
+                                    search_variants.append(f"{in_db}.{original_tbl}")
+                            # Try all variants
+                            for variant in search_variants:
+                                if variant in temp_obj_map:
+                                    temp_obj = temp_obj_map[variant]
+                                    break
+                            # If still not found, try to find by matching the temp part
+                            if not temp_obj and '#' in mapped_tbl:
+                                temp_part = mapped_tbl.split('#')[-1]
+                                for key, obj in temp_obj_map.items():
+                                    if key.endswith(f"#{temp_part}") or key == f"#{temp_part}":
+                                        temp_obj = obj
+                                        break
+                    
+                    # If input is a temp table and we have its ObjectInfo, expand to base sources
+                    if temp_obj and temp_obj.lineage:
+                        # Find lineage for this column in temp table
+                        temp_lineage = next((ln for ln in temp_obj.lineage if ln.output_column == input_field.column_name), None)
+                        if temp_lineage and temp_lineage.input_fields:
+                            # Filter out self-references (temp table referencing itself)
+                            # Only include base sources (not temp tables)
+                            base_inputs = []
+                            for base_input in temp_lineage.input_fields:
+                                base_tbl_name = base_input.table_name or ""
+                                # Skip if this is a self-reference to the temp table
+                                if '#' in base_tbl_name:
+                                    # Check if it's the same temp table
+                                    temp_part = base_tbl_name.split('#')[-1] if '#' in base_tbl_name else ""
+                                    if temp_part and temp_part in mapped_tbl:
+                                        # This is a self-reference, skip it
+                                        continue
+                                # This is a base source, include it
+                                base_inputs.append(base_input)
+                            
+                            # Expand temp table to base sources - create edges from base sources to output
+                            if base_inputs:
+                                for base_input in base_inputs:
+                                    base_ns = base_input.namespace
+                                    base_tbl = base_input.table_name
+                                    # Normalize base table name
+                                    try:
+                                        base_db = base_ns.rsplit('/', 1)[1] if base_ns else None
+                                    except Exception:
+                                        base_db = None
+                                    if base_db and base_tbl and base_tbl.startswith(f"{base_db}."):
+                                        base_tbl = base_tbl[len(base_db) + 1:]
+                                    
+                                    base_column = ColumnNode(
+                                        namespace=base_ns,
+                                        table_name=base_tbl,
+                                        column_name=base_input.column_name
+                                    )
+                                    
+                                    edge = ColumnEdge(
+                                        from_column=base_column,
+                                        to_column=output_column,
+                                        transformation_type=lineage.transformation_type,
+                                        transformation_description=lineage.transformation_description
+                                    )
+                                    
+                                    self.add_edge(edge)
+                                # Skip creating edge from temp table itself
+                                continue
+                    
+                    # Normalize DB prefix AFTER temp_name_map lookup
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
                         in_tbl = in_tbl[len(in_db) + 1:]
-                    
-                    # Normalize temp table names: if in_tbl is old format (e.g., "dbo.#asefl_temp"), 
-                    # replace with new format from temp_name_map
-                    if in_tbl in temp_name_map:
-                        in_tbl = temp_name_map[in_tbl]
 
                     input_column = ColumnNode(
                         namespace=in_ns,

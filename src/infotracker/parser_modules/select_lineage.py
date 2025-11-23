@@ -51,20 +51,24 @@ def _build_alias_maps(self, select_exp: exp.Select):
             else:
                 alias = str(a).lower()
         fqn = self._qualify_table(t)
-        # If this table corresponds to a known temp by simple name, use simple format
+        # If this table corresponds to a known temp by simple name, use canonical format
         try:
             parts_tmp = (fqn or '').split('.')
             simple = parts_tmp[-1] if parts_tmp else None
             if simple:
                 # Check if it's a temp table (starts with # or is in temp_registry with #)
+                temp_seg = None
                 if str(simple).startswith('#'):
                     # Already has #, check if it's in temp_registry
                     if simple in self.temp_registry:
-                        # Use simple format dbo.#temp instead of canonical with procedure context
-                        fqn = f"dbo.{simple}"
+                        temp_seg = simple
                 elif f"#{simple}" in self.temp_registry:
-                    # Use simple format dbo.#temp instead of canonical with procedure context
-                    fqn = f"dbo.#{simple}"
+                    temp_seg = f"#{simple}"
+                
+                if temp_seg:
+                    # Use canonical format with procedure context: schema.object#temp
+                    _, canonical_name = self._ns_and_name(temp_seg, obj_type_hint="temp_table")
+                    fqn = canonical_name
         except Exception:
             pass
         if alias:

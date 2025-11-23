@@ -739,7 +739,7 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
         if len(parts) == 2:
             return name
         return f"dbo.{name}"
-    m_upd = re.search(r'(?is)\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
+    m_upd = re.search(r'(?is)\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;#]+)', s)
     dml_type = None
     out_exprs = None
     dml_target = None

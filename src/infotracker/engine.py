@@ -264,12 +264,22 @@ class Engine:
         
         # Phase 3: Process objects in dependency order, building up schema registry
         resolved_objects: List[ObjectInfo] = []
+        # Store temp_lineage, temp_sources, and temp_registry from ALL procedures (global, not per obj_name)
+        # This allows source JSON for temp tables to use dependencies even if procedure and table have different obj_name
+        # BUT: temp tables are still scoped to their procedure context (canonical naming)
+        global_saved_temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}
+        global_saved_temp_sources: Dict[str, Set[str]] = {}
+        global_saved_temp_registry: Dict[str, List[str]] = {}
         for obj_name in processing_order:
             if obj_name not in sql_file_map:
                 continue
             # Parse every file that contributes to this object name first, then enrich
             group_infos: List[ObjectInfo] = []
             group_paths: List[Path] = []
+            # Store temp_lineage, temp_sources, and temp_registry from procedures before they get cleared (local for this obj_name)
+            saved_temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}
+            saved_temp_sources: Dict[str, Set[str]] = {}
+            saved_temp_registry: Dict[str, List[str]] = {}
             for sql_path in sql_file_map[obj_name]:
                 try:
                     sql_text = read_text_safely(sql_path, encoding=req.encoding)
@@ -299,6 +309,18 @@ class Engine:
                     
                     # Parse the file - this will re-detect USE statement and set current_database
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                    
+                    # Save temp_lineage, temp_sources, and temp_registry from procedures before they get cleared
+                    if obj_info.object_type == "procedure" or "procedure" in str(sql_path).lower():
+                        # Save temp_lineage, temp_sources, and temp_registry for later use (local)
+                        saved_temp_lineage.update(parser.temp_lineage)
+                        saved_temp_sources.update(parser.temp_sources)
+                        saved_temp_registry.update(parser.temp_registry)
+                        # Also save globally for source JSON creation (temp tables may be referenced from other obj_name)
+                        global_saved_temp_lineage.update(parser.temp_lineage)
+                        global_saved_temp_sources.update(parser.temp_sources)
+                        global_saved_temp_registry.update(parser.temp_registry)
+                        logger.debug(f"Phase 3: Saved temp_lineage from {sql_path.stem}: {len(saved_temp_lineage)} temp tables, keys: {list(saved_temp_lineage.keys())[:5]}")
                     
                     # Restore saved context after parse_sql_file (which may reset it)
                     # First, try to restore from Phase 1 context_map
@@ -333,6 +355,12 @@ class Engine:
             except Exception:
                 pass
 
+            # DON'T expand temp table references in union_lineage - keep them as-is
+            # Temp tables that are direct sources in union_lineage (e.g., #asefl_temp) should remain in lineage
+            # Only expand in column_graph.json using build_from_object_lineage, which handles multi-level expansion
+            # This preserves intermediate temp tables (e.g., #insert_update_temp_asefl) in the lineage path
+            expanded_union_lineage = union_lineage
+
             # Now emit each file, enriching table-only DDL objects with union lineage if they had none
             for obj_info, sql_path in zip(group_infos, group_paths):
                 try:
@@ -357,8 +385,8 @@ class Engine:
                             pass
 
                     # Enrich: if this is a 'table' with no lineage but a sibling provided lineage
-                    if (getattr(obj_info, 'object_type', None) == 'table' and not obj_info.lineage and union_lineage):
-                        obj_info.lineage = list(union_lineage)
+                    if (getattr(obj_info, 'object_type', None) == 'table' and not obj_info.lineage and expanded_union_lineage):
+                        obj_info.lineage = list(expanded_union_lineage)
                         if not obj_info.dependencies:
                             obj_info.dependencies = set(union_deps)
 
@@ -379,12 +407,22 @@ class Engine:
                     outputs.append([str(sql_path), str(target)])
 
                     # Additionally, emit separate OL events for temp tables created in this file
-                    # Use a set to deduplicate temp table keys (avoid duplicates from different parsing passes)
+                    # Use saved_temp_lineage/global_saved_temp_lineage instead of parser.temp_registry
+                    # because parser.temp_registry is cleared before each parsing (line 301)
+                    # This ensures temp tables from procedures are included even when CREATE TABLE is processed after
                     try:
                         temp_keys_set = set()
+                        # First, try saved_temp_lineage (local to this obj_name)
+                        for k in saved_temp_lineage.keys():
+                            if isinstance(k, str) and k.startswith('#') and '@' not in k:
+                                temp_keys_set.add(k)
+                        # Also check global_saved_temp_lineage (for temp tables from other procedures)
+                        for k in global_saved_temp_lineage.keys():
+                            if isinstance(k, str) and k.startswith('#') and '@' not in k:
+                                temp_keys_set.add(k)
+                        # Fallback to parser.temp_registry if available (for temp tables created in this file)
                         for k in parser.temp_registry.keys():
                             if isinstance(k, str) and k.startswith('#') and '@' not in k:
-                                # Use simple temp name (without version) as unique key
                                 temp_keys_set.add(k)
                         temp_keys = sorted(list(temp_keys_set))
                     except Exception:
@@ -413,11 +451,16 @@ class Engine:
                                     schema.name = table_name
                             else:
                                 logger.debug(f"Phase 3: No schema in registry for {tmp}, creating new schema with name={table_name}")
-                                cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(parser.temp_registry.get(tmp, []) or [])]
+                                # Use saved_temp_registry/global_saved_temp_registry instead of parser.temp_registry
+                                # because parser.temp_registry is cleared before each parsing (line 301)
+                                col_names = saved_temp_registry.get(tmp, []) or global_saved_temp_registry.get(tmp, []) or parser.temp_registry.get(tmp, []) or []
+                                cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(col_names)]
                                 schema = TableSchema(namespace=ns_tmp, name=table_name, columns=cols)
                             # Build lineage
                             lin_list = []
-                            col_map = parser.temp_lineage.get(tmp) or {}
+                            # Use saved_temp_lineage/global_saved_temp_lineage instead of parser.temp_lineage
+                            # because parser.temp_lineage is cleared before each parsing (line 303)
+                            col_map = saved_temp_lineage.get(tmp) or global_saved_temp_lineage.get(tmp) or parser.temp_lineage.get(tmp) or {}
                             logger.debug(f"Phase 3: temp_lineage for {tmp}: {len(col_map)} columns, keys={list(col_map.keys())[:5] if col_map else []}")
                             # If temp_lineage is empty, or if it contains CTE references instead of real tables, try to extract sources from SQL
                             # Check if temp_lineage contains CTE references (not real tables) or if all references are empty
@@ -452,11 +495,22 @@ class Engine:
                                         match = None
                                         from_table = None
                                         # Try UPDATE ... OUTPUT ... INTO #tmp pattern first (for temp tables created by UPDATE)
-                                        pattern_update_output = rf'(?is)UPDATE\s+.*?\bOUTPUT\s+.*?\bINTO\s+#{re.escape(temp_name_simple)}\b[^;]*?\bFROM\s+([#\w]+(?:\.[#\w]+)*)'
-                                        match_update = re.search(pattern_update_output, sql_text)
-                                        if match_update:
-                                            from_table = match_update.group(1).strip('[]')
-                                            logger.debug(f"Phase 3: Found UPDATE ... OUTPUT ... INTO pattern for {tmp}, FROM={from_table}")
+                                        # UPDATE may have FROM before OUTPUT or after INTO
+                                        # Pattern 1: UPDATE ... FROM ... OUTPUT ... INTO #tmp
+                                        pattern_update_output1 = rf'(?is)UPDATE\s+.*?\bFROM\s+([#\w]+(?:\.[#\w]+)*)[^;]*?\bOUTPUT\s+.*?\bINTO\s+#{re.escape(temp_name_simple)}\b'
+                                        match_update1 = re.search(pattern_update_output1, sql_text)
+                                        if match_update1:
+                                            from_table = match_update1.group(1).strip('[]')
+                                            logger.debug(f"Phase 3: Found UPDATE ... FROM ... OUTPUT ... INTO pattern for {tmp}, FROM={from_table}")
+                                        else:
+                                            # Pattern 2: UPDATE ... OUTPUT ... INTO #tmp ... FROM ...
+                                            pattern_update_output2 = rf'(?is)UPDATE\s+.*?\bOUTPUT\s+.*?\bINTO\s+#{re.escape(temp_name_simple)}\b[^;]*?\bFROM\s+([#\w]+(?:\.[#\w]+)*)'
+                                            match_update2 = re.search(pattern_update_output2, sql_text)
+                                            if match_update2:
+                                                from_table = match_update2.group(1).strip('[]')
+                                                logger.debug(f"Phase 3: Found UPDATE ... OUTPUT ... INTO ... FROM pattern for {tmp}, FROM={from_table}")
+                                        if match_update1 or match_update2:
+                                            match_update = match_update1 or match_update2
                                         else:
                                             # Try SELECT ... INTO #tmp ... FROM ... pattern
                                             # Handle both WITH ... SELECT ... INTO and plain SELECT ... INTO
@@ -537,8 +591,6 @@ class Engine:
                                                 ))
                                             logger.debug(f"Phase 3: Created fallback lineage for {tmp} from pattern: {nm_from}: {len(lin_list)} columns")
                                             break
-                                            logger.debug(f"Phase 3: Created fallback lineage for {tmp} from UPDATE ... OUTPUT ... INTO: {nm_from}: {len(lin_list)} columns")
-                                            break
                                 except Exception as e:
                                     logger.debug(f"Phase 3: Failed to create fallback lineage for {tmp}: {e}")
                                     import traceback
@@ -558,34 +610,73 @@ class Engine:
                                 # logger.debug(f"Phase 3: refs for {tmp}.{col.name}: {len(refs)} references")
                                 # Normalize temp table references to use new format (schema.object#temp)
                                 normalized_refs = []
+                                # Build temp_name_map for this temp table
+                                ref_ns, ref_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
+                                temp_name_map_local = {}
+                                # Map various old formats to new canonical format
+                                temp_part = tmp.lstrip('#')
+                                temp_name_map_local[f"dbo.#{temp_part}"] = ref_name
+                                temp_name_map_local[f"#{temp_part}"] = ref_name
+                                try:
+                                    ns_db = ref_ns.rsplit('/', 1)[1] if ref_ns else None
+                                    if ns_db:
+                                        temp_name_map_local[f"{ns_db}.dbo.#{temp_part}"] = ref_name
+                                        temp_name_map_local[f"{ns_db}.#{temp_part}"] = ref_name
+                                except Exception:
+                                    pass
+                                
                                 for ref in refs:
                                     # If this reference points to the same temp table, update it to new format
-                                    # Check if ref.table_name contains the temp table name (e.g., "dbo.#asefl_temp" contains "#asefl_temp")
-                                    temp_name_simple = tmp.lstrip('#')  # Remove # for comparison
                                     should_normalize = False
-                                    if ref.table_name:
-                                        # Check various formats: "dbo.#asefl_temp", "#asefl_temp", "dbo.asefl_temp", etc.
-                                        if tmp in ref.table_name or f"#{temp_name_simple}" in ref.table_name or ref.table_name.endswith(tmp):
-                                            should_normalize = True
-                                        # Also check if it's just the temp name without schema
-                                        elif ref.table_name == tmp or ref.table_name == temp_name_simple:
-                                            should_normalize = True
+                                    ref_table = ref.table_name
+                                    if ref_table and '#' in ref_table:
+                                        # Check if ref.table_name matches any old format in temp_name_map
+                                        # Try different variants: with DB prefix, without DB prefix, with schema, without schema
+                                        variants = [ref_table]
+                                        try:
+                                            ref_db = ref.namespace.rsplit('/', 1)[1] if ref.namespace else None
+                                            if ref_db and not ref_table.startswith(f"{ref_db}."):
+                                                variants.append(f"{ref_db}.{ref_table}")
+                                            if ref_table.startswith(f"{ref_db}.") if ref_db else False:
+                                                variants.append(ref_table[len(ref_db) + 1:])
+                                            # Try without schema (just #temp)
+                                            if '.' in ref_table:
+                                                temp_part_ref = ref_table.split('#')[-1] if '#' in ref_table else None
+                                                if temp_part_ref:
+                                                    variants.append(f"#{temp_part_ref}")
+                                                    if ref_db:
+                                                        variants.append(f"{ref_db}.#{temp_part_ref}")
+                                        except Exception:
+                                            pass
+                                        
+                                        # Check each variant
+                                        for variant in variants:
+                                            if variant in temp_name_map_local:
+                                                ref_table = temp_name_map_local[variant]
+                                                should_normalize = True
+                                                break
+                                        
+                                        # Also check if it's the same temp table by simple name
+                                        if not should_normalize:
+                                            temp_name_simple = tmp.lstrip('#')
+                                            if (tmp in ref_table or f"#{temp_name_simple}" in ref_table or 
+                                                ref_table.endswith(tmp) or ref_table == tmp or ref_table == temp_name_simple):
+                                                should_normalize = True
+                                    
                                     if should_normalize:
-                                        # Update to new format
-                                        ref_ns, ref_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
-                                        # DEBUG: Uncomment to see temp table processing
-                                        # logger.debug(f"Phase 3: Normalizing ref {ref.table_name} -> {ref_name} for temp {tmp}")
-                                        normalized_refs.append(ColumnReference(namespace=ref_ns, table_name=ref_name, column_name=ref.column_name))
+                                        # This is a self-reference to the temp table - skip it, we want base sources only
+                                        # Don't add self-references to lineage
+                                        continue
                                     else:
-                                        # Keep other references as-is
-                                        # DEBUG: Uncomment to see temp table processing
-                                        # logger.debug(f"Phase 3: Keeping ref as-is: {ref.table_name} (temp: {tmp})")
+                                        # Keep other references as-is (these are base sources)
                                         normalized_refs.append(ref)
                                 if normalized_refs:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=normalized_refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
                                 else:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
-                            deps = set(parser.temp_sources.get(tmp, set()) or set())
+                            # Use saved_temp_sources/global_saved_temp_sources instead of parser.temp_sources
+                            # because parser.temp_sources is cleared before each parsing (line 302)
+                            deps = set(saved_temp_sources.get(tmp, set()) or global_saved_temp_sources.get(tmp, set()) or parser.temp_sources.get(tmp, set()) or set())
                             temp_obj = ObjectInfo(name=table_name, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
                             logger.debug(f"Phase 3: Created temp_obj for {tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
                             # Include in graph
@@ -612,6 +703,64 @@ class Engine:
                     # Optionally emit minimal source dataset events for inputs that do not have their own outputs
                     if self._emit_external_sources:
                         try:
+                            # Build temp_name_map from all resolved objects for normalizing temp table names
+                            temp_name_map_sources = {}
+                            temp_obj_map_sources = {}  # Map normalized name -> temp_obj for getting dependencies
+                            temp_sources_map = {}  # Map normalized name -> Set[str] dependencies from saved_temp_sources
+                            for resolved_obj in resolved_objects:
+                                if resolved_obj.object_type == "temp_table" and resolved_obj.schema and resolved_obj.schema.name:
+                                    normalized_name = resolved_obj.schema.name
+                                    try:
+                                        ns_db = resolved_obj.schema.namespace.rsplit('/', 1)[1] if resolved_obj.schema.namespace else None
+                                        if ns_db and normalized_name.startswith(f"{ns_db}."):
+                                            normalized_name = normalized_name[len(ns_db) + 1:]
+                                    except Exception:
+                                        pass
+                                    if '#' in normalized_name:
+                                        temp_part = normalized_name.split('#')[-1]
+                                        temp_name_map_sources[f"dbo.#{temp_part}"] = normalized_name
+                                        temp_name_map_sources[f"#{temp_part}"] = normalized_name
+                                        if ns_db:
+                                            temp_name_map_sources[f"{ns_db}.dbo.#{temp_part}"] = normalized_name
+                                            temp_name_map_sources[f"{ns_db}.#{temp_part}"] = normalized_name
+                                        # Store temp_obj for later use
+                                        temp_obj_map_sources[normalized_name] = resolved_obj
+                            
+                            # Also use saved_temp_sources from procedures (may contain temp tables not in resolved_objects)
+                            # Use global_saved_temp_sources to include temp tables from all procedures, not just this obj_name
+                            # This allows source JSON for temp tables to use dependencies even if procedure and table have different obj_name
+                            for temp_key, deps in global_saved_temp_sources.items():
+                                if temp_key.startswith('#'):
+                                    # Try to find canonical name for this temp table
+                                    temp_part = temp_key.lstrip('#')
+                                    # Try to find matching normalized_name from temp_name_map_sources
+                                    normalized_name = None
+                                    for key, val in temp_name_map_sources.items():
+                                        if key.endswith(f"#{temp_part}") or key == f"#{temp_part}":
+                                            normalized_name = val
+                                            break
+                                    if not normalized_name:
+                                        # Use canonical name if available
+                                        try:
+                                            canonical = parser._canonical_temp_name(temp_key)
+                                            ns_tmp, table_name = parser._ns_and_name(temp_key, obj_type_hint="temp_table")
+                                            try:
+                                                ns_db = ns_tmp.rsplit('/', 1)[1] if ns_tmp else None
+                                                if ns_db and table_name.startswith(f"{ns_db}."):
+                                                    normalized_name = table_name[len(ns_db) + 1:]
+                                                else:
+                                                    normalized_name = table_name
+                                            except Exception:
+                                                normalized_name = table_name
+                                        except Exception:
+                                            normalized_name = f"dbo.{temp_key}"
+                                    if normalized_name and deps:
+                                        temp_sources_map[normalized_name] = deps
+                                        # Also add to temp_name_map_sources if not already there
+                                        if normalized_name not in temp_name_map_sources.values():
+                                            temp_name_map_sources[f"dbo.{temp_key}"] = normalized_name
+                                            temp_name_map_sources[temp_key] = normalized_name
+                            
                             inputs = ol_payload.get('inputs') or []
                             if inputs:
                                 src_dir = out_dir / "sources"
@@ -625,19 +774,86 @@ class Engine:
                                     s = str(nm_in)
                                     if s.startswith('@'):
                                         continue
+                                    
+                                    # Normalize temp table names using temp_name_map
+                                    normalized_s = s
+                                    if '#' in s and temp_name_map_sources:
+                                        # Try different variants
+                                        variants = [s]
+                                        try:
+                                            ns_db = ns_in.rsplit('/', 1)[1] if ns_in else None
+                                            if ns_db and not s.startswith(f"{ns_db}."):
+                                                variants.append(f"{ns_db}.{s}")
+                                            if s.startswith(f"{ns_db}.") if ns_db else False:
+                                                variants.append(s[len(ns_db) + 1:])
+                                            if '.' in s:
+                                                temp_part = s.split('#')[-1] if '#' in s else None
+                                                if temp_part:
+                                                    variants.append(f"#{temp_part}")
+                                                    if ns_db:
+                                                        variants.append(f"{ns_db}.#{temp_part}")
+                                        except Exception:
+                                            pass
+                                        
+                                        for variant in variants:
+                                            if variant in temp_name_map_sources:
+                                                normalized_s = temp_name_map_sources[variant]
+                                                break
+                                    
                                     # filename-safe
-                                    safe = s.replace('/', '_').replace('\\', '_').replace(':', '_')
+                                    safe = normalized_s.replace('/', '_').replace('\\', '_').replace(':', '_')
                                     src_path = src_dir / f"src_{safe}.json"
                                     if src_path.exists():
                                         continue
+                                    
+                                    # For temp tables, get dependencies from temp_obj_map_sources or temp_sources_map
+                                    src_inputs = []
+                                    if '#' in normalized_s:
+                                        # This is a temp table - find its ObjectInfo in temp_obj_map_sources
+                                        # Try exact match first, then try variants
+                                        temp_obj = temp_obj_map_sources.get(normalized_s)
+                                        if not temp_obj:
+                                            # Try to find by matching temp part
+                                            temp_part = normalized_s.split('#')[-1] if '#' in normalized_s else ""
+                                            for key, obj in temp_obj_map_sources.items():
+                                                if '#' in key and key.split('#')[-1] == temp_part:
+                                                    temp_obj = obj
+                                                    logger.debug(f"Phase 3: Found temp_obj for {normalized_s} by temp_part {temp_part}: {key}")
+                                                    break
+                                        
+                                        # Get dependencies from temp_obj or temp_sources_map
+                                        deps = None
+                                        if temp_obj and temp_obj.dependencies:
+                                            deps = temp_obj.dependencies
+                                            logger.debug(f"Phase 3: Using dependencies from temp_obj for {normalized_s}: {len(deps)} deps")
+                                        elif normalized_s in temp_sources_map:
+                                            deps = temp_sources_map[normalized_s]
+                                            logger.debug(f"Phase 3: Using dependencies from temp_sources_map for {normalized_s}: {len(deps)} deps")
+                                        else:
+                                            # Try to find by temp_part in temp_sources_map or global_saved_temp_sources
+                                            temp_part = normalized_s.split('#')[-1] if '#' in normalized_s else ""
+                                            temp_key = f"#{temp_part}"
+                                            if temp_key in global_saved_temp_sources:
+                                                deps = global_saved_temp_sources[temp_key]
+                                                logger.debug(f"Phase 3: Using dependencies from global_saved_temp_sources for {normalized_s} (temp_key={temp_key}): {len(deps)} deps")
+                                        
+                                        if deps:
+                                            from ..lineage import _ns_for_dep, _strip_db_prefix
+                                            for dep in sorted(deps):
+                                                dep_ns = _ns_for_dep(dep, ns_in or "mssql://localhost/InfoTrackerDW")
+                                                dep_name = _strip_db_prefix(dep)
+                                                src_inputs.append({"namespace": dep_ns, "name": dep_name})
+                                        else:
+                                            logger.debug(f"Phase 3: No dependencies found for {normalized_s}, temp_obj_map_sources keys: {list(temp_obj_map_sources.keys())[:5]}, temp_sources_map keys: {list(temp_sources_map.keys())[:5]}")
+                                    
                                     # Minimal OL event for source dataset
                                     src_event = {
                                         "eventType": "COMPLETE",
                                         "eventTime": datetime.now().isoformat()[:19] + "Z",
                                         "run": {"runId": "00000000-0000-0000-0000-000000000000"},
-                                        "job": {"namespace": "infotracker/sources", "name": f"source/{s}"},
-                                        "inputs": [],
-                                        "outputs": [{"namespace": ns_in or adapter.parser.schema_registry.get(None, None) or "mssql://localhost/InfoTrackerDW", "name": s, "facets": {}}],
+                                        "job": {"namespace": "infotracker/sources", "name": f"source/{normalized_s}"},
+                                        "inputs": src_inputs,
+                                        "outputs": [{"namespace": ns_in or adapter.parser.schema_registry.get(None, None) or "mssql://localhost/InfoTrackerDW", "name": normalized_s, "facets": {}}],
                                     }
                                     src_path.write_text(json.dumps(src_event, indent=2, ensure_ascii=False, sort_keys=True), encoding='utf-8')
                         except Exception:

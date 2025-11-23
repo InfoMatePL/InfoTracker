@@ -22,19 +22,44 @@ def _ns_for_dep(dep: str, default_ns: str) -> str:
     """Determine namespace for a dependency based on its database context.
 
     Strips quotes/brackets from identifiers to avoid duplicates.
+    Handles temp tables in both formats: #temp and DB.dbo.PROC#temp
     """
     d = _dequote(dep or "")
     dl = d.lower()
-    if dl.startswith("tempdb..#") or dl.startswith("#"):
+    # Check for temp tables: #temp or DB.dbo.PROC#temp format
+    if dl.startswith("tempdb..#") or dl.startswith("#") or "#" in d:
+        # For canonical temp names (DB.dbo.PROC#temp), extract DB
+        if "#" in d and "." in d:
+            parts = d.split(".")
+            if len(parts) >= 3:
+                db = parts[0]
+                return f"mssql://localhost/{db.upper()}"
+        # For simple temp names (#temp), use tempdb
         return "mssql://localhost/tempdb"
     parts = d.split(".")
     db = parts[0] if len(parts) >= 3 else None
     return f"mssql://localhost/{(db or '').upper()}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
 
 def _strip_db_prefix(name: str) -> str:
+    """Strip database prefix from name, preserving temp table canonical names.
+    
+    For canonical temp names (DB.dbo.PROC#temp), returns dbo.PROC#temp
+    For simple temp names (#temp), returns as is
+    For regular names (DB.dbo.table), returns dbo.table
+    """
     name = _dequote(name or "")
-    parts = (name or "").split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
+    # Handle canonical temp names (DB.dbo.PROC#temp)
+    if "#" in name and "." in name:
+        parts = name.split(".")
+        if len(parts) >= 3:
+            # Return dbo.PROC#temp
+            return ".".join(parts[-2:])
+        elif len(parts) == 2:
+            # Return as is (already schema.table format)
+            return name
+    # Regular handling
+    parts = name.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else name
 
 def _is_noise_dep(dep: str) -> bool:
     """Return True if dependency name looks like a temp table or non-table token.
@@ -223,33 +248,41 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
         name = f"procedures.{obj.name}"
     
     # Build inputs from dependencies with per-dependency namespaces
+    # First, collect from lineage (more detailed)
+    input_pairs_from_lineage = set()
     if obj.lineage:
-        input_pairs = {
+        input_pairs_from_lineage = {
             (f.namespace, f.table_name)
             for ln in obj.lineage
             for f in ln.input_fields
             if getattr(f, "namespace", None) and getattr(f, "table_name", None)
         }
-        if input_pairs:
-            def _is_noise_name(n: str) -> bool:
-                if not n:
-                    return True
-                # keep temp tables visible
-                if n.startswith('@'):
-                    return True
-                if '+' in n:
-                    return True
-                if n.startswith('[') and n.endswith(']') and '.' not in n:
-                    return True
-                return False
-            filtered = [ (ns2, nm2) for (ns2, nm2) in input_pairs if not _is_noise_name(nm2) ]
-            inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
-        else:
-            inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
-                      for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)]
+    
+    # Also collect from dependencies (may include temp tables and other sources not in lineage)
+    input_pairs_from_deps = {
+        (_ns_for_dep(dep, ns), _strip_db_prefix(dep))
+        for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)
+    }
+    
+    # Combine both sources
+    all_input_pairs = input_pairs_from_lineage | input_pairs_from_deps
+    
+    if all_input_pairs:
+        def _is_noise_name(n: str) -> bool:
+            if not n:
+                return True
+            # keep temp tables visible
+            if n.startswith('@'):
+                return True
+            if '+' in n:
+                return True
+            if n.startswith('[') and n.endswith(']') and '.' not in n:
+                return True
+            return False
+        filtered = [ (ns2, nm2) for (ns2, nm2) in all_input_pairs if not _is_noise_name(nm2) ]
+        inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
     else:
-        inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
-                  for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)]
+        inputs = []
 
     # Build output facets
     facets = {}
