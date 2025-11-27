@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 
-TESTS_BASE = Path("/home/pawel/projects/praktyki1/InfoTracker/build")
+TESTS_BASE = Path(__file__).parent.parent / "build"
 INPUT_DIR = TESTS_BASE / "input"
 OUTPUT_DIR = TESTS_BASE / "output"
 
