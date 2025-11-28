@@ -45,7 +45,10 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
         except Exception:
             pass
         simple_name = table_name.split('.')[-1]
+        # Check if this table is a CTE - expand it recursively
         if simple_name in self.cte_registry:
+            # Try to find CTE definition in WITH clause first (for CTEs in same statement)
+            cte_found_in_with = False
             with_clause = select_stmt.args.get('with')
             if with_clause and hasattr(with_clause, 'expressions'):
                 for cte in with_clause.expressions:
@@ -53,7 +56,20 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
                         if isinstance(cte.this, exp.Select):
                             cte_deps = _extract_dependencies(self, cte.this)
                             deps.update(cte_deps)
+                        cte_found_in_with = True
                         break
+            
+            # If not found in WITH clause, use cte_registry (for CTEs defined elsewhere)
+            if not cte_found_in_with:
+                cte_info = self.cte_registry.get(simple_name)
+                if isinstance(cte_info, dict) and 'definition' in cte_info:
+                    cte_def = cte_info['definition']
+                    if isinstance(cte_def, exp.Select):
+                        cte_deps = _extract_dependencies(self, cte_def)
+                        deps.update(cte_deps)
+                elif isinstance(cte_info, exp.Select):
+                    cte_deps = _extract_dependencies(self, cte_info)
+                    deps.update(cte_deps)
         else:
             deps.add(table_name)
 

@@ -370,7 +370,9 @@ def _parse_create_procedure(self, statement: exp.Create, object_hint: Optional[s
     self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
     logger.debug(f"_parse_create_procedure: Set context: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}, procedure_name={procedure_name}")
 
+    logger.debug(f"[DIAG] About to call _extract_procedure_outputs for {procedure_name}")
     materialized_outputs = self._extract_procedure_outputs(statement)
+    logger.debug(f"[DIAG] _extract_procedure_outputs returned {len(materialized_outputs)} outputs for {procedure_name}")
     if not materialized_outputs:
         try:
             m_lineage, m_cols, m_deps, m_target = self._extract_merge_lineage_string(str(statement), procedure_name)
@@ -506,22 +508,86 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
     correct lineage/dependencies. Falls back to light regex only if AST walk
     fails, preserving previous behavior.
     """
+    logger.debug(f"[DIAG] _extract_procedure_outputs: Starting AST walk")
+    logger.warning(f"XXX _extract_procedure_outputs called")
     outputs: List[ObjectInfo] = []
 
     # First try AST walk to find SELECT ... INTO and INSERT ... (SELECT|EXEC)
     found_inserts = set()  # Track which INSERT INTO were found by AST walk
+    processed_select_into = set()  # Track which SELECT INTO nodes we've already processed via WITH
     try:
+        node_count = 0
+        # Build a map of WITH nodes to their following SELECT INTO nodes
+        # This is necessary because sqlglot parses "WITH cte AS (...) SELECT ... INTO ..." 
+        # as separate WITH and SELECT nodes instead of SELECT with 'with' arg
+        with_nodes = []
+        select_into_nodes = []
+        
         for node in statement.walk():
-            # SELECT ... INTO ...
-            if isinstance(node, exp.Select) and self._is_select_into(node):
-                try:
-                    obj = self._parse_select_into(node)
-                    if obj:
-                        outputs.append(obj)
-                except Exception:
-                    pass
+            if isinstance(node, exp.With):
+                with_nodes.append(node)
+            elif isinstance(node, exp.Select) and self._is_select_into(node):
+                select_into_nodes.append(node)
+        
+        logger.debug(f"[DIAG] Found {len(with_nodes)} WITH nodes and {len(select_into_nodes)} SELECT INTO nodes")
+        logger.warning(f"XXX DIAGNOSTIC: Found {len(with_nodes)} WITH nodes and {len(select_into_nodes)} SELECT INTO nodes")
+        
+        # Try to match WITH nodes with SELECT INTO nodes
+        # Strategy: if a WITH node's .this is a SELECT INTO, they're already linked
+        # Otherwise, assume chronological order in the procedure body
+        for node in statement.walk():
+            node_count += 1
+            node_type = type(node).__name__
+            
+            # WITH ... SELECT ... INTO ...
+            if isinstance(node, exp.With):
+                logger.debug(f"[DIAG] Found WITH (CTE) node (node #{node_count})")
+                # Check if the SELECT inside the WITH has INTO clause
+                if hasattr(node, 'this') and isinstance(node.this, exp.Select):
+                    select_node = node.this
+                    has_into = self._is_select_into(select_node)
+                    logger.debug(f"[DIAG] WITH.this is SELECT, has INTO: {has_into}")
+                    
+                    if has_into:
+                        # Mark this SELECT as processed
+                        processed_select_into.add(id(select_node))
+                        try:
+                            # Manually attach CTEs to SELECT node's 'with' arg so _parse_select_into can see them
+                            # This works around sqlglot's parsing bug where CTEs are lost for SELECT INTO
+                            with_clause = node.args.get('with')
+                            if with_clause:
+                                logger.debug(f"[DIAG] Attaching WITH clause to SELECT node for processing")
+                                select_node.set('with', with_clause)
+                            
+                            obj = self._parse_select_into(select_node)
+                            if obj:
+                                logger.debug(f"[DIAG] _parse_select_into returned object: {obj.name}")
+                                outputs.append(obj)
+                            else:
+                                logger.debug(f"[DIAG] _parse_select_into returned None")
+                        except Exception as e:
+                            logger.debug(f"[DIAG] _parse_select_into raised exception: {e}")
+                            import traceback
+                            logger.debug(f"[DIAG] Traceback: {traceback.format_exc()}")
+                            pass
+            # SELECT ... INTO ... (standalone, not part of WITH)
+            elif isinstance(node, exp.Select) and self._is_select_into(node):
+                # Skip if we already processed this SELECT as part of a WITH node
+                if id(node) not in processed_select_into:
+                    logger.debug(f"[DIAG] Found SELECT INTO node (node #{node_count})")
+                    try:
+                        obj = self._parse_select_into(node)
+                        if obj:
+                            logger.debug(f"[DIAG] _parse_select_into returned object: {obj.name}")
+                            outputs.append(obj)
+                        else:
+                            logger.debug(f"[DIAG] _parse_select_into returned None")
+                    except Exception as e:
+                        logger.debug(f"[DIAG] _parse_select_into raised exception: {e}")
+                        pass
             # INSERT ... (SELECT | EXEC)
             elif isinstance(node, exp.Insert):
+                logger.debug(f"[DIAG] Found INSERT node (node #{node_count})")
                 try:
                     # Get the target table name for tracking
                     raw_target = self._get_table_name(node.this, None) if hasattr(node, 'this') else None
@@ -535,7 +601,11 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
                         outputs.append(obj)
                 except Exception:
                     pass
-    except Exception:
+        logger.debug(f"[DIAG] AST walk completed, visited {node_count} nodes")
+    except Exception as e:
+        logger.debug(f"[DIAG] AST walk raised exception: {e}")
+        import traceback
+        logger.debug(f"[DIAG] Traceback: {traceback.format_exc()}")
         pass
 
     # Fallback to regex-based heuristic for INSERT INTO that weren't found by AST walk

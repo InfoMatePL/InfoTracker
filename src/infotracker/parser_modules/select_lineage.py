@@ -73,7 +73,12 @@ def _build_alias_maps(self, select_exp: exp.Select):
             pass
         if alias:
             alias_map[alias] = fqn
-        alias_map[t.name.lower()] = fqn
+        # Don't overwrite CTEs in alias_map - they were already added with simple CTE names
+        table_name_lower = t.name.lower()
+        # Case-insensitive check: look for CTE with matching lowercase key
+        is_cte_name = any(cte_key.lower() == table_name_lower for cte_key in self.cte_registry.keys())
+        if not is_cte_name:
+            alias_map[table_name_lower] = fqn
         base_fqns.append(fqn)
 
     for sq in select_exp.find_all(exp.Subquery):
@@ -100,10 +105,36 @@ def _build_alias_maps(self, select_exp: exp.Select):
             idx += 1
 
     # If exactly one base table is present, allow resolving unqualified columns to it
+    # BUT: prioritize the table/CTE from the main FROM clause of this SELECT
+    # This ensures that for "SELECT ... FROM CTE", unqualified columns resolve to CTE, not to tables inside CTE definitions
     try:
-        uniq = sorted(set(base_fqns))
-        if len(uniq) == 1 and '' not in alias_map:
-            alias_map[''] = uniq[0]
+        # Find the main FROM clause of this SELECT (not nested SELECTs)
+        from_source = None
+        
+        # Note: sqlglot uses 'from_' (not 'from') to avoid Python keyword collision
+        if hasattr(select_exp, 'args') and 'from_' in select_exp.args:
+            from_expr = select_exp.args['from_']
+            if hasattr(from_expr, 'this') and isinstance(from_expr.this, exp.Table):
+                from_table = from_expr.this
+                from_table_name = from_table.name
+                # Check if FROM table has an alias
+                from_alias = getattr(from_table, "alias", None) or from_table.args.get("alias")
+                if from_alias:
+                    from_alias_str = from_alias.name.lower() if hasattr(from_alias, "name") else str(from_alias).lower()
+                    # Use the alias as the source
+                    if from_alias_str in alias_map:
+                        from_source = alias_map[from_alias_str]
+                else:
+                    # No alias - use table name (check if it's a CTE or regular table)
+                    from_table_lower = from_table_name.lower()
+                    if from_table_lower in alias_map:
+                        from_source = alias_map[from_table_lower]
+        
+        # Set alias_map[''] to the FROM source if found, otherwise fall back to single table logic
+        if from_source and '' not in alias_map:
+            alias_map[''] = from_source
+        elif len(set(base_fqns)) == 1 and '' not in alias_map:
+            alias_map[''] = sorted(set(base_fqns))[0]
     except Exception:
         pass
 
@@ -113,6 +144,7 @@ def _build_alias_maps(self, select_exp: exp.Select):
 def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     import logging
     logger = logging.getLogger(__name__)
+    
     qual = (col_exp.table or "").lower()
     table_fqn = alias_map.get(qual)
     if not table_fqn:

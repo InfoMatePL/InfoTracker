@@ -565,89 +565,115 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     # For each SELECT ... INTO, find CTEs before it
     for into_match in into_matches_in_body:
         temp_table = into_match.group(1)
-        into_pos = into_match.start()
+        # Find the position of "INTO" keyword within the match (not SELECT)
+        match_text = body_sql[into_match.start():into_match.end()]
+        into_keyword_offset = match_text.upper().find('INTO')
+        if into_keyword_offset < 0:
+            continue  # Skip if INTO not found (should not happen with correct regex)
+        into_pos = into_match.start() + into_keyword_offset
         
-        # Look backwards for WITH statements before this INTO (up to 10000 chars)
-        search_start = max(0, into_pos - 10000)
+        # Look backwards for WITH statements before this INTO (up to 50000 chars to handle large procedures)
+        search_start = max(0, into_pos - 50000)
         before_into_text = body_sql[search_start:into_pos]
         
-        # Find all WITH ... AS (...) patterns before INTO
-        # Pattern: WITH name AS ( ... ) where closing paren is balanced
-        with_pattern = r'(?:^|;|\n)\s*WITH\s+(\w+)\s+AS\s*\('
-        with_matches = list(re.finditer(with_pattern, before_into_text, re.IGNORECASE | re.MULTILINE))
+        # Find the WITH statement that DIRECTLY precedes this INTO
+        # Strategy: find the CLOSEST WITH before our target INTO
+        # Find all WITH statements in the window before this INTO
+        all_with_matches = list(re.finditer(r'(?:^|;|\n)\s*WITH\s+', before_into_text, re.IGNORECASE | re.MULTILINE))
         
-        for with_match in with_matches:
-            cte_name = with_match.group(1)
-            with_start_in_before = with_match.start()
-            # Find the actual start of WITH (skip semicolon and whitespace before WITH)
-            match_text = before_into_text[with_start_in_before:with_match.end()]
-            actual_with_start_in_match = len(match_text) - len(match_text.lstrip('; \n\r\t'))
-            with_start_absolute = search_start + with_start_in_before + actual_with_start_in_match
+        # The closest WITH is simply the LAST one in before_into_text
+        # (since before_into_text ends right before our SELECT INTO)
+        closest_with = all_with_matches[-1] if all_with_matches else None
+        
+        if closest_with:
+            # Find the actual "WITH" keyword position (skip semicolon/newline prefix in regex match)
+            match_text = closest_with.group(0)
+            with_keyword_offset = match_text.upper().find('WITH')
+            with_start = closest_with.start() + with_keyword_offset
+            with_block = before_into_text[with_start:]
             
-            # Find the matching closing paren for this CTE
-            # Start from the opening paren after "AS ("
-            paren_start = with_match.end() - 1  # Position of opening paren
-            paren_count = 0
-            paren_pos = paren_start
-            cte_end_pos = None
+            # Debug: check if all expected CTEs are in the block
+            # Find ALL CTE definitions in this WITH block: name AS (...)
+            # This pattern matches both "WITH name AS (" and ", name AS ("
+            cte_pattern = r'(\w+)\s+AS\s*\('
+            cte_matches = list(re.finditer(cte_pattern, with_block, re.IGNORECASE))
             
-            # Count parentheses to find the matching closing paren
-            while paren_pos < len(before_into_text):
-                if before_into_text[paren_pos] == '(':
-                    paren_count += 1
-                elif before_into_text[paren_pos] == ')':
-                    paren_count -= 1
-                    if paren_count == 0:
-                        cte_end_pos = search_start + paren_pos + 1
-                        break
-                paren_pos += 1
-            
-            if cte_end_pos:
-                # Extract the CTE definition
-                cte_sql = body_sql[with_start_absolute:cte_end_pos]
-                # Remove leading semicolons and whitespace
-                cte_sql = cte_sql.lstrip('; \n\r\t')
-                logger.debug(f"_parse_procedure_body_statements: Found CTE {cte_name} before INTO {temp_table}, extracting from body_sql")
+            for cte_idx, cte_match in enumerate(cte_matches):
+                cte_name = cte_match.group(1)
+                cte_start_in_block = cte_match.start()
+                cte_start_absolute = search_start + with_start + cte_start_in_block
                 
-                # Try to parse and register the CTE
-                try:
-                    # Parse the CTE definition (WITH ... AS (...))
-                    # Add a dummy SELECT to make it valid SQL
-                    cte_parse_sql = cte_sql + " SELECT 1"
-                    parsed_cte = sqlglot.parse_one(cte_parse_sql, read=self.dialect)
+                # Find the matching closing paren for this CTE
+                # Start from the opening paren after "AS ("
+                paren_start = cte_match.end() - 1  # Position of opening paren in with_block
+                paren_count = 0
+                paren_pos = paren_start
+                cte_end_pos = None
+                
+                # Count parentheses to find the matching closing paren
+                while paren_pos < len(with_block):
+                    if with_block[paren_pos] == '(':
+                        paren_count += 1
+                    elif with_block[paren_pos] == ')':
+                        paren_count -= 1
+                        if paren_count == 0:
+                            cte_end_pos = search_start + with_start + paren_pos + 1
+                            break
+                    paren_pos += 1
+            
+                if cte_end_pos:
+                    # Extract the CTE definition
+                    # For first CTE, include WITH keyword; for others, construct WITH manually
+                    if cte_idx == 0:
+                        # First CTE: extract from "WITH name AS (...)" 
+                        cte_def_start = search_start + with_start
+                        cte_sql = body_sql[cte_def_start:cte_end_pos]
+                        cte_sql = cte_sql.lstrip('; \n\r\t')
+                    else:
+                        # Subsequent CTE: extract just "name AS (...)" and prepend WITH
+                        cte_sql = "WITH " + body_sql[cte_start_absolute:cte_end_pos].lstrip(', \n\r\t')
                     
-                    if isinstance(parsed_cte, exp.With) and hasattr(parsed_cte, 'expressions'):
-                        # Extract CTE from exp.With
-                        for cte_expr in parsed_cte.expressions:
-                            if hasattr(cte_expr, 'alias') and str(cte_expr.alias).upper() == cte_name.upper():
-                                # Register the CTE
-                                if isinstance(cte_expr.this, exp.Select):
-                                    self._process_ctes(cte_expr.this)
-                                    logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} from body_sql, cte_registry keys: {list(self.cte_registry.keys())}")
-                                break
-                    elif isinstance(parsed_cte, exp.Select):
-                        # If parsed as SELECT, try to extract columns
-                        cte_columns = []
-                        for proj in parsed_cte.expressions:
-                            col_name = None
-                            if isinstance(proj, exp.Alias):
-                                col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
-                                if not col_name and hasattr(proj, 'alias_or_name'):
-                                    col_name = str(proj.alias_or_name)
-                            elif isinstance(proj, exp.Column):
-                                col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
-                            if col_name:
-                                cte_columns.append(col_name)
-                        # Register CTE
-                        self.cte_registry[cte_name] = {
-                            'columns': cte_columns,
-                            'definition': parsed_cte
-                        }
-                        logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} (parsed as SELECT) from body_sql, cte_registry keys: {list(self.cte_registry.keys())}")
-                except Exception as e:
-                    logger.debug(f"_parse_procedure_body_statements: Failed to parse CTE {cte_name} from body_sql: {e}")
-                    import traceback
-                    logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
+                    logger.debug(f"_parse_procedure_body_statements: Found CTE {cte_name} (#{cte_idx+1}) before INTO {temp_table}")
+                    
+                    # Try to parse and register the CTE
+                    try:
+                        # Parse the CTE definition (WITH ... AS (...))
+                        # Add a dummy SELECT to make it valid SQL
+                        cte_parse_sql = cte_sql + " SELECT 1"
+                        parsed_cte = sqlglot.parse_one(cte_parse_sql, read=self.dialect)
+                        
+                        if isinstance(parsed_cte, exp.With) and hasattr(parsed_cte, 'expressions'):
+                            # Extract CTE from exp.With
+                            for cte_expr in parsed_cte.expressions:
+                                if hasattr(cte_expr, 'alias') and str(cte_expr.alias).upper() == cte_name.upper():
+                                    # Register the CTE
+                                    if isinstance(cte_expr.this, exp.Select):
+                                        self._process_ctes(parsed_cte.this if isinstance(parsed_cte.this, exp.Select) else cte_expr.this)
+                                        logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name}, cte_registry now has: {list(self.cte_registry.keys())}")
+                                    break
+                        elif isinstance(parsed_cte, exp.Select):
+                            # If parsed as SELECT, try to extract columns
+                            cte_columns = []
+                            for proj in parsed_cte.expressions:
+                                col_name = None
+                                if isinstance(proj, exp.Alias):
+                                    col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                    if not col_name and hasattr(proj, 'alias_or_name'):
+                                        col_name = str(proj.alias_or_name)
+                                elif isinstance(proj, exp.Column):
+                                    col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                if col_name:
+                                    cte_columns.append(col_name)
+                            # Register CTE
+                            self.cte_registry[cte_name] = {
+                                'columns': cte_columns,
+                                'definition': parsed_cte
+                            }
+                            logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} (as SELECT), cte_registry now has: {list(self.cte_registry.keys())}")
+                    except Exception as e:
+                        logger.debug(f"_parse_procedure_body_statements: Failed to parse CTE {cte_name}: {e}")
+                        import traceback
+                        logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
     
     # Preprocess body (remove DECLARE, SET, etc.)
     preprocessed_body = self._preprocess_sql(body_sql)

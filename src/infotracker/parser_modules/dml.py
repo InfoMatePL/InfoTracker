@@ -23,7 +23,7 @@ def _is_insert_exec(self, statement: exp.Insert) -> bool:
 def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] = None) -> ObjectInfo:
     import logging
     logger = logging.getLogger(__name__)
-    logger.debug(f"_parse_select_into: Called with object_hint={object_hint}")
+    logger.debug(f"[DIAG] _parse_select_into: Called with object_hint={object_hint}")
     
     into_expr = statement.args.get('into')
     if not into_expr:
@@ -45,6 +45,7 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
             is_temp = True
             temp_name = into_match.group(1)
             raw_target = f"#{temp_name}"
+            logger.debug(f"[DIAG] _parse_select_into: Detected temp table {raw_target} from original SQL")
     except Exception:
         pass
     
@@ -64,6 +65,7 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     # Final check: if raw_target doesn't start with # but we detected it as temp, add #
     if is_temp and raw_target and not raw_target.startswith('#') and 'tempdb' not in raw_target.lower():
         raw_target = f"#{raw_target.split('.')[-1]}"
+    logger.debug(f"[DIAG] _parse_select_into: Final raw_target={raw_target}, is_temp={is_temp}")
     try:
         parts = (raw_target or "").split('.')
         if len(parts) >= 3 and self.registry:
@@ -80,8 +82,10 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     # Process CTEs before extracting lineage (CTEs need to be registered for column lineage extraction)
     # Check if this SELECT is part of a WITH statement (parent is exp.With)
     # If so, process CTEs from the parent
+    logger.debug(f"[DIAG] _parse_select_into: About to check for CTEs; statement type={type(statement).__name__}")
     parent = getattr(statement, 'parent', None)
     if isinstance(parent, exp.With):
+        logger.debug(f"[DIAG] _parse_select_into: Parent is exp.With, processing CTEs")
         # If parent is exp.With, the actual SELECT is in parent.this
         if hasattr(parent, 'this') and isinstance(parent.this, exp.Select):
             self._process_ctes(parent.this)
@@ -89,11 +93,23 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
         # Check if statement has CTEs directly using args.get('with')
         with_clause = statement.args.get('with')
         if with_clause:
+            logger.debug(f"[DIAG] _parse_select_into: Found WITH clause on SELECT statement")
             self._process_ctes(statement)
+        else:
+            logger.debug(f"[DIAG] _parse_select_into: No WITH clause on SELECT statement")
     elif isinstance(statement, exp.With) and hasattr(statement, 'this'):
+        logger.debug(f"[DIAG] _parse_select_into: Statement itself is exp.With, processing CTEs")
         # If statement itself is exp.With, process CTEs from the SELECT inside
         if isinstance(statement.this, exp.Select):
             self._process_ctes(statement.this)
+    else:
+        logger.debug(f"[DIAG] _parse_select_into: No CTE processing path matched")
+    
+    # Log cte_registry state after processing
+    if hasattr(self, 'cte_registry'):
+        logger.debug(f"[DIAG] _parse_select_into: cte_registry has {len(self.cte_registry)} CTEs: {list(self.cte_registry.keys())}")
+    else:
+        logger.debug(f"[DIAG] _parse_select_into: cte_registry not found")
 
     dependencies = self._extract_dependencies(statement)
     logger.debug(f"_parse_select_into: dependencies={dependencies}, raw_target={raw_target}")
