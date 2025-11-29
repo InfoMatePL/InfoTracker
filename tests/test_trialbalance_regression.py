@@ -260,9 +260,11 @@ def test_test2_main_dependencies(test2_output: Path):
     
     input_names = {inp["name"] for inp in data["inputs"]}
     
-    # Expected base tables (tetafk has different satellites)
+    # Expected base tables (tetafk has different satellites including bobookings and bookings)
     expected_tables = {
         "dbo.AccountBalance_LNK_BV",
+        "dbo.AccountBalance_sat_S_mis_tetafk_bobookings_current",
+        "dbo.AccountBalance_sat_S_mis_tetafk_bookings_current",
         "dbo.GeneralAccount_sat_S_mis_tetafk_current",
         "dbo.TrialBalance_tetafk_BV",
     }
@@ -270,7 +272,7 @@ def test_test2_main_dependencies(test2_output: Path):
     assert expected_tables.issubset(input_names), \
         f"Missing expected tables in test2. Got: {input_names}"
     
-    # Expected temp tables
+    # Expected temp tables (base names without version suffixes)
     expected_temps = {
         "dbo.update_TrialBalance_tetafk_BV#MaxLoadDate",
         "dbo.update_TrialBalance_tetafk_BV#MinAccountingPeriod",
@@ -301,20 +303,42 @@ def test_test2_output_schema(test2_output: Path):
     schema = data["outputs"][0]["facets"]["schema"]
     field_names = {f["name"] for f in schema["fields"]}
     
-    # Expected columns (tetafk has similar but slightly different structure)
+    # Expected columns (tetafk has richer structure with opening balances and cumulative fields)
     expected_fields = {
         "hk_l_AccountBalance",
         "hk_h_GeneralAccount",
         "hk_h_ChartOfAccount",
         "hk_h_AccountingPeriod",
         "GeneralAccountSegment",
+        "GeneralAccountSegmentDesc",
+        "AccountSegment2",
+        "AccountSegment3",
+        "AccountSegment4",
+        "AccountSegment5",
+        "AccountSegment6",
+        "AccountSegment7",
         "AccountingYear",
+        "AccountingMonth",
+        "AccountingPeriod",
+        "OpeningBalanceDebit",
+        "OpeningBalanceCredit",
+        "OpeningBalanceDebit_OpeningBalanceCredit",
         "DebitInPeriod",
         "CreditInPeriod",
+        "AccountBalanceInPeriod",
+        "CumulativelyDebit",
+        "CumulativelyCredit",
+        "CumulativelyDebit_CumulativelyCredit",
+        "CompanyCode",
+        "DV_load_date",
     }
     
     assert expected_fields.issubset(field_names), \
         f"Missing expected fields in test2. Got: {field_names}"
+    
+    # Should have exactly 26 fields
+    assert len(schema["fields"]) == 26, \
+        f"Expected 26 fields in test2, got {len(schema['fields'])}"
 
 
 # ============================================================================
