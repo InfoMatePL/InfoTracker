@@ -54,6 +54,18 @@ class ColumnReference:
     
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
+    
+    def __hash__(self) -> int:
+        """Case-insensitive hash for SQL Server compatibility."""
+        return hash((self.namespace.lower(), self.table_name.lower(), self.column_name.lower()))
+    
+    def __eq__(self, other) -> bool:
+        """Case-insensitive equality for SQL Server compatibility."""
+        if not isinstance(other, ColumnReference):
+            return False
+        return (self.namespace.lower() == other.namespace.lower() and 
+                self.table_name.lower() == other.table_name.lower() and
+                self.column_name.lower() == other.column_name.lower())
 
 
 @dataclass
@@ -179,6 +191,13 @@ class ColumnNode:
     namespace: str
     table_name: str
     column_name: str
+    
+    def __post_init__(self) -> None:
+        """Normalize column_name to lowercase for SQL Server case-insensitivity."""
+        # SQL Server is case-insensitive by default, so we normalize to lowercase
+        # to ensure consistent matching across different case variants
+        if self.column_name:
+            self.column_name = self.column_name.lower()
     
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
