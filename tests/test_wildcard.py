@@ -45,9 +45,9 @@ class TestWildcardSelectors:
         column_names = [node.column_name for node in results]
         
         assert len(results) == 3
-        assert "OrderID" in column_names
-        assert "CustomerID" in column_names
-        assert "Revenue" in column_names
+        assert "orderid" in column_names  # Normalized to lowercase
+        assert "customerid" in column_names  # Normalized to lowercase
+        assert "revenue" in column_names  # Normalized to lowercase
     
     def test_table_wildcard_different_schema(self):
         """Test table wildcard with different schema."""
@@ -56,8 +56,8 @@ class TestWildcardSelectors:
         column_names = [node.column_name for node in results]
         
         assert len(results) == 2
-        assert "Revenue" in column_names
-        assert "CustomerID" in column_names
+        assert "revenue" in column_names  # Normalized to lowercase
+        assert "customerid" in column_names  # Normalized to lowercase
     
     def test_column_wildcard_contains_case_insensitive(self):
         """Test column wildcard with case-insensitive contains matching."""
