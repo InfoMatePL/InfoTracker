@@ -147,6 +147,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     
     qual = (col_exp.table or "").lower()
     table_fqn = alias_map.get(qual)
+    
     if not table_fqn:
         # Try to find table by column name if no table qualifier
         # This handles unqualified columns when there's only one table
@@ -342,6 +343,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 with_clause = select_stmt.args.get('with')
                 if with_clause and hasattr(with_clause, 'expressions'):
                     for cte in with_clause.expressions:
+                        cte_alias = str(cte.alias) if hasattr(cte, 'alias') and cte.alias else None
                         if hasattr(cte, 'alias') and str(cte.alias) == cte_name:
                             # Found the CTE definition, extract its sources
                             if isinstance(cte.this, exp.Select):
@@ -386,6 +388,48 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                 # This handles cases like "SELECT INTO #MaxLoadDate FROM MaxDates" where MaxDates is a CTE
                                 if not temp_deps_found and cte_deps:
                                     logger.debug(f"_append_column_ref: CTE {cte_name} has no temp table dependencies, expanding to base sources: {cte_deps}")
+                                    
+                                    # FIXED: Instead of blindly adding column to ALL dependencies, 
+                                    # extract column-level lineage from CTE definition to find the correct source table(s)
+                                    try:
+                                        logger.warning(f"DIAGNOSTIC: Extracting lineage for CTE {cte_name}, col={col_exp.name}, cte.this={type(cte.this).__name__}")
+                                        
+                                        cte_lineage, _cte_schema = self._extract_column_lineage(cte.this, cte_name)
+                                        
+                                        logger.warning(f"DIAGNOSTIC: Extracted {len(cte_lineage)} columns from CTE {cte_name}")
+                                        
+                                        logger.debug(f"_append_column_ref: Extracted lineage for CTE {cte_name}, {len(cte_lineage)} columns")
+                                        
+                                        # Find lineage for the requested column
+                                        col_lineage = None
+                                        for lin in cte_lineage:
+                                            if lin.output_column.lower() == col_exp.name.lower():
+                                                col_lineage = lin
+                                                break
+                                        
+                                        if col_lineage:
+                                            logger.warning(f"DIAGNOSTIC: Found lineage for {col_exp.name}, inputs={[(r.table_name, r.column_name) for r in col_lineage.input_fields[:3]]}")
+                                        else:
+                                            logger.warning(f"DIAGNOSTIC: No lineage found for {col_exp.name} in CTE {cte_name}, available columns={[l.output_column for l in cte_lineage[:5]]}")
+                                        
+                                        if col_lineage and col_lineage.input_fields:
+                                            logger.debug(f"_append_column_ref: Found lineage for column {col_exp.name} in CTE {cte_name}, {len(col_lineage.input_fields)} input fields")
+                                            # Use the input_fields from CTE's lineage as sources
+                                            for input_ref in col_lineage.input_fields:
+                                                # input_ref might be another CTE - if so, it will be recursively expanded by deps.py
+                                                out_list.append(input_ref)
+                                                logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} column lineage: {input_ref}")
+                                            if out_list:
+                                                return
+                                        else:
+                                            logger.debug(f"_append_column_ref: No lineage found for column {col_exp.name} in CTE {cte_name}, falling back to all dependencies")
+                                    except Exception as e:
+                                        import traceback
+                                        logger.warning(f"DIAGNOSTIC: Exception extracting CTE lineage: {e}")
+                                        logger.warning(f"DIAGNOSTIC: Traceback: {traceback.format_exc()}")
+                                        logger.debug(f"_append_column_ref: Failed to extract CTE lineage: {e}, falling back to all dependencies")
+                                    
+                                    # Fallback: if lineage extraction failed, add column to all dependencies (old behavior)
                                     for dep in cte_deps:
                                         dep_simple = dep.split('.')[-1] if '.' in dep else dep
                                         # Skip temp tables (they should be expanded separately)
@@ -421,8 +465,10 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                     # Extract dependencies from CTE's SELECT
                     cte_deps = self._extract_dependencies(cte_def)
                     logger.debug(f"_append_column_ref: CTE {cte_name} dependencies from registry: {cte_deps}")
+                    
                     # Check if any dependency is a temp table
                     temp_deps_found = False
+                    temp_lineage_used = False
                     for dep in cte_deps:
                         dep_simple = dep.split('.')[-1] if '.' in dep else dep
                         if dep_simple.startswith('#') or (f"#{dep_simple}" in self.temp_registry):
@@ -437,6 +483,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                 ref = ColumnReference(namespace=ns_temp, table_name=table_name, column_name=col_exp.name)
                                 out_list.append(ref)
                                 logger.debug(f"_append_column_ref: Added temp ref from CTE registry: {ref}")
+                                temp_lineage_used = True
                                 return
                             # Try to use temp_lineage if available
                             ver = self._temp_current(temp_seg)
@@ -444,20 +491,60 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                             if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
                                 out_list.extend(self.temp_lineage[ver][colname])
                                 logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(self.temp_lineage[ver][colname])} refs")
+                                temp_lineage_used = True
                                 return
                             if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
                                 out_list.extend(self.temp_lineage[temp_seg][colname])
                                 logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(self.temp_lineage[temp_seg][colname])} refs")
+                                temp_lineage_used = True
                                 return
-                            # Fallback: add direct reference
-                            ref = ColumnReference(namespace=ns_temp, table_name=table_name, column_name=col_exp.name)
-                            out_list.append(ref)
-                            logger.debug(f"_append_column_ref: Added temp ref from CTE registry (fallback): {ref}")
-                            return
-                    # If no temp tables found, use regular tables as sources (expand CTE to base sources)
-                    # This handles cases like "SELECT INTO #MaxLoadDate FROM MaxDates" where MaxDates is a CTE
-                    if not temp_deps_found and cte_deps:
-                        logger.debug(f"_append_column_ref: CTE {cte_name} has no temp table dependencies, expanding to base sources: {cte_deps}")
+                            # Column not in temp_lineage - this temp table doesn't have this column
+                            # Continue to check other dependencies or fall through to column-level expansion
+                            logger.debug(f"_append_column_ref: Column {col_exp.name} not in temp_lineage for {temp_seg}, will try column-level expansion")
+                    
+                    # If temp dependencies were found but column wasn't in any of them, 
+                    # OR if no temp dependencies at all, use column-level lineage expansion
+                    if (temp_deps_found and not temp_lineage_used) or (not temp_deps_found and cte_deps):
+                        if temp_deps_found and not temp_lineage_used:
+                            logger.warning(f"DIAGNOSTIC_REG: CTE {cte_name} has temp dependencies but column {col_exp.name} not in temp_lineage, expanding to column-level sources: {cte_deps}")
+                            logger.debug(f"_append_column_ref: CTE {cte_name} has temp dependencies but column not in temp_lineage, expanding to column-level sources: {cte_deps}")
+                        else:
+                            logger.warning(f"DIAGNOSTIC_REG: CTE {cte_name} (from registry) has no temp table dependencies, expanding to base sources: {cte_deps}")
+                            logger.debug(f"_append_column_ref: CTE {cte_name} (from registry) has no temp table dependencies, expanding to base sources: {cte_deps}")
+                        
+                        # FIXED: Instead of blindly adding column to ALL dependencies, 
+                        # extract column-level lineage from CTE definition to find the correct source table(s)
+                        try:
+                            logger.warning(f"DIAGNOSTIC_REG: Extracting lineage for CTE {cte_name}, col={col_exp.name}, cte_def={type(cte_def).__name__}")
+                            cte_lineage, _cte_schema = self._extract_column_lineage(cte_def, cte_name)
+                            logger.warning(f"DIAGNOSTIC_REG: Extracted {len(cte_lineage)} columns from CTE {cte_name}")
+                            logger.debug(f"_append_column_ref: Extracted lineage for CTE {cte_name} (from registry), {len(cte_lineage)} columns")
+                            
+                            # Find lineage for the requested column
+                            col_lineage = None
+                            for lin in cte_lineage:
+                                if lin.output_column.lower() == col_exp.name.lower():
+                                    col_lineage = lin
+                                    break
+                            
+                            if col_lineage and col_lineage.input_fields:
+                                logger.debug(f"_append_column_ref: Found lineage for column {col_exp.name} in CTE {cte_name} (from registry), {len(col_lineage.input_fields)} input fields")
+                                # Use the input_fields from CTE's lineage as sources
+                                for input_ref in col_lineage.input_fields:
+                                    # input_ref might be another CTE - if so, it will be recursively expanded by deps.py
+                                    out_list.append(input_ref)
+                                    logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} (from registry) column lineage: {input_ref}")
+                                if out_list:
+                                    return
+                            else:
+                                logger.debug(f"_append_column_ref: No lineage found for column {col_exp.name} in CTE {cte_name} (from registry), falling back to all dependencies")
+                        except Exception as e:
+                            import traceback
+                            logger.debug(f"_append_column_ref: Exception extracting CTE lineage: {e}")
+                            logger.debug(f"_append_column_ref: Traceback: {traceback.format_exc()}")
+                            logger.debug(f"_append_column_ref: Failed to extract CTE lineage from registry: {e}, falling back to all dependencies")
+                        
+                        # Fallback: if lineage extraction failed, add column to all dependencies (old behavior)
                         for dep in cte_deps:
                             dep_simple = dep.split('.')[-1] if '.' in dep else dep
                             # Skip temp tables (they should be expanded separately)
@@ -471,7 +558,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                     column_name=col_exp.name,
                                 )
                                 out_list.append(ref)
-                                logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} base source {dep}: {ref}")
+                                logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} (from registry) base source {dep}: {ref}")
                         if out_list:
                             return
         except Exception as e:
