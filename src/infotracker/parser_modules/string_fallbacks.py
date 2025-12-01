@@ -284,8 +284,13 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
     return lineage, dependencies
 
 
-def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> Optional[ObjectInfo]:
+def _extract_materialized_output_from_procedure_string(self, sql_content: str) -> List[ObjectInfo]:
+    """Extract ALL materialized outputs from procedure (SELECT INTO, INSERT INTO, TRUNCATE).
+    
+    Returns a list of ObjectInfo for all persistent tables modified by the procedure.
+    """
     logger.debug(f"_extract_materialized_output_from_procedure_string: Called")
+    outputs: List[ObjectInfo] = []
     s = self._normalize_tsql(sql_content)
     s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
     lines = s.splitlines()
@@ -316,6 +321,7 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
         ns = self._canonical_namespace(canon_db)
         return ObjectInfo(name=full_name, object_type="table", schema=TableSchema(namespace=ns, name=full_name, columns=[]), lineage=[], dependencies=set())
 
+    # Collect all SELECT INTO outputs
     for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
         obj = _to_obj(m.group(1))
         if obj:
@@ -329,7 +335,8 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                     obj.dependencies = deps
             except Exception as e:
                 logger.debug(f"_extract_materialized_output_from_procedure_string: Failed to extract lineage for SELECT INTO {obj.name}: {e}")
-            return obj
+            outputs.append(obj)
+    # Collect all INSERT INTO outputs (non-temp tables)
     for m in re.finditer(r'(?is)\bINSERT\s+INTO\s+([^\s,()\r\n;]+)', s):
         table_token = m.group(1).strip().rstrip(';')
         # Skip temp tables
@@ -358,8 +365,24 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                 logger.debug(f"_extract_materialized_output_from_procedure_string: Extracted {len(lineage)} columns, {len(deps)} dependencies for INSERT INTO {table_name_clean}")
             except Exception as e:
                 logger.debug(f"_extract_materialized_output_from_procedure_string: Failed to extract lineage for INSERT INTO {obj.name}: {e}")
-            return obj
-    return None
+            outputs.append(obj)
+    
+    # Collect TRUNCATE TABLE as output operation (table is modified)
+    for m in re.finditer(r'(?is)\bTRUNCATE\s+TABLE\s+([^\s,()\r\n;]+)', s):
+        table_token = m.group(1).strip().rstrip(';')
+        # Skip temp tables
+        if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            continue
+        obj = _to_obj(table_token)
+        if obj:
+            logger.debug(f"_extract_materialized_output_from_procedure_string: Detected TRUNCATE TABLE {obj.name}")
+            # Check if this table is already in outputs (from INSERT INTO)
+            # If so, don't add it again
+            if not any(o.name == obj.name for o in outputs):
+                outputs.append(obj)
+    
+    logger.debug(f"_extract_materialized_output_from_procedure_string: Found {len(outputs)} outputs")
+    return outputs
 
 
 def _extract_first_create_statement(self, sql_content: str, statement_type: str) -> str:
@@ -739,7 +762,7 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
         if len(parts) == 2:
             return name
         return f"dbo.{name}"
-    m_upd = re.search(r'(?is)\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;#]+)', s)
+    m_upd = re.search(r'(?is)\bUPDATE\s+([^\s(,;]+).*?\bOUTPUT\b\s+(.*?)\s+\bINTO\b\s+([^\s(,;]+)', s)
     dml_type = None
     out_exprs = None
     dml_target = None
