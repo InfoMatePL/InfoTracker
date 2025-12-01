@@ -11,6 +11,9 @@ These tests validate that lineage extraction for various TrialBalance procedures
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -239,6 +242,7 @@ def test_test2_artifacts_exist(test2_output: Path):
         "StoredProcedure.dbo.update_TrialBalance_tetafk_BV__temp__EDW_CORE.dbo.hashMinAccountingPeriod.json",
         "StoredProcedure.dbo.update_TrialBalance_tetafk_BV__temp__EDW_CORE.dbo.hashtetafk_temp.json",
         "StoredProcedure.dbo.update_TrialBalance_tetafk_BV__temp__EDW_CORE.dbo.hashinsert_update_temp_tetafk.json",
+        "StoredProcedure.dbo.update_TrialBalance_tetafk_BV__temp__EDW_CORE.dbo.hashTrialBalance_tetafk_BV_ins_upd_results.json",  # Auxiliary output
         "column_graph.json",
     ]
     
@@ -248,9 +252,9 @@ def test_test2_artifacts_exist(test2_output: Path):
 
 
 def test_test2_object_count(test2_output: Path):
-    """Verify test2 has exactly 5 stored procedure artifacts."""
+    """Verify test2 has exactly 6 stored procedure artifacts (5 temps + 1 auxiliary output)."""
     json_files = list(test2_output.glob("StoredProcedure.*.json"))
-    assert len(json_files) == 5, f"Expected 5 procedure artifacts, found {len(json_files)}"
+    assert len(json_files) == 6, f"Expected 6 procedure artifacts (5 temps + 1 auxiliary), found {len(json_files)}"
 
 
 def test_test2_main_dependencies(test2_output: Path):
@@ -539,3 +543,80 @@ def test_column_graph_has_edges(test0_output: Path, test1_output: Path,
         assert "from" in sample_edge
         assert "to" in sample_edge
         assert "transformation" in sample_edge
+
+
+def test_test2_column_graph_baseline(test2_output: Path):
+    """
+    Regression test for test2 column_graph structure.
+    
+    This test runs a fresh extract and validates the column graph has the expected
+    structure. It uses hardcoded baseline values to catch regressions.
+    
+    Baseline (as of 2025-12-01 after rollback):
+    - Nodes: 158
+    - Edges: 267
+    
+    The test uses >= to allow for improvements (more lineage detected) but prevent
+    regressions (missing lineage). If this test fails, investigate why nodes/edges
+    decreased - it likely indicates a bug.
+    """
+    # Create temporary output directory
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_output = Path(tmp_dir) / "test2_fresh"
+        tmp_output.mkdir()
+        
+        # Run extract
+        sql_dir = INPUT_DIR / "test2"
+        result = subprocess.run(
+            ["infotracker", "extract", "--sql-dir", str(sql_dir), "--out-dir", str(tmp_output)],
+            capture_output=True,
+            text=True,
+        )
+        
+        assert result.returncode == 0, \
+            f"Extract failed: {result.stderr}"
+        
+        # Load column_graph
+        graph_json = tmp_output / "column_graph.json"
+        assert graph_json.exists(), "column_graph.json not created"
+        
+        data = load_json(graph_json)
+        
+        # Check nodes baseline
+        assert "nodes" in data, "Missing nodes in column_graph.json"
+        node_count = len(data["nodes"])
+        assert node_count >= 158, \
+            f"Regression: column_graph has {node_count} nodes, expected >= 158"
+        
+        # Check edges baseline
+        assert "edges" in data, "Missing edges in column_graph.json"
+        edge_count = len(data["edges"])
+        assert edge_count >= 267, \
+            f"Regression: column_graph has {edge_count} edges, expected >= 267"
+        
+        # Verify structure of nodes
+        if node_count > 0:
+            sample_node = data["nodes"][0]
+            # Node structure: {namespace, table, column}
+            assert "namespace" in sample_node, "Node missing 'namespace' field"
+            assert "table" in sample_node, "Node missing 'table' field"
+            assert "column" in sample_node, "Node missing 'column' field"
+        
+        # Verify structure of edges
+        if edge_count > 0:
+            sample_edge = data["edges"][0]
+            assert "from" in sample_edge, "Edge missing 'from' field"
+            assert "to" in sample_edge, "Edge missing 'to' field"
+            assert "transformation" in sample_edge, "Edge missing 'transformation' field"
+        
+        # Additional sanity checks: verify some key tables appear in graph
+        table_names = {node["table"] for node in data["nodes"]}
+        
+        # Main output table should have nodes
+        assert "dbo.TrialBalance_tetafk_BV" in table_names, \
+            "Expected dbo.TrialBalance_tetafk_BV in graph"
+        
+        # Temp tables should have nodes (contain #)
+        temp_tables = [tbl for tbl in table_names if "#" in tbl]
+        assert len(temp_tables) > 0, \
+            "Expected temp tables in graph"
