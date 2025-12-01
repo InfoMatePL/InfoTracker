@@ -854,7 +854,7 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
         if m_as:
             out_name = m_as.group(1)
         if not out_name:
-            m_col = re.search(r'(?i)\b(?:inserted|deleted)\.(\w+)\b', raw)
+            m_col = re.search(r'(?i)\b(?:inserted|deleted)\.\[?(\w+)\]?', raw)
             if m_col:
                 out_name = m_col.group(1)
             else:
@@ -865,7 +865,7 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
                     out_name = f"col_{i+1}"
         out_names.append(out_name)
         refs: List[ColumnReference] = []
-        for m in re.finditer(r'(?i)\b([A-Za-z_][\w]*)\.(\w+)\b', raw):
+        for m in re.finditer(r'(?i)\b([A-Za-z_][\w]*)\.\[?(\w+)\]?', raw):
             al = m.group(1).lower()
             col = m.group(2)
             if al in {'inserted','deleted'}:
