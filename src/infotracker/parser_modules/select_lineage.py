@@ -861,9 +861,9 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             output_columns.append(ColumnSchema(name=col_name, data_type="unknown", nullable=True, ordinal=ordinal))
             ordinal += 1
             input_refs = self._extract_column_references(select_expr, select_stmt)
-            if not input_refs:
-                db = self.current_database or self.default_database or "InfoTrackerDW"
-                input_refs = [ColumnReference(namespace=self._canonical_namespace(db), table_name="LITERAL", column_name=str(select_expr))]
+            # For computed expressions without trackable column dependencies, use empty input_refs
+            # instead of creating fake LITERAL objects. This prevents spurious nodes in column_graph
+            # while preserving the lineage entry with proper transformation metadata.
             lineage.append(ColumnLineage(output_column=col_name, input_fields=input_refs, transformation_type=TransformationType.EXPRESSION, transformation_description=f"SELECT {str(select_expr)}"))
 
     return lineage, output_columns
