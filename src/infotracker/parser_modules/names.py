@@ -163,8 +163,13 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
         # Detect temps via context:
         #  - catalog == tempdb means it's a temp (restore '#')
         #  - simple name present in temp_registry (as '#name')
+        # Also detect table variables (starting with '@') and preserve the '@' prefix
         try:
             simple = str(table_expr.name)
+            # Check if original expression starts with @ (table variable)
+            # Table variables should be skipped from lineage (not materialized outputs)
+            if str(table_expr).startswith('@'):
+                return f"@{simple}"
             if getattr(table_expr, 'catalog', None):
                 cat = str(table_expr.catalog)
                 if cat and cat.lower() == 'tempdb':

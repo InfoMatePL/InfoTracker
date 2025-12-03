@@ -380,6 +380,10 @@ class ColumnGraph:
             output_namespace = obj.schema.namespace
             output_table = obj.schema.name
 
+            # Skip table variables (starting with @) - they should not appear in column_graph
+            if output_table and output_table.startswith('@'):
+                continue
+
             # Normalize: strip leading '<DB>.' from table name if it matches namespace DB
             try:
                 ns_db = output_namespace.rsplit('/', 1)[1]
@@ -407,6 +411,10 @@ class ColumnGraph:
                 
                 # Create edges for each input field
                 for input_field in lineage.input_fields:
+                    # Skip table variables (starting with @) - they should not appear in column_graph
+                    if input_field.table_name and input_field.table_name.startswith('@'):
+                        continue
+                    
                     in_ns = input_field.namespace
                     in_tbl = input_field.table_name
                     # Normalize inputs similarly

@@ -1998,8 +1998,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
             if obj:
                 logger.debug(f"_parse_procedure_body_statements: Parsed INSERT INTO, got obj: {obj.name}, dependencies={obj.dependencies}, lineage={len(obj.lineage)} columns")
                 all_outputs.append(obj)
-                # Skip temp tables
-                if obj.name.startswith("#") or "tempdb" in obj.name.lower():
+                # Skip temp tables and table variables
+                if obj.name.startswith("#") or obj.name.startswith("@") or "tempdb" in obj.name.lower():
                     all_inputs.update(obj.dependencies or [])
                     continue
                 
@@ -2020,8 +2020,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     
     # Create ObjectInfo for temp tables from temp_registry that are not in all_outputs
     # This ensures temp tables like #insert_update_temp_asefl, #MaxLoadDate, #MinAccountingPeriod are available
+    # Skip table variables (starting with @) - they should not be materialized
     for tkey in self.temp_registry.keys():
-        if tkey.startswith('#'):
+        if tkey.startswith('#') and not tkey.startswith('@'):
             # Check if this temp table is already in all_outputs
             temp_already_in_outputs = False
             for obj in all_outputs:
@@ -2164,8 +2165,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     else:
                         deps_expanded.add(tkey)
             # Also add temp tables from temp_registry that might not be in all_outputs
+            # Skip table variables (starting with @) - they should not be materialized
             for tkey in self.temp_registry.keys():
-                if tkey.startswith('#'):
+                if tkey.startswith('#') and not tkey.startswith('@'):
                     temp_tables_found.add(tkey)
                     # Use canonical temp table name if available
                     ctx_db = getattr(self, '_ctx_db', None) or self.current_database or self.default_database
@@ -2188,9 +2190,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
             logger.debug(f"_parse_procedure_body_statements: Checking all_outputs for auxiliary tables: {len(all_outputs)} outputs, result_output={result_output.name if result_output else None}")
             for obj in all_outputs:
                 logger.debug(f"  - all_outputs entry: name={obj.name if obj else 'None'}, type={obj.object_type if obj else 'None'}, is_result={obj == result_output}, lineage={len(obj.lineage) if obj and obj.lineage else 0}")
-                # Skip temp tables (already handled), skip result_output (main output)
+                # Skip temp tables and table variables (already handled), skip result_output (main output)
                 if (obj and obj.object_type == "table" and obj != result_output and 
-                    not obj.name.startswith("#") and "tempdb" not in obj.name.lower()):
+                    not obj.name.startswith("#") and not obj.name.startswith("@") and "tempdb" not in obj.name.lower()):
                     # This is an auxiliary persistent table (e.g., _ins_upd_results)
                     # Register it as a fake temp table so engine.py emits JSON for it
                     fake_temp_key = f"#{obj.name.split('.')[-1]}"  # e.g., #TrialBalance_tetafk_BV_ins_upd_results
