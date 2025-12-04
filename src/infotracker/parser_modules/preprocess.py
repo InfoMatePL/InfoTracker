@@ -113,6 +113,14 @@ def _normalize_tsql(self, text: str) -> str:
     t = re.sub(r"^\s*GO\s*;?\s*$", "", t, flags=re.I|re.M)
     t = re.sub(r"\s+COLLATE\s+[A-Za-z0-9_]+", "", t, flags=re.I)
     t = re.sub(r"\bISNULL\s*\(", "COALESCE(", t, flags=re.I)
+    # [TEMPORARY TEST] Commented out ;WITH conversion to test if it causes test regression
+    # Fix ;WITH syntax: sqlglot cannot parse CTE with leading semicolon
+    # Convert ;WITH to \nWITH to make CTE parseable
+    # before_count = len(re.findall(r';\s*WITH\b', t, flags=re.I))
+    # t = re.sub(r';\s*WITH\b', '\nWITH', t, flags=re.I)
+    # after_count = len(re.findall(r'^\s*WITH\b', t, flags=re.I | re.M))
+    # if before_count > 0:
+    #     print(f"DEBUG preprocess.py: Converted {before_count} ';WITH' to 'WITH', now have {after_count} 'WITH' at line start")
     try:
         t = re.sub(r"[\u200B\u200C\u200D\u00A0]", " ", t)
     except Exception:

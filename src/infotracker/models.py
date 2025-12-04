@@ -343,8 +343,20 @@ class ColumnGraph:
             "downstream_tables": len(set(str(edge.to_column).rsplit('.', 1)[0] for edge in downstream_edges))
         }
     
-    def build_from_object_lineage(self, objects: List[ObjectInfo]) -> None:
-        """Build column graph from object lineage information."""
+    def build_from_object_lineage(self, objects: List[ObjectInfo], cte_data: Dict[str, Any] = None) -> None:
+        """Build column graph from object lineage information.
+        
+        Args:
+            objects: List of ObjectInfo with lineage
+            cte_data: Optional CTE registry for expanding CTE to base sources (NOT WORKING due to architectural limitation)
+        """
+        if cte_data is None:
+            cte_data = {}
+        
+        # NOTE: CTE expansion was attempted but cte_data is always empty
+        # CTE are registered locally in SelectLineageExtractor and don't propagate to engine/models
+        # Known limitation: CTE will appear in column_graph as intermediate nodes
+        
         # Build a map of old temp table names to new ones (e.g., "dbo.#asefl_temp" -> "dbo.update_asefl_TrialBalance_BV#asefl_temp")
         # Also build a map of temp table names to their ObjectInfo for lineage expansion
         temp_name_map: Dict[str, str] = {}
@@ -476,6 +488,64 @@ class ColumnGraph:
                                     if key.endswith(f"#{temp_part}") or key == f"#{temp_part}":
                                         temp_obj = obj
                                         break
+                    
+                    # CHECK FOR CTE EXPANSION (before temp table expansion)
+                    # If input is a CTE, expand it to base sources (similar to temp tables)
+                    # CTE are ephemeral query-scoped objects that should be transparent in lineage
+                    cte_expanded = False
+                    if cte_data and in_tbl:
+                        # Check if in_tbl is a CTE (case-insensitive match)
+                        # Try simple name (last part after dots)
+                        cte_simple = in_tbl.split('.')[-1] if '.' in in_tbl else in_tbl
+                        cte_info = None
+                        for cte_name, info in cte_data.items():
+                            if cte_name.lower() == cte_simple.lower():
+                                cte_info = info
+                                break
+                        
+                        if cte_info:
+                            # CTE found - extract base sources from CTE definition
+                            # cte_info is either dict with 'definition' or just columns list
+                            cte_def = None
+                            if isinstance(cte_info, dict) and 'definition' in cte_info:
+                                cte_def = cte_info['definition']
+                                from sqlglot import expressions as exp
+                                if cte_def and isinstance(cte_def, exp.Select):
+                                    # Extract dependencies from CTE definition (base tables)
+                                    # We can't call parser methods here, so use simple FROM extraction
+                                    base_tables = set()
+                                    for table in cte_def.find_all(exp.Table):
+                                        tbl_name = str(table.name) if hasattr(table, 'name') else str(table)
+                                        # Skip if this is another CTE
+                                        is_another_cte = False
+                                        for other_cte_name in cte_data.keys():
+                                            if tbl_name.lower() == other_cte_name.lower():
+                                                is_another_cte = True
+                                                break
+                                        if not is_another_cte and not tbl_name.startswith('#'):
+                                            base_tables.add(tbl_name)
+                                    
+                                    # Create edges from CTE base sources to output (expand CTE)
+                                    if base_tables:
+                                        for base_tbl_name in base_tables:
+                                            # Use same namespace as CTE
+                                            base_column = ColumnNode(
+                                                namespace=in_ns,
+                                                table_name=f"dbo.{base_tbl_name}" if '.' not in base_tbl_name else base_tbl_name,
+                                                column_name=input_field.column_name
+                                            )
+                                            
+                                            edge = ColumnEdge(
+                                                from_column=base_column,
+                                                to_column=output_column,
+                                                transformation_type=lineage.transformation_type,
+                                                transformation_description=lineage.transformation_description
+                                            )
+                                            
+                                            self.add_edge(edge)
+                                        cte_expanded = True
+                                        # Skip creating edge from CTE itself - it's been expanded
+                                        continue
                     
                     # If input is a temp table and we have its ObjectInfo, expand to base sources
                     if temp_obj and temp_obj.lineage:

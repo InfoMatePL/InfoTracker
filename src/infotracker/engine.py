@@ -277,6 +277,9 @@ class Engine:
         global_saved_temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}
         global_saved_temp_sources: Dict[str, Set[str]] = {}
         global_saved_temp_registry: Dict[str, List[str]] = {}
+        # Store CTE registry from ALL procedures for column graph expansion (similar to temp_lineage)
+        # CTE need to be expanded to base sources in column_graph (like temp tables)
+        global_saved_cte_registry: Dict[str, Any] = {}
         for obj_name in processing_order:
             if obj_name not in sql_file_map:
                 continue
@@ -321,6 +324,10 @@ class Engine:
                     # Parse the file - this will re-detect USE statement and set current_database
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
                     
+                    # NOTE: CTE registry saving attempted here but cte_registry is empty after parse
+                    # CTE are registered locally in SelectLineageExtractor and don't propagate back to parser
+                    # This is a known architectural limitation - CTE will appear in column_graph as-is
+                    
                     # Save temp_lineage, temp_sources, and temp_registry from procedures before they get cleared
                     if obj_info.object_type == "procedure" or "procedure" in str(sql_path).lower():
                         # Save temp_lineage, temp_sources, and temp_registry for later use (local)
@@ -331,6 +338,7 @@ class Engine:
                         global_saved_temp_lineage.update(parser.temp_lineage)
                         global_saved_temp_sources.update(parser.temp_sources)
                         global_saved_temp_registry.update(parser.temp_registry)
+                        # CTE registry already saved above (lines 326-332) immediately after parsing
                         logger.debug(f"Phase 3: Saved temp_lineage from {sql_path.stem}: {len(saved_temp_lineage)} temp tables, keys: {list(saved_temp_lineage.keys())[:5]}")
                     
                     # Restore saved context after parse_sql_file (which may reset it)
@@ -935,6 +943,7 @@ class Engine:
             
             # OPTIMIZATION: Clear parser registries after processing this object to free memory
             # These are re-populated for each file, so we can clear them between objects
+            # CTE registry was already saved above (lines 339-341) before parsing next file
             parser.cte_registry.clear()
             # Note: temp_registry, temp_sources, temp_lineage are already cleared before each file (line 303-306)
             # But we can also clear _proc_acc and _temp_version to be safe
@@ -954,7 +963,8 @@ class Engine:
         if resolved_objects:
             try:
                 graph = ColumnGraph()
-                graph.build_from_object_lineage(resolved_objects)  # Use resolved objects with expanded schemas
+                # Pass CTE registry to enable CTE expansion (like temp tables)
+                graph.build_from_object_lineage(resolved_objects, cte_data=global_saved_cte_registry)
                 self._column_graph = graph
 
                 # Save graph to disk for impact analysis

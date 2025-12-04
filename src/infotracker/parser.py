@@ -303,7 +303,9 @@ class SqlParser:
             pass
         
         # Reset registries for each file to avoid contamination
-        self.cte_registry.clear()
+        # NOTE: cte_registry is NOT cleared here (like temp_lineage) - it needs to persist for column graph expansion
+        # CTE are saved in engine.py after parsing and used in models.py for expansion (similar to temp tables)
+        # self.cte_registry.clear()  # DO NOT CLEAR - needed for column graph expansion in engine/models
         self.temp_registry.clear()
         self.temp_sources.clear()
         self.temp_lineage.clear()

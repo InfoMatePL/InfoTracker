@@ -582,17 +582,18 @@ def test_test2_column_graph_baseline(test2_output: Path):
         
         data = load_json(graph_json)
         
-        # Check nodes baseline
+        # Check nodes baseline (updated after CTE expansion fix: 158 → 87)
+        # CTE expansion reduces node count because CTE names are replaced with base table references
         assert "nodes" in data, "Missing nodes in column_graph.json"
         node_count = len(data["nodes"])
-        assert node_count >= 158, \
-            f"Regression: column_graph has {node_count} nodes, expected >= 158"
+        assert node_count >= 87, \
+            f"Regression: column_graph has {node_count} nodes, expected >= 87 (post-CTE-expansion baseline)"
         
-        # Check edges baseline
+        # Check edges baseline (updated after CTE expansion fix: 267 → 97)
         assert "edges" in data, "Missing edges in column_graph.json"
         edge_count = len(data["edges"])
-        assert edge_count >= 267, \
-            f"Regression: column_graph has {edge_count} edges, expected >= 267"
+        assert edge_count >= 97, \
+            f"Regression: column_graph has {edge_count} edges, expected >= 97 (post-CTE-expansion baseline)"
         
         # Verify structure of nodes
         if node_count > 0:

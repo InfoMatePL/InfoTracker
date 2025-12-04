@@ -1453,11 +1453,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             from .temp_utils import _extract_temp_name
                             temp_bare = self._extract_temp_name(out_target)
                             simple_key = f"#{temp_bare}" if not temp_bare.startswith('#') else temp_bare
-                            print(f"DEBUG: out_target={out_target}, simple_key={simple_key}, out_lineage length={len(out_lineage or [])}, out_cols length={len(out_cols or [])}")
                             if out_lineage:
                                 # Build col_map from lineage (similar to _parse_select_into line 214)
                                 col_map = {lin.output_column.lower() if lin.output_column else '': list(lin.input_fields or []) for lin in out_lineage}
-                                print(f"DEBUG: col_map keys={list(col_map.keys())}, sample values={list(col_map.values())[:2] if col_map else []}")
                                 self.temp_lineage[simple_key] = col_map
                                 logger.debug(f"_parse_procedure_body_statements: Registered OUTPUT INTO temp_lineage for {simple_key}: {len(col_map)} columns")
                             

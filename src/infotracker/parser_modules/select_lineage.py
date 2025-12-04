@@ -145,6 +145,10 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     import logging
     logger = logging.getLogger(__name__)
     
+    # Initialize visited CTE set to prevent infinite recursion
+    if not hasattr(self, '_cte_expansion_stack'):
+        self._cte_expansion_stack = set()
+    
     qual = (col_exp.table or "").lower()
     table_fqn = alias_map.get(qual)
     
@@ -514,35 +518,48 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                         
                         # FIXED: Instead of blindly adding column to ALL dependencies, 
                         # extract column-level lineage from CTE definition to find the correct source table(s)
-                        try:
-                            logger.warning(f"DIAGNOSTIC_REG: Extracting lineage for CTE {cte_name}, col={col_exp.name}, cte_def={type(cte_def).__name__}")
-                            cte_lineage, _cte_schema = self._extract_column_lineage(cte_def, cte_name)
-                            logger.warning(f"DIAGNOSTIC_REG: Extracted {len(cte_lineage)} columns from CTE {cte_name}")
-                            logger.debug(f"_append_column_ref: Extracted lineage for CTE {cte_name} (from registry), {len(cte_lineage)} columns")
-                            
-                            # Find lineage for the requested column
-                            col_lineage = None
-                            for lin in cte_lineage:
-                                if lin.output_column.lower() == col_exp.name.lower():
-                                    col_lineage = lin
-                                    break
-                            
-                            if col_lineage and col_lineage.input_fields:
-                                logger.debug(f"_append_column_ref: Found lineage for column {col_exp.name} in CTE {cte_name} (from registry), {len(col_lineage.input_fields)} input fields")
-                                # Use the input_fields from CTE's lineage as sources
-                                for input_ref in col_lineage.input_fields:
-                                    # input_ref might be another CTE - if so, it will be recursively expanded by deps.py
-                                    out_list.append(input_ref)
-                                    logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} (from registry) column lineage: {input_ref}")
-                                if out_list:
-                                    return
-                            else:
-                                logger.debug(f"_append_column_ref: No lineage found for column {col_exp.name} in CTE {cte_name} (from registry), falling back to all dependencies")
-                        except Exception as e:
-                            import traceback
-                            logger.debug(f"_append_column_ref: Exception extracting CTE lineage: {e}")
-                            logger.debug(f"_append_column_ref: Traceback: {traceback.format_exc()}")
-                            logger.debug(f"_append_column_ref: Failed to extract CTE lineage from registry: {e}, falling back to all dependencies")
+                        
+                        # Prevent infinite recursion: check if we're already expanding this CTE
+                        if cte_name in self._cte_expansion_stack:
+                            logger.debug(f"_append_column_ref: CTE {cte_name} already in expansion stack, skipping to avoid infinite recursion")
+                            # Skip to fallback logic
+                        else:
+                            try:
+                                # Mark this CTE as being expanded
+                                self._cte_expansion_stack.add(cte_name)
+                                logger.warning(f"DIAGNOSTIC_REG: Extracting lineage for CTE {cte_name}, col={col_exp.name}, cte_def={type(cte_def).__name__}")
+                                cte_lineage, _cte_schema = self._extract_column_lineage(cte_def, cte_name)
+                                logger.warning(f"DIAGNOSTIC_REG: Extracted {len(cte_lineage)} columns from CTE {cte_name}")
+                                logger.debug(f"_append_column_ref: Extracted lineage for CTE {cte_name} (from registry), {len(cte_lineage)} columns")
+                                
+                                # Find lineage for the requested column
+                                col_lineage = None
+                                for lin in cte_lineage:
+                                    if lin.output_column.lower() == col_exp.name.lower():
+                                        col_lineage = lin
+                                        break
+                                
+                                if col_lineage and col_lineage.input_fields:
+                                    logger.debug(f"_append_column_ref: Found lineage for column {col_exp.name} in CTE {cte_name} (from registry), {len(col_lineage.input_fields)} input fields")
+                                    # Use the input_fields from CTE's lineage as sources
+                                    for input_ref in col_lineage.input_fields:
+                                        # input_ref might be another CTE - if so, it will be recursively expanded by deps.py
+                                        out_list.append(input_ref)
+                                        logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} (from registry) column lineage: {input_ref}")
+                                    if out_list:
+                                        # Clean up expansion stack before returning
+                                        self._cte_expansion_stack.discard(cte_name)
+                                        return
+                                else:
+                                    logger.debug(f"_append_column_ref: No lineage found for column {col_exp.name} in CTE {cte_name} (from registry), falling back to all dependencies")
+                            except Exception as e:
+                                import traceback
+                                logger.debug(f"_append_column_ref: Exception extracting CTE lineage: {e}")
+                                logger.debug(f"_append_column_ref: Traceback: {traceback.format_exc()}")
+                                logger.debug(f"_append_column_ref: Failed to extract CTE lineage from registry: {e}, falling back to all dependencies")
+                            finally:
+                                # Always remove from stack after processing
+                                self._cte_expansion_stack.discard(cte_name)
                         
                         # Fallback: if lineage extraction failed, add column to all dependencies (old behavior)
                         for dep in cte_deps:
@@ -1208,9 +1225,11 @@ def _resolve_table_from_alias(self, alias: Optional[str], context: exp.Select) -
 
 
 def _process_ctes(self, select_stmt: exp.Select) -> exp.Select:
-    with_clause = select_stmt.args.get('with')
-    if with_clause and hasattr(with_clause, 'expressions'):
-        for cte in with_clause.expressions:
+    # FIX: Use .ctes property instead of args.get('with') which was ALWAYS None
+    # sqlglot stores WITH in args['with_'] (with underscore) and provides .ctes property
+    if hasattr(select_stmt, 'ctes') and select_stmt.ctes:
+        ctes = select_stmt.ctes
+        for cte in ctes:
             if hasattr(cte, 'alias') and hasattr(cte, 'this'):
                 cte_name = str(cte.alias)
                 cte_columns = []
