@@ -76,6 +76,21 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
     
     matches = list(re.finditer(pattern_with_terminator, s))
     logger.debug(f"_extract_insert_select_lineage_string: Found {len(matches)} INSERT INTO ... SELECT patterns")
+
+    # If no INSERT matches were found, try to normalize SELECT ... INTO into INSERT ... SELECT
+    # so we can reuse the same lineage extraction logic for long SELECT INTO statements.
+    if not matches and re.search(r'(?is)\bSELECT\s+.*?\bINTO\b', s):
+        select_into_regex = r'(?is)SELECT\s+(.*?)\s+INTO\s+([#\w.\[\]]+)\s+'
+        def _select_into_to_insert(m: re.Match) -> str:
+            cols = m.group(1)
+            target = m.group(2)
+            return f"INSERT INTO {target} SELECT {cols} "
+        converted = re.sub(select_into_regex, _select_into_to_insert, s)
+        if converted != s:
+            logger.debug("_extract_insert_select_lineage_string: Normalized SELECT INTO to INSERT INTO for parsing")
+        matches = list(re.finditer(pattern_with_terminator, converted))
+        logger.debug(f"_extract_insert_select_lineage_string: After normalization found {len(matches)} INSERT/SELECT patterns")
+        s = converted
     
     for match_idx, match in enumerate(matches):
         table_ref = match.group(1).strip()
@@ -85,10 +100,20 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
         table_simple = table_ref.split('.')[-1].lower().strip('[]')
         logger.debug(f"_extract_insert_select_lineage_string: Match {match_idx+1}: table_ref={table_ref}, table_simple={table_simple}, target_simple={target_simple}")
         
-        # Skip temp tables (unless target is also temp)
+        # Skip temp tables only if target clearly refers to a different non-temp object.
+        # When the object_name is normalized (no leading #) but the SQL uses #temp, allow matching.
         if table_simple.startswith('#') and not target_simple.startswith('#'):
-            logger.debug(f"_extract_insert_select_lineage_string: Skipping temp table {table_simple}")
-            continue
+            normalized_temp = table_simple.lstrip('#')
+            if target_simple == normalized_temp or target_simple.endswith(normalized_temp):
+                logger.debug(
+                    "_extract_insert_select_lineage_string: Allowing temp table %s to match normalized target %s",
+                    table_simple,
+                    target_simple,
+                )
+                table_simple = normalized_temp
+            else:
+                logger.debug(f"_extract_insert_select_lineage_string: Skipping temp table {table_simple}")
+                continue
         
         # Check if this INSERT matches our target table
         # Try exact match first, then check if table_simple is at the end of target_simple
@@ -325,9 +350,11 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
     for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
         obj = _to_obj(m.group(1))
         if obj:
-            # Try to extract lineage for SELECT INTO
+            # Try to extract lineage for SELECT INTO (use a wide window to keep long FROM/JOIN blocks intact)
             try:
-                select_into_sql = s[max(0, m.start()-1000):m.end()+5000]  # Get context around SELECT INTO
+                window_start = max(0, m.start() - 5000)
+                window_end = min(len(s), m.end() + 20000)
+                select_into_sql = s[window_start:window_end]
                 lineage, deps = self._extract_insert_select_lineage_string(select_into_sql, obj.name)
                 if lineage:
                     obj.lineage = lineage

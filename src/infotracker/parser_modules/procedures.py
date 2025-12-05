@@ -228,11 +228,73 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
             seg_sql = self._preprocess_sql(self._normalize_tsql(src_text))
             import re as _re
             # SELECT ... INTO #temp ... segments
-            # Improved regex to handle multi-line SELECT ... INTO statements better
-            for m in _re.finditer(r"(?is)\bSELECT\s+.*?\bINTO\s+#(?P<tmp>[A-Za-z0-9_]+)\b.*?(?=;|\b(?:INSERT|CREATE|ALTER|UPDATE|DELETE|DROP|TRUNCATE|BEGIN|END|GO|COMMIT|ROLLBACK)\b|$)", src_text):
+            # Use backwards-search approach: find INTO, then find its SELECT
+            # This avoids matching wrong SELECT to INTO in multi-statement procedures
+            select_into_matches = list(_re.finditer(r'INTO\s+#([A-Za-z0-9_]+)', src_text, _re.IGNORECASE))
+            
+            for m_into in select_into_matches:
+                into_pos = m_into.start()
+                into_end = m_into.end()
+                tmp = m_into.group(1)
+                
+                # Find the SELECT that belongs to this INTO
+                # Strategy: search backwards through statement boundaries (double-newlines)
+                # until we find a SELECT keyword
+                sql_before_into = src_text[:into_pos]
+                select_pos = None
+                
+                # Search backwards through all double-newline boundaries
+                search_pos = len(sql_before_into)
+                while search_pos > 0:
+                    # Find the last double-newline before current search position
+                    boundary_pos = sql_before_into.rfind('\n\n', 0, search_pos)
+                    search_from = 0 if boundary_pos == -1 else boundary_pos
+                    
+                    # Search for SELECT in this range
+                    select_search_text = sql_before_into[search_from:search_pos]
+                    select_matches_list = list(_re.finditer(r'\bSELECT\b', select_search_text, _re.IGNORECASE))
+                    
+                    if select_matches_list:
+                        # Found a SELECT - use the last one in this segment
+                        last_select = select_matches_list[-1]
+                        select_pos = search_from + last_select.start()
+                        break
+                    
+                    # Move search position to this boundary and continue looking further back
+                    search_pos = boundary_pos
+                    if boundary_pos == -1:
+                        # No more boundaries - no SELECT found
+                        break
+                
+                if select_pos is None:
+                    continue
+                
+                # Find end of INTO statement
+                after_into = src_text[into_end:]
+                end_match = _re.search(r'\n\s*(?:GO|;|SELECT\s+@)', after_into, _re.IGNORECASE | _re.MULTILINE)
+                if end_match:
+                    end_pos = into_end + end_match.start()
+                else:
+                    double_nl = after_into.find('\n\n')
+                    end_pos = (into_end + double_nl) if double_nl > 0 else len(src_text)
+                
+                raw_seg = src_text[select_pos:end_pos]
+                
                 # Try AST on the normalized/preprocessed segment
-                raw_seg = m.group(0)
-                seg = self._preprocess_sql(self._normalize_tsql(raw_seg))
+
+                
+                # Clean up the captured segment: strip trailing comments and statements that shouldn't be there
+                # T-SQL doesn't require semicolons, so we need to remove code that comes after the INTO statement
+                # Look for patterns like /* comment */ or SELECT/INSERT/UPDATE after the main statement
+                raw_seg_cleaned = raw_seg
+                # Remove block comments followed by diagnostic SELECT @variable statements
+                # The diagnostic code pattern: /* ... */ followed by SELECT @variable ... statements
+                # Only remove if it's followed by diagnostic patterns, not other INTO or JOIN keywords
+                cleaned = _re.sub(r'/\*.*?\*/\s*(?:SELECT\s+@\w+\s+.*?(?=;|GO|\Z)|PRINT\s+.*?(?=;|GO|\Z))', '', raw_seg_cleaned, flags=_re.MULTILINE | _re.DOTALL)
+                if cleaned != raw_seg_cleaned:
+                    raw_seg_cleaned = cleaned
+                
+                seg = self._preprocess_sql(self._normalize_tsql(raw_seg_cleaned))
                 try:
                     import sqlglot
                     from sqlglot import expressions as _exp
@@ -240,10 +302,9 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                     if isinstance(st, _exp.Select):
                         # registers temp_registry/temp_sources/temp_lineage
                         self._parse_select_into(st, object_hint)
-                except Exception:
+                except Exception as ast_err:
                     # Fallback: approximate base deps from string scan
                     try:
-                        tmp = m.group('tmp')
                         if tmp:
                             tkey = f"#{tmp}"
                             bases = self._extract_basic_dependencies(raw_seg) or set()
@@ -832,6 +893,10 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
             # Search up to 10000 characters back (WITH statements can be very long)
             search_start = max(0, into_match.start() - 10000)
             before_text = preprocessed_body[search_start:into_match.start()]
+            # IMPORTANT: local_search_start is used to track the actual search position
+            # in before_text for calculating positions in preprocessed_body
+            # It may be different from search_start if we extend the search range
+            local_search_start = search_start
             
             logger.debug(f"_parse_procedure_body_statements: Looking for WITH before INTO {temp_table}, searching {len(before_text)} chars back, search_start={search_start}, into_match.start()={into_match.start()}")
             # Check if WITH is in preprocessed_body before into_match.start()
@@ -886,14 +951,15 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 logger.debug(f"_parse_procedure_body_statements: Last 200 chars before INTO {temp_table}: {before_text[-200:]}")
                 # Also check if WITH is in preprocessed_body before into_match.start() (maybe search_start is wrong)
                 # Always check extended range if WITH is not found in before_text
+                # NOTE: Use local variables to avoid modifying search_start which affects later iterations
                 extended_search_start = max(0, into_match.start() - 20000)
                 extended_before_text = preprocessed_body[extended_search_start:into_match.start()]
-                logger.debug(f"_parse_procedure_body_statements: Checking extended_before_text for {temp_table}, length={len(extended_before_text)}, search_start={extended_search_start}, into_match.start()={into_match.start()}")
+                logger.debug(f"_parse_procedure_body_statements: Checking extended_before_text for {temp_table}, length={len(extended_before_text)}, extended_search_start={extended_search_start}, into_match.start()={into_match.start()}")
                 # Check if WITH is in extended_before_text
                 has_with_in_extended = 'WITH' in extended_before_text.upper() or 'WITH' in extended_before_text
                 logger.debug(f"_parse_procedure_body_statements: has_with_in_extended={has_with_in_extended} for {temp_table}")
                 if has_with_in_extended:
-                    logger.debug(f"_parse_procedure_body_statements: Found 'WITH' in extended_before_text (search_start={extended_search_start}), but not in before_text (search_start={search_start})")
+                    logger.debug(f"_parse_procedure_body_statements: Found 'WITH' in extended_before_text (extended_search_start={extended_search_start}), but not in before_text (search_start={search_start})")
                     # Find WITH in extended_before_text
                     with_pos_in_extended = extended_before_text.upper().find('WITH')
                     if with_pos_in_extended >= 0:
@@ -903,13 +969,18 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                         context_end = min(len(extended_before_text), with_pos_in_extended + 200)
                         logger.debug(f"_parse_procedure_body_statements: Context around WITH: {extended_before_text[context_start:context_end]}")
                         # Use extended_before_text instead of before_text for finding WITH
+                        # IMPORTANT: Create local variables to avoid modifying search_start for other iterations
                         before_text = extended_before_text
-                        search_start = extended_search_start
+                        local_search_start = extended_search_start
+                    else:
+                        local_search_start = search_start
+                else:
+                    local_search_start = search_start
             
             # Find the nearest WITH statement before this INTO
-            # Look for ;WITH or start of string or newline followed by WITH
-            # Also check for WITH at the start of the search area
-            with_start_pattern = r'(?:^|;|\n)\s*WITH\s+'
+            # IMPORTANT: Only match WITH if it's immediately followed by CTEs and then SELECT
+            # This avoids matching WITH statements from earlier SELECT...INTO blocks
+            with_start_pattern = r'(?:^|;|\n)\s*WITH\s+\w+\s*AS\s*\('
             with_start_matches = list(re.finditer(with_start_pattern, before_text, re.IGNORECASE | re.MULTILINE))
             
             # Also try a simpler pattern - just look for WITH (might be at start of line)
@@ -925,11 +996,31 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     # Check if this WITH is at start of statement
                     if pos == 0 or (pos > 0 and before_text[pos-1] in (';', '\n')):
                         with_start_matches.append(simple_match)
-                        logger.debug(f"_parse_procedure_body_statements: Found WITH at position {search_start + pos} using simple pattern")
+                        logger.debug(f"_parse_procedure_body_statements: Found WITH at position {local_search_start + pos} using simple pattern")
                     else:
                         logger.debug(f"_parse_procedure_body_statements: WITH at pos {pos} is not at start of statement (prev_char={repr(prev_char)})")
             
             logger.debug(f"_parse_procedure_body_statements: Found {len(with_start_matches)} WITH matches before INTO {temp_table}")
+            
+            # IMPORTANT: Filter out WITH statements that are NOT for this INTO
+            # If there's a semicolon between the WITH and INTO in preprocessed_body,
+            # the WITH is for a different statement
+            valid_with_matches = []
+            for with_match in with_start_matches:
+                with_pos_in_before = with_match.start()
+                actual_with_pos = local_search_start + with_pos_in_before
+                # Check if there's a semicolon between WITH and INTO in preprocessed_body
+                between_text = preprocessed_body[actual_with_pos:into_match.start()]
+                semicolon_count = between_text.count(';')
+                if semicolon_count == 0:
+                    # No semicolon - this WITH is likely for this INTO
+                    valid_with_matches.append(with_match)
+                    logger.debug(f"_parse_procedure_body_statements: WITH at {actual_with_pos} is valid for {temp_table} (no semicolon between)")
+                else:
+                    logger.debug(f"_parse_procedure_body_statements: WITH at {actual_with_pos} is NOT valid for {temp_table} ({semicolon_count} semicolons between)")
+            
+            with_start_matches = valid_with_matches
+            logger.debug(f"_parse_procedure_body_statements: After filtering, {len(with_start_matches)} valid WITH matches for {temp_table}")
             
             if not with_start_matches:
                 # No WITH found - this is a simple SELECT ... INTO #table (without WITH)
@@ -941,14 +1032,14 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     # Use the last (closest) SELECT match
                     select_start_match = select_start_matches[-1]
                     select_pos_in_before = select_start_match.start()
-                    actual_select_start = search_start + select_pos_in_before
+                    actual_select_start = local_search_start + select_pos_in_before
                     # Adjust if it starts with semicolon or newline
                     while actual_select_start < len(preprocessed_body) and preprocessed_body[actual_select_start] in (';', '\n', '\r', ' '):
                         actual_select_start += 1
                     
                     # Find the end of this statement
                     # Look for semicolon, next SELECT, or control flow keywords (IF, BEGIN, etc.)
-                    search_end_pos = min(len(preprocessed_body), into_end + 1000)
+                    search_end_pos = min(len(preprocessed_body), into_end + 20000)
                     after_text = preprocessed_body[into_end:search_end_pos]
                     
                     # Look for semicolon first
@@ -963,10 +1054,22 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             semicolon_pos = -1
                     
                     if semicolon_pos < 0:
-                        # Look for next SELECT on a new line
-                        next_select_match = re.search(r'\n\s*SELECT\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                        # Look for EXEC statement first (display insert status, audit, etc.)
+                        exec_match = re.search(r'\n\s*EXEC\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                        # Look for next SELECT on a new line (but not SELECT @var assignments)
+                        next_select_match = re.search(r'\n\s*SELECT\s+(?!@)', after_text, re.IGNORECASE | re.MULTILINE)
+                        
+                        # Use whichever comes first
+                        candidates = []
+                        if exec_match:
+                            candidates.append(('EXEC', exec_match.start()))
                         if next_select_match:
-                            actual_end = into_end + next_select_match.start()
+                            candidates.append(('SELECT', next_select_match.start()))
+                        
+                        if candidates:
+                            # Pick the earliest one
+                            earliest_type, earliest_pos = min(candidates, key=lambda x: x[1])
+                            actual_end = into_end + earliest_pos
                         else:
                             # Look for control flow keywords (IF, BEGIN, etc.) on new line
                             control_flow_match = re.search(r'\n\s*(IF|BEGIN|END|ELSE|WHILE|FOR)\s*\(', after_text, re.IGNORECASE | re.MULTILINE)
@@ -984,9 +1087,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     if next_keyword:
                                         actual_end = into_end + clause_end + next_keyword.start()
                                     else:
-                                        actual_end = min(len(preprocessed_body), into_end + 500)
+                                        actual_end = min(len(preprocessed_body), into_end + 8000)
                                 else:
-                                    actual_end = min(len(preprocessed_body), into_end + 500)
+                                    actual_end = min(len(preprocessed_body), into_end + 8000)
                     
                     # Extract the full statement
                     full_stmt = preprocessed_body[actual_select_start:actual_end].strip()
@@ -1015,7 +1118,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 # Position in before_text
                 with_pos_in_before = with_start_match.start()
                 # Actual position in preprocessed_body
-                actual_with_start = search_start + with_pos_in_before
+                actual_with_start = local_search_start + with_pos_in_before
                 # Adjust if it starts with semicolon or newline
                 while actual_with_start < len(preprocessed_body) and preprocessed_body[actual_with_start] in (';', '\n', '\r', ' '):
                     actual_with_start += 1
@@ -1048,25 +1151,31 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 # For #asefl_temp, the statement ends after the FROM clause (no semicolon, next statement is SELECT)
                 # Strategy: Find the end of the FROM clause by looking for the next SELECT on a new line
                 # that appears after all JOINs are done
-                search_end_pos = min(len(preprocessed_body), into_end + 500)
+                search_end_pos = min(len(preprocessed_body), into_end + 20000)
                 after_text = preprocessed_body[into_end:search_end_pos]
                 
                 logger.debug(f"_parse_procedure_body_statements: Looking for end of statement for {temp_table}, after_text length={len(after_text)}")
                 logger.debug(f"_parse_procedure_body_statements: First 300 chars after INTO {temp_table}: {after_text[:300]}")
                 
                 # For #asefl_temp, the statement ends after the FROM clause (no semicolon, next statement is SELECT)
-                # Strategy: Always look for next SELECT on a new line first, as it's more reliable than semicolon
+                # Strategy: Always look for next SELECT or EXEC on a new line first, as it's more reliable than semicolon
                 # The semicolon might be inside the statement (e.g., after JOINs but before the actual end)
-                next_select_match = re.search(r'\n\s*SELECT\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                # Ignore SELECT @var assignments using negative lookahead
+                exec_match = re.search(r'\n\s*EXEC\s+', after_text, re.IGNORECASE | re.MULTILINE)
+                next_select_match = re.search(r'\n\s*SELECT\s+(?!@)', after_text, re.IGNORECASE | re.MULTILINE)
+                
+                # Use whichever comes first (EXEC or SELECT)
+                candidates = []
+                if exec_match:
+                    candidates.append(('EXEC', exec_match.start()))
                 if next_select_match:
-                    select_pos = next_select_match.start()
-                    logger.debug(f"_parse_procedure_body_statements: Found SELECT at position {select_pos} after INTO {temp_table}")
-                    # Check what comes after this SELECT to see if it's part of the current statement
-                    select_context = after_text[select_pos:select_pos+100]
-                    logger.debug(f"_parse_procedure_body_statements: Context around SELECT: {select_context}")
-                    # For #asefl_temp, the next SELECT is the next statement, so end before it
-                    actual_end = into_end + select_pos
-                    logger.debug(f"_parse_procedure_body_statements: Ending statement at position {actual_end} (before SELECT)")
+                    candidates.append(('SELECT', next_select_match.start()))
+                
+                if candidates:
+                    earliest_type, earliest_pos = min(candidates, key=lambda x: x[1])
+                    logger.debug(f"_parse_procedure_body_statements: Found {earliest_type} at position {earliest_pos} after INTO {temp_table}")
+                    actual_end = into_end + earliest_pos
+                    logger.debug(f"_parse_procedure_body_statements: Ending statement at position {actual_end} (before {earliest_type})")
                 else:
                     # No SELECT found, try to find a semicolon
                     semicolon_pos = after_text.find(';')
@@ -1083,11 +1192,11 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                         else:
                             # The semicolon might be inside the statement, use limit
                             logger.debug(f"_parse_procedure_body_statements: Semicolon is not followed by SELECT, might be inside statement, using limit")
-                            actual_end = min(len(preprocessed_body), into_end + 500)
+                            actual_end = min(len(preprocessed_body), into_end + 8000)
                     else:
                         # No SELECT and no semicolon found, use limit
                         logger.debug(f"_parse_procedure_body_statements: No SELECT and no semicolon found after INTO {temp_table}, using limit")
-                        actual_end = min(len(preprocessed_body), into_end + 500)
+                        actual_end = min(len(preprocessed_body), into_end + 8000)
                 
                 # Extract the full statement
                 full_stmt = preprocessed_body[actual_with_start:actual_end].strip()
@@ -1237,6 +1346,66 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                 if col_names:
                                     self.temp_registry[temp_name] = col_names
                                     logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from WITH ... SELECT ... INTO fallback: {col_names[:5]}")
+                                
+                                # Extract dependencies from FROM and JOIN clauses (regex-based fallback)
+                                deps_from_sql: Set[str] = set()
+                                try:
+                                    sql_text = match.group(1)
+                                    logger.debug(f"_parse_procedure_body_statements: Extracting dependencies for {temp_name}, sql_text length={len(sql_text)}, first 200 chars: {sql_text[:200][:200]}")
+
+                                    def _clean_dep(dep: str) -> str:
+                                        dep = dep.strip().rstrip(';,')
+                                        dep = dep.replace('[', '').replace(']', '')
+                                        return dep
+                                    
+                                    # Extract FROM clause table
+                                    from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', sql_text, re.IGNORECASE)
+                                    if from_match:
+                                        from_table = _clean_dep(from_match.group(1))
+                                        # Simple table name extraction (will be qualified by _get_table_name during OpenLineage generation)
+                                        if from_table and not from_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
+                                            deps_from_sql.add(from_table)
+                                            logger.debug(f"_parse_procedure_body_statements: Found FROM table: {from_table} for {temp_name}")
+                                    
+                                    # Extract all JOIN clause tables (LEFT JOIN, RIGHT JOIN, INNER JOIN, etc.)
+                                    # Pattern: optional JOIN type + JOIN + table name
+                                    for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|\s*$)', sql_text, re.IGNORECASE):
+                                        join_table = _clean_dep(join_match.group(1))
+                                        if join_table and not join_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
+                                            deps_from_sql.add(join_table)
+                                            logger.debug(f"_parse_procedure_body_statements: Found JOIN table: {join_table} for {temp_name}")
+
+                                    # Broaden with basic dependency finder to catch bracketed identifiers and aliases
+                                    deps_from_sql.update({
+                                        _clean_dep(dep) for dep in self._extract_basic_dependencies(sql_text)
+                                    })
+                                    
+                                    # Store dependencies in temp_sources
+                                    if not deps_from_sql:
+                                        # Secondary scan around INTO in the full body to avoid truncated matches
+                                        into_marker = f"INTO {temp_name}"
+                                        pos = preprocessed_body.upper().find(into_marker.upper())
+                                        if pos != -1:
+                                            window = preprocessed_body[max(0, pos - 8000):pos + 8000]
+                                            from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', window, re.IGNORECASE)
+                                            if from_match:
+                                                deps_from_sql.add(_clean_dep(from_match.group(1)))
+                                            for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|$)', window, re.IGNORECASE):
+                                                jtbl = _clean_dep(join_match.group(1))
+                                                if jtbl:
+                                                    deps_from_sql.add(jtbl)
+                                            deps_from_sql.update({
+                                                _clean_dep(dep) for dep in self._extract_basic_dependencies(window)
+                                            })
+                                    if deps_from_sql:
+                                        existing = set(self.temp_sources.get(temp_name, set()))
+                                        existing.update(d for d in deps_from_sql if d)
+                                        self.temp_sources[temp_name] = existing
+                                        logger.debug(f"_parse_procedure_body_statements: Stored {len(deps_from_sql)} dependencies for {temp_name} in temp_sources")
+                                except Exception as deps_error:
+                                    logger.debug(f"_parse_procedure_body_statements: Failed to extract dependencies for {temp_name}: {deps_error}")
+
+
                     except Exception as fallback_error:
                         logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from WITH ... SELECT ... INTO fallback: {fallback_error}")
         
@@ -1342,6 +1511,63 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                 if col_names:
                                     self.temp_registry[temp_name] = col_names
                                     logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SQL fallback: {col_names[:5]}")
+                                
+                                # IMPORTANT: Extract dependencies REGARDLESS of whether col_names were found
+                                # Dependencies are needed even if column extraction failed
+                                # Extract dependencies from FROM and JOIN clauses (regex-based fallback for SELECT...INTO)
+                                deps_from_sql: Set[str] = set()
+                                try:
+                                    sql_text = match.group(1)
+
+                                    def _clean_dep(dep: str) -> str:
+                                        dep = dep.strip().rstrip(';,')
+                                        dep = dep.replace('[', '').replace(']', '')
+                                        return dep
+                                
+                                    # Extract FROM clause table
+                                    from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', sql_text, re.IGNORECASE)
+                                    if from_match:
+                                        from_table = _clean_dep(from_match.group(1))
+                                        if from_table and not from_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
+                                            deps_from_sql.add(from_table)
+                                            logger.debug(f"_parse_procedure_body_statements: Found FROM table: {from_table} for {temp_name}")
+                                
+                                    # Extract all JOIN clause tables
+                                    for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|\s*$)', sql_text, re.IGNORECASE):
+                                        join_table = _clean_dep(join_match.group(1))
+                                        if join_table and not join_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
+                                            deps_from_sql.add(join_table)
+                                            logger.debug(f"_parse_procedure_body_statements: Found JOIN table: {join_table} for {temp_name}")
+
+                                    # Broaden with basic dependency finder to catch bracketed identifiers and aliases
+                                    deps_from_sql.update({
+                                        _clean_dep(dep) for dep in self._extract_basic_dependencies(sql_text)
+                                    })
+                                
+                                    # Store dependencies
+                                    if not deps_from_sql:
+                                        into_marker = f"INTO {temp_name}"
+                                        pos = preprocessed_body.upper().find(into_marker.upper())
+                                        if pos != -1:
+                                            window = preprocessed_body[max(0, pos - 8000):pos + 8000]
+                                            from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', window, re.IGNORECASE)
+                                            if from_match:
+                                                deps_from_sql.add(_clean_dep(from_match.group(1)))
+                                            for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|$)', window, re.IGNORECASE):
+                                                jtbl = _clean_dep(join_match.group(1))
+                                                if jtbl:
+                                                    deps_from_sql.add(jtbl)
+                                            deps_from_sql.update({
+                                                _clean_dep(dep) for dep in self._extract_basic_dependencies(window)
+                                            })
+                                    if deps_from_sql:
+                                        existing = set(self.temp_sources.get(temp_name, set()))
+                                        existing.update(d for d in deps_from_sql if d)
+                                        self.temp_sources[temp_name] = existing
+                                        logger.debug(f"_parse_procedure_body_statements: Stored {len(deps_from_sql)} dependencies for {temp_name}")
+                                except Exception as deps_error:
+                                    logger.debug(f"_parse_procedure_body_statements: Failed to extract dependencies for {temp_name}: {deps_error}")
+
                     except Exception as fallback_error:
                         logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from SQL fallback: {fallback_error}")
         
@@ -1636,6 +1862,35 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                 if col_names:
                                     self.temp_registry[temp_name] = col_names
                                     logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SELECT ... INTO fallback (chunk exception): {col_names[:5]}")
+                                    
+                                    # Extract dependencies from FROM and JOIN clauses (chunk exception fallback)
+                                    deps_from_sql: Set[str] = set()
+                                    try:
+                                        def _clean_dep(dep: str) -> str:
+                                            return dep.strip().rstrip(';,').replace('[', '').replace(']', '')
+                                        
+                                        # Extract FROM clause table
+                                        from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', stmt_sql, re.IGNORECASE)
+                                        if from_match:
+                                            from_table = _clean_dep(from_match.group(1))
+                                            if from_table and not from_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
+                                                deps_from_sql.add(from_table)
+                                                logger.debug(f"_parse_procedure_body_statements: Found FROM table: {from_table} for {temp_name} (chunk exception fallback)")
+                                        
+                                        # Extract all JOIN clause tables
+                                        for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|\s*$)', stmt_sql, re.IGNORECASE):
+                                            join_table = _clean_dep(join_match.group(1))
+                                            if join_table and not join_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
+                                                deps_from_sql.add(join_table)
+                                                logger.debug(f"_parse_procedure_body_statements: Found JOIN table: {join_table} for {temp_name} (chunk exception fallback)")
+                                        
+                                        if deps_from_sql:
+                                            existing = set(self.temp_sources.get(temp_name, set()))
+                                            existing.update(d for d in deps_from_sql if d)
+                                            self.temp_sources[temp_name] = existing
+                                            logger.debug(f"_parse_procedure_body_statements: Stored {len(deps_from_sql)} dependencies for {temp_name} from chunk exception fallback")
+                                    except Exception as deps_error:
+                                        logger.debug(f"_parse_procedure_body_statements: Failed to extract dependencies from chunk exception: {deps_error}")
                     except Exception as fallback_error:
                         logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from chunk exception fallback: {fallback_error}")
                 continue
@@ -2043,9 +2298,35 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                         lineage=[],  # No lineage for temp tables from temp_registry
                         dependencies=set()  # Will be populated from temp_sources if available
                     )
-                    # Try to get dependencies from temp_sources
+                    # Try to get dependencies from temp_sources, otherwise derive from the nearest SELECT/INSERT segment
+                    deps_for_temp: Set[str] = set()
                     if tkey in self.temp_sources:
-                        out_obj.dependencies = self.temp_sources[tkey]
+                        deps_for_temp = set(self.temp_sources[tkey])
+                    else:
+                        try:
+                            import re as _re
+                            search_text = full_sql or body_sql
+                            if search_text:
+                                pattern_sel = rf"(?is)\\bSELECT\\s+.*?\\bINTO\\s+#{_re.escape(tkey.lstrip('#'))}\\b.*?(?=;|\\b(?:INSERT|CREATE|ALTER|UPDATE|DELETE|DROP|TRUNCATE|BEGIN|END|GO|COMMIT|ROLLBACK)\\b|$)"
+                                for m_tmp in _re.finditer(pattern_sel, search_text):
+                                    seg_sql = m_tmp.group(0)
+                                    deps_for_temp.update(self._extract_basic_dependencies(seg_sql))
+                                    if deps_for_temp:
+                                        break
+                                if not deps_for_temp:
+                                    pattern_ins = rf"(?is)\\bINSERT\\s+INTO\\s+#{_re.escape(tkey.lstrip('#'))}\\b.*?(?=;|\\bINSERT\\b|\\bCREATE\\b|\\bALTER\\b|\\bUPDATE\\b|\\bDELETE\\b|\\bEND\\b|\\bGO\\b|$)"
+                                    for m_tmp in _re.finditer(pattern_ins, search_text):
+                                        seg_sql = m_tmp.group(0)
+                                        deps_for_temp.update(self._extract_basic_dependencies(seg_sql))
+                                        if deps_for_temp:
+                                            break
+                        except Exception:
+                            pass
+                        if deps_for_temp:
+                            deps_for_temp = {d for d in deps_for_temp if '#' not in d and 'tempdb' not in str(d).lower()}
+                            self.temp_sources[tkey] = deps_for_temp
+                    if deps_for_temp:
+                        out_obj.dependencies = deps_for_temp
                     all_outputs.append(out_obj)
                     logger.debug(f"_parse_procedure_body_statements: Created ObjectInfo for {tkey} from temp_registry: {out_obj.name}, columns={len(out_cols)}, dependencies={len(out_obj.dependencies)}")
                 except Exception as obj_error:
@@ -2178,6 +2459,20 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     else:
                         deps_expanded.add(tkey)
             result_output.dependencies = deps_expanded
+        except Exception:
+            pass
+
+        # Last-resort: if deps still show only temp table(s), broaden using basic scan
+        try:
+            deps_now = set(result_output.dependencies or [])
+            looks_like_only_temp = False
+            if deps_now and all(('#' in d) or ('tempdb' in str(d).lower()) or (not d) for d in deps_now):
+                looks_like_only_temp = True
+            if not deps_now or looks_like_only_temp:
+                broad = self._extract_basic_dependencies(sql_content) or set()
+                if broad:
+                    filt = {b for b in broad if re.match(r'^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$', str(b))}
+                    result_output.dependencies = filt or broad
         except Exception:
             pass
         

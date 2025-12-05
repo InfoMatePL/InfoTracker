@@ -114,7 +114,17 @@ def _expand_dependency_to_base_tables(self, dep_name: str, context_stmt: exp.Exp
         return expanded
 
     if simple_name in self.temp_registry:
-        expanded.add(dep_name)
+        # For temp tables, also expand their direct dependencies
+        # Note: simple_name might already have # prefix, so normalize it
+        tkey = simple_name if simple_name.startswith('#') else f"#{simple_name}"
+        temp_deps = self.temp_sources.get(tkey, set())
+        if temp_deps:
+            # Recursively expand each dependency of this temp table
+            for temp_dep in temp_deps:
+                expanded.update(_expand_dependency_to_base_tables(self, temp_dep, context_stmt))
+        else:
+            # If no dependencies recorded, just return the temp table itself
+            expanded.add(dep_name)
         return expanded
 
     expanded.add(dep_name)

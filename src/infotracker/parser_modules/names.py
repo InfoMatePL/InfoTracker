@@ -146,6 +146,17 @@ def _qualify_table(self, tbl: exp.Table) -> str:
     name = tbl.name
     sch = getattr(tbl, "db", None) or "dbo"
     db = getattr(tbl, "catalog", None) or self.current_database or self.default_database
+    
+    # For temp tables, use canonical name instead of tempdb
+    # sqlglot parses #temp as catalog=tempdb, but we want EDW_CORE.dbo.procedure.#temp
+    if name and name.startswith('#'):
+        try:
+            canonical = self._canonical_temp_name(name)
+            # canonical is already fully qualified: DB.schema.object.#temp
+            return canonical
+        except Exception:
+            pass  # fallback to tempdb if canonical name fails
+    
     return ".".join([p for p in [db, sch, name] if p])
 
 
@@ -173,10 +184,11 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
             if getattr(table_expr, 'catalog', None):
                 cat = str(table_expr.catalog)
                 if cat and cat.lower() == 'tempdb':
-                    return f"tempdb..#{simple}"
-            # If we have materialized this temp earlier in the procedure, map it to tempdb canonical form
+                    # Use canonical temp name instead of tempdb..#
+                    return self._canonical_temp_name(f"#{simple}")
+            # If we have materialized this temp earlier in the procedure, map it to canonical form
             if simple and (f"#{simple}" in self.temp_registry):
-                return f"tempdb..#{simple}"
+                return self._canonical_temp_name(f"#{simple}")
         except Exception:
             pass
         catalog = str(table_expr.catalog) if table_expr.catalog else None
@@ -193,11 +205,11 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
             table_name = str(table_expr.name)
             full_name = qualify_identifier(table_name, database_to_use)
     elif isinstance(table_expr, exp.Identifier):
-        # Identifiers may also point at temps without leading '#'. If present in temp_registry, restore it.
+        # Identifiers may also point at temps without leading '#'. If present in temp_registry, use canonical name.
         try:
             ident = str(table_expr.this)
             if ident and (f"#{ident}" in self.temp_registry):
-                return f"tempdb..#{ident}"
+                return self._canonical_temp_name(f"#{ident}")
         except Exception:
             pass
         table_name = str(table_expr.this)
@@ -205,10 +217,10 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
     else:
         full_name = hint or "unknown"
 
-    # Temp tables: keep original canonicalization logic, skip registry-based DB resolution
+    # Temp tables: use canonical naming instead of tempdb..#
     if full_name and (full_name.startswith('#') or full_name.lower().startswith('tempdb..#')):
-        temp_name = full_name.lstrip('#')
-        return f"tempdb..#{temp_name}"
+        temp_name = full_name.lstrip('#') if full_name.startswith('#') else full_name.split('..#')[-1]
+        return self._canonical_temp_name(f"#{temp_name}")
 
     # Registry-aware DB resolution:
     # If the DB came from a weak default (InfoTrackerDW/InfoTrackerDB),
