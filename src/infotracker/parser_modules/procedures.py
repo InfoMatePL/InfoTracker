@@ -126,8 +126,45 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
         for idx, materialized_output in enumerate(materialized_outputs):
             logger.debug(f"  Output {idx+1}/{len(materialized_outputs)}: {materialized_output.name} ({materialized_output.object_type})")
         
-        # Use first output for processing (maintains backward compatibility)
-        materialized_output = materialized_outputs[0]
+        # Select the best output candidate
+        # 1. Prefer outputs with lineage
+        # 2. Prefer outputs that match the procedure name (heuristic)
+        # 3. Fallback to first output
+        
+        best_output = materialized_outputs[0]
+        
+        if len(materialized_outputs) > 1:
+            # Filter candidates with lineage
+            candidates_with_lineage = [o for o in materialized_outputs if o.lineage]
+            
+            if candidates_with_lineage:
+                # If we have candidates with lineage, pick the one that matches procedure name best
+                # or just the first one with lineage if no name match
+                best_output = candidates_with_lineage[0]
+                
+                # Try to match name
+                proc_simple = procedure_name.split('.')[-1].lower().strip('[]')
+                for cand in candidates_with_lineage:
+                    cand_simple = cand.name.split('.')[-1].lower().strip('[]')
+                    # Check if candidate name is contained in procedure name or vice versa
+                    # e.g. update_asefl_TrialBalance_BV vs TrialBalance_asefl_BV
+                    # Remove 'update_' prefix from proc name for better matching
+                    proc_core = proc_simple.replace('update_', '').replace('sp_', '')
+                    if cand_simple in proc_core or proc_core in cand_simple:
+                        best_output = cand
+                        break
+            else:
+                # No lineage, try to match name among all candidates
+                proc_simple = procedure_name.split('.')[-1].lower().strip('[]')
+                for cand in materialized_outputs:
+                    cand_simple = cand.name.split('.')[-1].lower().strip('[]')
+                    proc_core = proc_simple.replace('update_', '').replace('sp_', '')
+                    if cand_simple in proc_core or proc_core in cand_simple:
+                        best_output = cand
+                        break
+        
+        materialized_output = best_output
+        logger.debug(f"Selected primary output: {materialized_output.name} (lineage count: {len(materialized_output.lineage)})")
         # Ensure materialized output uses the correct database from USE statement
         if materialized_output.schema:
             # Update namespace to use current_database (from USE statement)
@@ -2523,7 +2560,51 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     logger.debug(f"_parse_procedure_body_statements: Failed to create ObjectInfo for {tkey} from temp_registry: {obj_error}")
     
     # Prefer best match (procedure name → table name), otherwise use last persistent
-    result_output = best_match_output or last_persistent_output
+    # HEURISTIC: If we have multiple persistent outputs, prioritize the one that:
+    # 1. Has lineage (columns extracted)
+    # 2. Matches the procedure name pattern
+    # 3. Is the first one found (often the main INSERT)
+    
+    # Filter for persistent tables
+    persistent_outputs = [o for o in all_outputs if o.object_type == "table"]
+    
+    # 1. Filter for outputs with lineage
+    outputs_with_lineage = [o for o in persistent_outputs if o.lineage and len(o.lineage) > 0]
+    
+    # 2. Filter for name match
+    proc_basename = object_hint.split('.')[-1].lower() if object_hint else ""
+    expected_table = proc_basename.replace('update_', '').replace('load_', '')
+    
+    matches_name = []
+    candidates = outputs_with_lineage if outputs_with_lineage else persistent_outputs
+    
+    for o in candidates:
+        table_basename = o.name.split('.')[-1].lower()
+        # Check if table name is contained in procedure name or vice versa (ignoring update/load prefix)
+        # Also check for fuzzy match (e.g. asefl_TrialBalance_BV vs TrialBalance_asefl_BV)
+        if (expected_table and (expected_table == table_basename or 
+            table_basename.endswith(expected_table) or 
+            expected_table in table_basename or
+            table_basename in expected_table)):
+            matches_name.append(o)
+            
+    # Selection logic:
+    if matches_name:
+        # If we have name matches with lineage (or without if none have lineage), pick the first one
+        # But prefer the one that is NOT _ins_upd_results if possible, unless it's the only one
+        non_aux_matches = [o for o in matches_name if "_ins_upd_results" not in o.name.lower()]
+        if non_aux_matches:
+            result_output = non_aux_matches[0]
+        else:
+            result_output = matches_name[0]
+    elif outputs_with_lineage:
+        # If no name match, but some have lineage, pick the first one with lineage
+        result_output = outputs_with_lineage[0]
+    else:
+        # Fallback to original logic
+        result_output = best_match_output or last_persistent_output
+        
+    logger.debug(f"Selected primary output: {result_output.name if result_output else 'None'} (lineage count: {len(result_output.lineage) if result_output else 0})")
     
     # If we found persistent outputs, merge lineage from UPDATE if it targets the same table
     if result_output:
@@ -2666,37 +2747,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         except Exception:
             pass
         
-        # Register auxiliary outputs (non-best-match persistent tables) as fake temp tables
-        # so engine.py will emit separate JSON artifacts for them
-        # This allows multiple materialized outputs to be visible in lineage
-        try:
-            logger.debug(f"_parse_procedure_body_statements: Checking all_outputs for auxiliary tables: {len(all_outputs)} outputs, result_output={result_output.name if result_output else None}")
-            for obj in all_outputs:
-                logger.debug(f"  - all_outputs entry: name={obj.name if obj else 'None'}, type={obj.object_type if obj else 'None'}, is_result={obj == result_output}, lineage={len(obj.lineage) if obj and obj.lineage else 0}")
-                # Skip temp tables and table variables (already handled), skip result_output (main output)
-                if (obj and obj.object_type == "table" and obj != result_output and 
-                    not obj.name.startswith("#") and not obj.name.startswith("@") and "tempdb" not in obj.name.lower()):
-                    # This is an auxiliary persistent table (e.g., _ins_upd_results)
-                    # Register it as a fake temp table so engine.py emits JSON for it
-                    fake_temp_key = f"#{obj.name.split('.')[-1]}"  # e.g., #TrialBalance_tetafk_BV_ins_upd_results
-                    logger.debug(f"_parse_procedure_body_statements: Processing auxiliary output {obj.name}, fake_temp_key={fake_temp_key}, has_schema={bool(obj.schema)}, has_lineage={bool(obj.lineage)}, lineage_count={len(obj.lineage) if obj.lineage else 0}")
-                    if obj.schema and obj.schema.columns:
-                        self.temp_registry[fake_temp_key] = [col.name for col in obj.schema.columns]
-                        logger.debug(f"    - Registered {len(obj.schema.columns)} columns in temp_registry")
-                    if obj.lineage:
-                        self.temp_lineage[fake_temp_key] = {}
-                        for lin in obj.lineage:
-                            if lin.output_column and lin.input_fields:
-                                self.temp_lineage[fake_temp_key][lin.output_column.lower()] = list(lin.input_fields)
-                        logger.debug(f"    - Registered {len(self.temp_lineage[fake_temp_key])} columns in temp_lineage")
-                    else:
-                        logger.debug(f"    - NO LINEAGE for {obj.name} - will have empty inputFields!")
-                    if obj.dependencies:
-                        self.temp_sources[fake_temp_key] = set(obj.dependencies)
-                        logger.debug(f"    - Registered {len(obj.dependencies)} dependencies in temp_sources")
-                    logger.debug(f"_parse_procedure_body_statements: ✅ Registered auxiliary output {obj.name} as fake temp {fake_temp_key}")
-        except Exception as e:
-            logger.debug(f"_parse_procedure_body_statements: Failed to register auxiliary outputs: {e}", exc_info=True)
+
         
         # DON'T restore context - it's needed for temp table canonical naming in engine.py Phase 3
         # The context will be restored when the next file is parsed (in parse_sql_file)
