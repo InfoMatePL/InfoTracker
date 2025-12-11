@@ -2756,9 +2756,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         return result_output
     
     # Filter out known garbage dependencies that might have leaked from comments or partial parsing
-    garbage_tokens = {'previous', 'end', 'desc', 'asc', 'case', 'when', 'then', 'else', 'select', 'from', 'where', 'group', 'by', 'order', 'having'}
+    garbage_tokens = {'previous', 'end', 'desc', 'asc', 'case', 'when', 'then', 'else', 'select', 'from', 'where', 'group', 'by', 'order', 'having', 'ca', '=', 'int', 'date', 'bit', 'datetime', 'datetime2'}
     if all_inputs:
-        all_inputs = {d for d in all_inputs if d.lower() not in garbage_tokens and not d.lower().endswith('.end') and not d.lower().endswith('.previous')}
+        all_inputs = {d for d in all_inputs if d.split('.')[-1].lower() not in garbage_tokens and not d.lower().endswith('.end') and not d.lower().endswith('.previous') and '=' not in d}
 
     # Fallback: return basic procedure info with dependencies from all statements
     dependencies = all_inputs
