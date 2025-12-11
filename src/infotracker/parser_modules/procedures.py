@@ -1565,6 +1565,93 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                         existing.update(d for d in deps_from_sql if d)
                                         self.temp_sources[temp_name] = existing
                                         logger.debug(f"_parse_procedure_body_statements: Stored {len(deps_from_sql)} dependencies for {temp_name}")
+                                    
+                                    # CRITICAL: Generate ObjectInfo with facets for fallback path
+                                    # Without this, temp tables won't appear in column graph
+                                    # Check if we have columns OR dependencies (from temp_sources)
+                                    has_deps = bool(self.temp_sources.get(temp_name))
+                                    if col_names or has_deps:
+                                        try:
+                                            # Create schema facet
+                                            schema_fields = []
+                                            for col in col_names:
+                                                schema_fields.append({
+                                                    "name": col,
+                                                    "type": "UNKNOWN",  # Type inference not available in fallback
+                                                    "description": None
+                                                })
+                                            
+                                            # Get qualified dependencies from temp_sources (includes all extracted deps)
+                                            qualified_deps = set()
+                                            all_deps = self.temp_sources.get(temp_name, set())
+                                            for dep in all_deps:
+                                                try:
+                                                    qualified = self._get_table_name(dep)
+                                                    # Use qualified name if available and not "unknown", otherwise use original dep
+                                                    if qualified and qualified != "unknown":
+                                                        qualified_deps.add(qualified)
+                                                    else:
+                                                        qualified_deps.add(dep)
+                                                except Exception:
+                                                    qualified_deps.add(dep)
+                                            
+                                            # Create canonical temp table name
+                                            canonical_temp_name = self._canonical_temp_name(temp_name)
+                                            ns_temp, name_temp = self._ns_and_name(canonical_temp_name, obj_type_hint="table")
+                                            
+                                            # Use dummy column if no columns extracted but we have dependencies
+                                            if not col_names and qualified_deps:
+                                                col_names = ["*"]
+                                            
+                                            # Create TableSchema
+                                            columns_list = [ColumnSchema(name=col, data_type="UNKNOWN") for col in col_names]
+                                            schema = TableSchema(
+                                                namespace=ns_temp,
+                                                name=name_temp,
+                                                columns=columns_list
+                                            )
+                                            
+                                            # Generate lineage for graph visualization
+                                            lineage = []
+                                            if qualified_deps and col_names:
+                                                from infotracker.models import ColumnLineage, ColumnReference, TransformationType
+                                                for col in col_names:
+                                                    input_refs = []
+                                                    for dep in qualified_deps:
+                                                        try:
+                                                            dep_ns, dep_name = self._ns_and_name(dep)
+                                                            input_refs.append(ColumnReference(
+                                                                namespace=dep_ns,
+                                                                table_name=dep_name,
+                                                                column_name="*"
+                                                            ))
+                                                        except Exception:
+                                                            pass
+                                                    if input_refs:
+                                                        lineage.append(ColumnLineage(
+                                                            output_column=col,
+                                                            input_fields=input_refs,
+                                                            transformation_type=TransformationType.UNKNOWN,
+                                                            transformation_description="from temp source (fallback)"
+                                                        ))
+                                            
+                                            # Create ObjectInfo with facets
+                                            out_obj = ObjectInfo(
+                                                name=name_temp,
+                                                object_type="temp_table",
+                                                schema=schema,
+                                                lineage=lineage,
+                                                dependencies=qualified_deps,
+                                            )
+                                            
+                                            all_outputs.append(out_obj)
+                                            all_inputs.update(qualified_deps)
+                                            logger.debug(f"_parse_procedure_body_statements: Created ObjectInfo for {temp_name} from fallback with {len(col_names)} columns, {len(qualified_deps)} dependencies")
+                                        except Exception as obj_error:
+                                            logger.debug(f"_parse_procedure_body_statements: Failed to create ObjectInfo for {temp_name}: {obj_error}")
+                                            import traceback
+                                            logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
+                                    
                                 except Exception as deps_error:
                                     logger.debug(f"_parse_procedure_body_statements: Failed to extract dependencies for {temp_name}: {deps_error}")
 
@@ -2278,18 +2365,62 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         if tkey.startswith('#') and not tkey.startswith('@'):
             # Check if this temp table is already in all_outputs
             temp_already_in_outputs = False
+            if tkey == "#offer":  # Debug #offer specifically
+                logger.debug(f"_parse_procedure_body_statements: Checking {tkey}, all_outputs count={len(all_outputs)}")
+                # Log first 3 temp_table objects to understand structure
+                temp_count = 0
+                for obj in all_outputs:
+                    if obj and obj.object_type == "temp_table":
+                        temp_count += 1
+                        if temp_count <= 3:
+                            has_schema = obj.schema is not None
+                            has_schema_name = (obj.schema.name if has_schema else None)
+                            logger.debug(f"  Temp #{temp_count}: name={obj.name}, has_schema={has_schema}, schema.name={has_schema_name}")
             for obj in all_outputs:
-                if (obj and obj.object_type == "temp_table" and obj.schema and obj.schema.name):
-                    # Check if schema.name ends with tkey (e.g., "dbo.PROC#insert_update_temp_asefl" ends with "#insert_update_temp_asefl")
-                    if obj.schema.name.endswith(tkey) or obj.schema.name.endswith(tkey.lstrip('#')):
-                        temp_already_in_outputs = True
-                        logger.debug(f"_parse_procedure_body_statements: Temp table {tkey} already in all_outputs as {obj.schema.name}")
-                        break
+                # Ensure we have a valid object and schema
+                if not (obj and obj.object_type == "temp_table"):
+                    continue
+                
+                # Get schema name safely
+                schema_name = obj.schema.name if (obj.schema and obj.schema.name) else obj.name
+                if not schema_name:
+                    continue
+                    
+                if tkey == "#offer":  # Debug only for #offer
+                    logger.debug(f"_parse_procedure_body_statements: Checking {tkey} against schema_name={schema_name}, obj.name={obj.name}")
+                    logger.debug(f"  Comparison: schema_lower={schema_name_lower}, tkey_lower={tkey_lower}")
+                    logger.debug(f"  endswith(tkey_lower)={schema_name_lower.endswith(tkey_lower)}")
+                    logger.debug(f"  endswith(.tkey_no_hash)={schema_name_lower.endswith(f'.{tkey_no_hash_lower}')}")
+
+                # Case-insensitive comparison
+                schema_name_lower = schema_name.lower()
+                tkey_lower = tkey.lower()
+                tkey_no_hash_lower = tkey.lstrip('#').lower()
+                
+                # Check for exact match or suffix match
+                # e.g. "dbo.proc#offer" ends with "#offer"
+                if (schema_name_lower == tkey_lower or
+                    schema_name_lower.endswith(tkey_lower) or 
+                    schema_name_lower.endswith(f".{tkey_no_hash_lower}") or
+                    schema_name_lower == tkey_no_hash_lower or
+                    obj.name.lower() == tkey_lower):
+                    
+                    temp_already_in_outputs = True
+                    logger.debug(f"_parse_procedure_body_statements: Temp table {tkey} already in all_outputs as {schema_name}")
+                    break
             if not temp_already_in_outputs:
                 try:
                     ns_out, nm_out = self._ns_and_name(tkey, obj_type_hint="temp_table")
                     col_names = self.temp_registry[tkey]
+                    
+                    # Use dummy column if no columns extracted
+                    if not col_names:
+                        col_names = ["*"]
+                        # Update registry so engine.py sees it too
+                        self.temp_registry[tkey] = col_names
+                        
                     out_cols = [ColumnSchema(name=col, data_type=None, nullable=True, ordinal=i) for i, col in enumerate(col_names)]
+
                     out_schema = TableSchema(namespace=ns_out, name=nm_out, columns=out_cols)
                     out_obj = ObjectInfo(
                         name=nm_out,
@@ -2327,6 +2458,45 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             self.temp_sources[tkey] = deps_for_temp
                     if deps_for_temp:
                         out_obj.dependencies = deps_for_temp
+                        
+                        # Generate lineage for graph visualization
+                        if out_cols:
+                            from infotracker.models import ColumnLineage, ColumnReference, TransformationType
+                            lineage = []
+                            for col in out_cols:
+                                input_refs = []
+                                for dep in deps_for_temp:
+                                    try:
+                                        dep_ns, dep_name = self._ns_and_name(dep)
+                                        input_refs.append(ColumnReference(
+                                            namespace=dep_ns,
+                                            table_name=dep_name,
+                                            column_name="*"
+                                        ))
+                                    except Exception:
+                                        pass
+                                if input_refs:
+                                    lineage.append(ColumnLineage(
+                                        output_column=col.name,
+                                        input_fields=input_refs,
+                                        transformation_type=TransformationType.UNKNOWN,
+                                        transformation_description="from temp source"
+                                    ))
+                            out_obj.lineage = lineage
+                            
+                            # Register in temp_lineage so downstream usage can resolve it
+                            # This is crucial for graph connectivity when this temp table is used as a source
+                            col_map = {}
+                            for lin in lineage:
+                                col_map[lin.output_column] = lin.input_fields
+                            
+                            self.temp_lineage[tkey] = col_map
+                            # Also register canonical name
+                            try:
+                                canonical = self._canonical_temp_name(tkey)
+                                self.temp_lineage[canonical] = col_map
+                            except Exception:
+                                pass
                     all_outputs.append(out_obj)
                     logger.debug(f"_parse_procedure_body_statements: Created ObjectInfo for {tkey} from temp_registry: {out_obj.name}, columns={len(out_cols)}, dependencies={len(out_obj.dependencies)}")
                 except Exception as obj_error:

@@ -171,10 +171,11 @@ class OpenLineageGenerator:
             "facets": {}
         }
         
-        # Add schema facet for tables and procedures with columns
+        # Add schema facet for tables and procedures (even if columns list is empty)
         # Views should only have columnLineage, not schema
-        if (obj_info.schema and obj_info.schema.columns and 
+        if (obj_info.schema and 
             obj_info.object_type in ['table', 'temp_table', 'procedure']):
+            print(f"DEBUG: Generating schema facet for {obj_info.name}, type={obj_info.object_type}, cols={len(obj_info.schema.columns) if obj_info.schema and obj_info.schema.columns else 0}")
             schema_facet = self._build_schema_facet(obj_info)
             if schema_facet:  # Only add if not None (fallback objects)
                 output["facets"]["schema"] = schema_facet
@@ -288,13 +289,20 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
     facets = {}
     
     # Add schema facet if we have columns and it's not a fallback object
-    if (obj.object_type in ('table', 'temp_table', 'procedure') 
-        and obj.schema and obj.schema.columns 
-        and not getattr(obj, 'is_fallback', False)):
+    # Relaxed condition: allow schema facet even if columns list is empty
+    should_add_schema = (obj.object_type in ('table', 'temp_table', 'procedure') 
+        and obj.schema 
+        and not getattr(obj, 'is_fallback', False))
+        
+    # DEBUG: Trace schema facet generation
+    if obj.object_type == 'temp_table':
+        print(f"DEBUG: emit_ol_from_object for {obj.name}: schema={bool(obj.schema)}, cols={len(obj.schema.columns) if obj.schema else 0}, is_fallback={getattr(obj, 'is_fallback', False)}, should_add={should_add_schema}")
+
+    if should_add_schema:
         facets["schema"] = {
             "_producer": "https://github.com/OpenLineage/OpenLineage",
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
-            "fields": [{"name": c.name, "type": c.data_type} for c in obj.schema.columns]
+            "fields": [{"name": c.name, "type": c.data_type} for c in (obj.schema.columns or [])]
         }
     
     # Add column lineage facet if we have lineage

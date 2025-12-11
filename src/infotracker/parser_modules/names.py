@@ -44,12 +44,17 @@ def _split_fqn(self, fqn: str) -> Tuple[Optional[str], Optional[str], Optional[s
 
 def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
     if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
-        # Use canonical temp name which includes procedure context when available
+        # If table_name is already canonical (contains '.#'), use it directly
+        # Otherwise, get canonical temp name which includes procedure context
         # Format: DB.schema.object.#temp[@v] or just #temp[@v] if no context
-        try:
-            canonical = self._canonical_temp_name(table_name)
-        except Exception:
+        if '.#' in table_name or 'dbo.update_' in table_name:
+            # Already canonical, don't call _canonical_temp_name again
             canonical = table_name
+        else:
+            try:
+                canonical = self._canonical_temp_name(table_name)
+            except Exception:
+                canonical = table_name
         
         # Parse canonical name to extract DB, schema, object, and temp name
         # Format: EDW_CORE.dbo.update_asefl_TrialBalance_BV.#asefl_temp

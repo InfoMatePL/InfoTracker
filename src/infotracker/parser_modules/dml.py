@@ -120,6 +120,12 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     
     logger.debug(f"_parse_select_into: About to extract column lineage for {table_name}, select_stmt type: {type(select_stmt).__name__}")
     lineage, output_columns = self._extract_column_lineage(select_stmt, table_name)
+    
+    # Fix for empty columns: if parser fails to extract columns (e.g. complex CTEs), default to *
+    if not output_columns:
+        logger.debug(f"_parse_select_into: No columns extracted for {table_name}, defaulting to '*'")
+        output_columns = [ColumnSchema(name="*", data_type="unknown", ordinal=0, nullable=True)]
+        
     logger.debug(f"_parse_select_into: lineage count={len(lineage or [])}, output_columns count={len(output_columns or [])}")
     if lineage:
         for lin in lineage[:3]:  # Show first 3 lineage items
