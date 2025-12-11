@@ -1681,6 +1681,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 expanded_chunks.append(chunk)
         
         # Now parse each chunk
+        seen_temp_tables_in_fallback = set()
         for chunk_idx, stmt_sql in enumerate(expanded_chunks):
             stmt_sql = stmt_sql.strip()
             if not stmt_sql or stmt_sql.upper() in ('GO', 'END'):
@@ -1851,6 +1852,10 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     except Exception as fallback_error:
                         logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from UPDATE ... OUTPUT ... INTO fallback: {fallback_error}")
             try:
+                # Force fallback for SELECT ... INTO to avoid sqlglot comment issues
+                if re.search(r'(?is)SELECT\s+.*?\s+INTO\s+#', stmt_sql):
+                    raise ValueError("Force fallback for SELECT INTO")
+
                 parsed = sqlglot.parse_one(stmt_sql, read=self.dialect)
                 if parsed:
                     statements.append(parsed)
@@ -1902,9 +1907,22 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             select_into_match = re.search(r'(?is)SELECT\s+(.*?)\s+INTO\s+(#\w+)', stmt_sql, re.IGNORECASE)
                             if select_into_match:
                                 temp_name = select_into_match.group(2)
+                                
+                                # If this is the first time we see this temp table in the fallback,
+                                # clear any existing entry (which might be from a failed sqlglot prescan)
+                                if temp_name not in seen_temp_tables_in_fallback:
+                                    if temp_name in self.temp_sources:
+                                        logger.debug(f"_parse_procedure_body_statements: Clearing potentially corrupted temp_sources for {temp_name} (fallback reset)")
+                                        del self.temp_sources[temp_name]
+                                    seen_temp_tables_in_fallback.add(temp_name)
+
                                 col_list_str = select_into_match.group(1)
                                 col_names = []
                                 for col_expr in re.split(r',\s*(?![^()]*\))', col_list_str):
+                                    # Remove SQL comments (-- and /* */) FIRST
+                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE)
+                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL)
+                                    
                                     col_expr = col_expr.strip()
                                     # Skip if empty or too short
                                     if not col_expr or len(col_expr) < 2:
@@ -1927,9 +1945,6 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                                 # Skip this column - it's too complex
                                                 continue
                                     col_expr = col_expr.strip('[]').strip()
-                                    # Remove SQL comments (-- and /* */)
-                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
-                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL).strip()
                                     # Remove leading/trailing invalid characters
                                     col_expr = col_expr.strip('[]').strip()
                                     # Remove patterns like "abl.[column" -> "column"
@@ -1946,6 +1961,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                        not col_expr.startswith('(') and not col_expr.endswith(')') and \
                                        not col_expr.endswith('--') and not col_expr.startswith('['):
                                         col_names.append(col_expr)
+                                
                                 if col_names:
                                     self.temp_registry[temp_name] = col_names
                                     logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SELECT ... INTO fallback (chunk exception): {col_names[:5]}")
@@ -1953,11 +1969,15 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     # Extract dependencies from FROM and JOIN clauses (chunk exception fallback)
                                     deps_from_sql: Set[str] = set()
                                     try:
+                                        # Strip comments from stmt_sql for dependency extraction to avoid false positives
+                                        clean_stmt_sql = re.sub(r'--.*$', '', stmt_sql, flags=re.MULTILINE)
+                                        clean_stmt_sql = re.sub(r'/\*.*?\*/', '', clean_stmt_sql, flags=re.DOTALL)
+                                        
                                         def _clean_dep(dep: str) -> str:
                                             return dep.strip().rstrip(';,').replace('[', '').replace(']', '')
                                         
                                         # Extract FROM clause table
-                                        from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', stmt_sql, re.IGNORECASE)
+                                        from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)', clean_stmt_sql, re.IGNORECASE)
                                         if from_match:
                                             from_table = _clean_dep(from_match.group(1))
                                             if from_table and not from_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
@@ -1965,7 +1985,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                                 logger.debug(f"_parse_procedure_body_statements: Found FROM table: {from_table} for {temp_name} (chunk exception fallback)")
                                         
                                         # Extract all JOIN clause tables
-                                        for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|\s*$)', stmt_sql, re.IGNORECASE):
+                                        for join_match in re.finditer(r'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|CROSS\s+|FULL\s+)?JOIN\s+([#\w.\[\]]+)(?:\s+(?:AS\s+)?[#\w.\[\]]+)?(?=\s+ON|\s+WHERE|\s+,|\s+JOIN|\s+;|\s*$)', clean_stmt_sql, re.IGNORECASE):
                                             join_table = _clean_dep(join_match.group(1))
                                             if join_table and not join_table.upper() in ['SELECT', 'WHERE', 'GROUP', 'ORDER']:
                                                 deps_from_sql.add(join_table)
@@ -2681,8 +2701,14 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         # DON'T restore context - it's needed for temp table canonical naming in engine.py Phase 3
         # The context will be restored when the next file is parsed (in parse_sql_file)
         # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
+        
         return result_output
     
+    # Filter out known garbage dependencies that might have leaked from comments or partial parsing
+    garbage_tokens = {'previous', 'end', 'desc', 'asc', 'case', 'when', 'then', 'else', 'select', 'from', 'where', 'group', 'by', 'order', 'having'}
+    if all_inputs:
+        all_inputs = {d for d in all_inputs if d.lower() not in garbage_tokens and not d.lower().endswith('.end') and not d.lower().endswith('.previous')}
+
     # Fallback: return basic procedure info with dependencies from all statements
     dependencies = all_inputs
     
@@ -2705,5 +2731,10 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     # DON'T restore context before returning - it's needed for temp table canonical naming in engine.py
     # The context will be restored when the next file is parsed (in parse_sql_file)
     logger.debug(f"_parse_procedure_body_statements: Before return, context: _ctx_db={getattr(self, '_ctx_db', None)}, _ctx_obj={getattr(self, '_ctx_obj', None)}")
+    
+    for k, v in self.temp_sources.items():
+        if "previous" in str(v):
+            print(f"DEBUG: temp_sources[{k}] HAS previous: {v}")
+
     # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
     return obj

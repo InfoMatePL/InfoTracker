@@ -143,6 +143,11 @@ def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
     cleaned_sql = re.sub(r'--.*?(?=\n|$)', '', sql_content, flags=re.MULTILINE)
     cleaned_sql = re.sub(r'/\*.*?\*/', '', cleaned_sql, flags=re.DOTALL)
 
+    # DEBUG: Check if comments are really removed
+    if "previous" in cleaned_sql and "from previous" in cleaned_sql.lower():
+        print(f"DEBUG: Comment NOT removed in _extract_basic_dependencies! Content snippet: {cleaned_sql[:200]}...")
+
+
     from_pattern = r'FROM\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
     join_pattern = r'JOIN\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
     update_pattern = r'UPDATE\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
