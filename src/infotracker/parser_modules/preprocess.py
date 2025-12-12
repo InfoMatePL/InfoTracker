@@ -72,6 +72,27 @@ def _remove_try_catch_blocks(sql: str) -> str:
     return sql
 
 
+def _remove_transaction_blocks(sql: str) -> str:
+    """Remove T-SQL transaction control statements.
+    
+    Sqlglot doesn't support T-SQL transaction syntax (BEGIN TRANSACTION, COMMIT, ROLLBACK),
+    so we strip these keywords while preserving the SQL statements inside.
+    """
+    if not sql:
+        return sql
+    
+    # Remove BEGIN TRANSACTION, BEGIN TRAN (keep content inside)
+    sql = re.sub(r'(?i)\bBEGIN\s+TRAN(?:SACTION)?\b', '', sql)
+    
+    # Remove COMMIT and COMMIT TRANSACTION
+    sql = re.sub(r'(?i)\bCOMMIT(?:\s+TRAN(?:SACTION)?)?\b', '', sql)
+    
+    # Remove ROLLBACK and ROLLBACK TRANSACTION
+    sql = re.sub(r'(?i)\bROLLBACK(?:\s+TRAN(?:SACTION)?)?\b', '', sql)
+    
+    return sql
+
+
 def _strip_udf_options_between_returns_and_as(sql: str) -> str:
     """Strip UDF options between RETURNS ... and AS.
 
@@ -220,6 +241,12 @@ def _preprocess_sql(self, sql: str) -> str:
     # Remove TRY/CATCH blocks BEFORE cutting to first statement
     try:
         processed_sql = _remove_try_catch_blocks(processed_sql)
+    except Exception:
+        pass
+    
+    # Remove transaction blocks (BEGIN TRANSACTION, COMMIT, ROLLBACK) BEFORE cutting to first statement
+    try:
+        processed_sql = _remove_transaction_blocks(processed_sql)
     except Exception:
         pass
     
