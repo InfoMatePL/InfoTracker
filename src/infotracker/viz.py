@@ -125,6 +125,9 @@ HTML_TMPL = """<!doctype html>
     --header:#7fbf5f; --header-text:#fff; --border:#b8c5a6; --text:#1f2d1f;
     --row:#edf7e9; --row-alt:#e6f4e2; --row-border:#cbe4c0;
     --wire:#97a58a; --wire-strong:#6a7a5b;
+    /* Temp tables (light blue theme) */
+    --temp-card:#dbeafe; --temp-card-target:#bfdbfe; --temp-header:#3b82f6; --temp-header-text:#fff;
+    --temp-border:#93c5fd; --temp-row:#eff6ff; --temp-row-alt:#dbeafe; --temp-row-border:#bfdbfe;
     /* Selection highlight (accessible in light theme) */
     --sel-bg:#fde68a; /* amber-300 */
     --sel-outline:#111827; /* slate-900 */
@@ -192,7 +195,7 @@ HTML_TMPL = """<!doctype html>
   
   /* Dark mode adjustments */
   @media (prefers-color-scheme: dark){
-    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; --sel-bg:#374151; /* slate-700 */ --sel-outline:#e5eef5; --sidebar-bg-start:rgba(11,16,32,0.70); --sidebar-bg-end:rgba(11,16,32,0.55); }
+    :root{ --bg:#0b1020; --card:#13202b; --card-target:#1a2936; --fx:#273043; --header:#2c7d4d; --header-text:#e8f2e8; --border:#203042; --text:#e5eef5; --row:#132a1f; --row-alt:#0f241b; --row-border:#1f3a2e; --wire:#8da891; --wire-strong:#a2c79f; --temp-card:#1e3a5f; --temp-card-target:#2a4a70; --temp-header:#2563eb; --temp-header-text:#e0f2fe; --temp-border:#1e40af; --temp-row:#1e293b; --temp-row-alt:#172033; --temp-row-border:#1e3a5f; --sel-bg:#374151; /* slate-700 */ --sel-outline:#e5eef5; --sidebar-bg-start:rgba(11,16,32,0.70); --sidebar-bg-end:rgba(11,16,32,0.55); }
     #toolbar{ background: linear-gradient(180deg, rgba(11,16,32,0.65), rgba(11,16,32,0.55)); border-bottom-color:#1e293b; box-shadow: 0 2px 10px rgba(0,0,0,0.35); }
     #toolbar button{ background: linear-gradient(180deg, #0f172a, #0b1220); border-color:#243044; color:#e5eef5; box-shadow: 0 1px 0 rgba(255,255,255,0.04) inset, 0 1px 2px rgba(0,0,0,0.3); }
     #toolbar button:hover{ background: linear-gradient(180deg, #121a30, #0e1527); }
@@ -276,7 +279,10 @@ HTML_TMPL = """<!doctype html>
   .table-node{position:absolute; width:240px; background:var(--card); border:1px solid var(--border); border-radius:10px; box-shadow:0 1px 2px rgba(0,0,0,.06)}
   .table-node{ cursor: grab; user-select: none; }
   .table-node.dragging{ box-shadow:0 6px 24px rgba(0,0,0,.18); cursor: grabbing; }
+  .table-node.temp-table{ background:var(--temp-card); border-color:var(--temp-border) }
+  .table-node.temp-table.target{ background:var(--temp-card-target) }
   .table-node header{position:relative; padding:8px 10px; font-weight:600; color:var(--header-text); background:var(--header); border-bottom:1px solid var(--border); border-radius:10px 10px 0 0; text-align:center}
+  .table-node.temp-table header{ background:var(--temp-header); color:var(--temp-header-text); border-bottom-color:var(--temp-border) }
   .table-node header .title{ display:inline-flex; flex-direction:column; align-items:center; line-height:1.2; pointer-events:none }
   .table-node header .title .title-ns{ font-size:12px; opacity:.95 }
   .table-node header .title .title-obj{ font-size:14px; font-weight:700 }
@@ -294,6 +300,8 @@ HTML_TMPL = """<!doctype html>
   .table-node.collapsed.expanded li{ display:flex }
   .table-node li{display:flex; align-items:center; justify-content:center; gap:8px; margin:4px 0; padding:6px 8px; background:var(--row); border:1px solid var(--row-border); border-radius:8px; white-space:nowrap; font-size:13px}
   .table-node li.alt{ background:var(--row-alt) }
+  .table-node.temp-table li{ background:var(--temp-row); border-color:var(--temp-row-border) }
+  .table-node.temp-table li.alt{ background:var(--temp-row-alt) }
   .table-node li.col-row{ cursor: pointer; }
   .table-node li.active{ outline:2px solid #6a7a5b }
   .table-node li.selected{ outline:2px solid var(--sel-outline); background: var(--sel-bg); color: var(--text) }
@@ -642,13 +650,16 @@ function layoutTables(){
   const cardById = new Map();
   tables.forEach(t=>{
     const art = document.createElement('article'); art.className='table-node'; art.id = `tbl-${t.id}`;
+    // Check if this is a temp table (contains #)
+    const isTemp = (t.label||'').includes('#') || (t.full||'').includes('#');
+    if (isTemp) art.classList.add('temp-table');
     if (NEIGHBOR_IDS && NEIGHBOR_IDS.has(t.id)) art.classList.add('neighbor');
     if (COLLAPSE){
       art.classList.add('collapsed');
       if (EXPANDED_IDS && EXPANDED_IDS.has && EXPANDED_IDS.has(t.id)) art.classList.add('expanded');
     }
     // Prepare a display-friendly full name without scheme (e.g., "EDW_CORE.dbo.table")
-    const fullClean = (t.full||'').replace(/^mssql:\/\/[^/]+\/?/, '');
+    const fullClean = (t.full||'').replace(/^mssql:\\/\\/[^/]+\\/?/, '');
     // Attach searchable metadata
     art.setAttribute('data-id', (t.id||'').toLowerCase());
     art.setAttribute('data-full', (fullClean||'').toLowerCase());
@@ -1103,7 +1114,7 @@ function buildSidebar(){
 
   // Helper to parse full name into db/schema/table
   function splitFull(full){
-    const clean = (full||'').replace(/^mssql:\/\/[^\/]+\/?/, '');
+    const clean = (full||'').replace(/^mssql:\\/\\/[^\\/]+\\/?/, '');
     const parts = clean.split('.');
     const db = parts[0] || '';
     const schema = parts[1] || '';
@@ -1445,9 +1456,9 @@ function findAndFocus(q){
   // Normalize query: trim, lower, strip quotes, plus, and URI prefix
   function cleanQuery(s){
     let x = (s||'').trim().toLowerCase();
-    x = x.replace(/^\+|\+$/g,''); // trim + on both ends
+    x = x.replace(/^\\+|\\+$/g,''); // trim + on both ends
     x = x.replace(/^"|"$/g,''); // strip surrounding quotes
-    x = x.replace(/^mssql:\/\/[^/]+\//,''); // drop scheme+host
+    x = x.replace(/^mssql:\\/\\/[^\/]+\//,''); // drop scheme+host
     return x;
   }
   const ql = cleanQuery(q);
@@ -2197,9 +2208,9 @@ function highlightSearch(q){
   // Normalize similarly to findAndFocus
   function cleanQuery(s){
     let x = (s||'').trim().toLowerCase();
-    x = x.replace(/^\+|\+$/g,'');
+    x = x.replace(/^\\+|\\+$/g,'');
     x = x.replace(/^"|"$/g,'');
-    x = x.replace(/^mssql:\/\/[^\/]+\//,'');
+    x = x.replace(/^mssql:\\/\\/[^\\/]+\//,'');
     return x;
   }
   const ql = cleanQuery(q);
