@@ -324,6 +324,11 @@ HTML_TMPL = """<!doctype html>
   /* Neighbor (ghost) tables rendered for context when selecting a table */
   .table-node.neighbor{ opacity:.75; border-style:dashed; border-color:#94a3b8; background:transparent }
   .table-node.neighbor header{ background:#9aa6b2; color:#0b1020 }
+  /* Temp table neighbors keep blue theme but reduced opacity for "unselected" feel */
+  .table-node.temp-table.neighbor{ opacity:.55; border-color:#93c5fd; background:rgba(219,234,254,0.3) }
+  .table-node.temp-table.neighbor header{ background:#60a5fa; color:#fff }
+  .theme-dark .table-node.temp-table.neighbor{ opacity:.55; border-color:#1e40af; background:rgba(30,58,95,0.3) }
+  .theme-dark .table-node.temp-table.neighbor header{ background:#3b82f6; color:#e0f2fe }
 </style>
 </head>
 <body>
@@ -1458,7 +1463,7 @@ function findAndFocus(q){
     let x = (s||'').trim().toLowerCase();
     x = x.replace(/^\\+|\\+$/g,''); // trim + on both ends
     x = x.replace(/^"|"$/g,''); // strip surrounding quotes
-    x = x.replace(/^mssql:\\/\\/[^\/]+\//,''); // drop scheme+host
+    x = x.replace(/^mssql:\\/\\/[^\\/]+\//,''); // drop scheme+host
     return x;
   }
   const ql = cleanQuery(q);
