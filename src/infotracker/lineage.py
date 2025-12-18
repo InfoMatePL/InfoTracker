@@ -294,10 +294,6 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
         and obj.schema 
         and not getattr(obj, 'is_fallback', False))
         
-    # DEBUG: Trace schema facet generation
-    if obj.object_type == 'temp_table':
-        print(f"DEBUG: emit_ol_from_object for {obj.name}: schema={bool(obj.schema)}, cols={len(obj.schema.columns) if obj.schema else 0}, is_fallback={getattr(obj, 'is_fallback', False)}, should_add={should_add_schema}")
-
     if should_add_schema:
         facets["schema"] = {
             "_producer": "https://github.com/OpenLineage/OpenLineage",

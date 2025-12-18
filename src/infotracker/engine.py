@@ -286,10 +286,13 @@ class Engine:
             # Parse every file that contributes to this object name first, then enrich
             group_infos: List[ObjectInfo] = []
             group_paths: List[Path] = []
+            # Track which temp tables (owner::tmp) have been emitted to avoid duplicates
+            emitted_temp_tables: Set[str] = set()
             # Store temp_lineage, temp_sources, and temp_registry from procedures before they get cleared (local for this obj_name)
             saved_temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}
             saved_temp_sources: Dict[str, Set[str]] = {}
             saved_temp_registry: Dict[str, List[str]] = {}
+            saved_temp_owner: Optional[str] = None  # Store owner (procedure name) for temp tables
             for sql_path in sql_file_map[obj_name]:
                 try:
                     # OPTIMIZATION: Use cached SQL text from Phase 1 instead of re-reading from disk
@@ -334,10 +337,20 @@ class Engine:
                         saved_temp_lineage.update(parser.temp_lineage)
                         saved_temp_sources.update(parser.temp_sources)
                         saved_temp_registry.update(parser.temp_registry)
+                        # Save owner (procedure name) for temp tables to use later when emitting OL events
+                        saved_temp_owner = parser._ctx_obj or obj_name or sql_path.stem
                         # Also save globally for source JSON creation (temp tables may be referenced from other obj_name)
-                        global_saved_temp_lineage.update(parser.temp_lineage)
-                        global_saved_temp_sources.update(parser.temp_sources)
-                        global_saved_temp_registry.update(parser.temp_registry)
+                        # PREFIX keys with owner procedure to avoid collision between procedures with same temp names
+                        owner_prefix = parser._ctx_obj or obj_name or sql_path.stem
+                        for key, value in parser.temp_lineage.items():
+                            prefixed_key = f"{owner_prefix}::{key}"
+                            global_saved_temp_lineage[prefixed_key] = value
+                        for key, value in parser.temp_sources.items():
+                            prefixed_key = f"{owner_prefix}::{key}"
+                            global_saved_temp_sources[prefixed_key] = value
+                        for key, value in parser.temp_registry.items():
+                            prefixed_key = f"{owner_prefix}::{key}"
+                            global_saved_temp_registry[prefixed_key] = value
                         # CTE registry already saved above (lines 326-332) immediately after parsing
                         logger.debug(f"Phase 3: Saved temp_lineage from {sql_path.stem}: {len(saved_temp_lineage)} temp tables, keys: {list(saved_temp_lineage.keys())[:5]}")
                     
@@ -437,70 +450,83 @@ class Engine:
                                 return k.split('@')[0]
                             return k
                         
-                        # Temp tables are LOCAL to the procedure where they were created
-                        # Only use saved_temp_* (local to this obj_name) and parser.temp_registry (from current file)
-                        # Do NOT use global_saved_temp_* for creating outputs - they are only for source JSON (dependencies)
-                        # First, try saved_temp_lineage (local to this obj_name) - these definitely belong
-                        for k in saved_temp_lineage.keys():
-                            if isinstance(k, str) and k.startswith('#'):
-                                base_name = get_base_temp_name(k)
-                                temp_keys_set.add(base_name)
-                        # Also check saved_temp_registry (for temp tables that may not have lineage, e.g., from UPDATE OUTPUT INTO)
-                        for k in saved_temp_registry.keys():
-                            if isinstance(k, str) and k.startswith('#'):
-                                base_name = get_base_temp_name(k)
-                                temp_keys_set.add(base_name)
-                        # Fallback to parser.temp_registry if available (for temp tables created in this file)
-                        for k in parser.temp_registry.keys():
-                            if isinstance(k, str) and k.startswith('#'):
-                                base_name = get_base_temp_name(k)
-                                temp_keys_set.add(base_name)
-                        temp_keys = sorted(list(temp_keys_set))
-                    except Exception:
-                        temp_keys = []
-                    for tmp in temp_keys:
+                        # BUILD temp_keys from global_saved_temp_* (with prefixed keys like "owner::#temp")
+                        # This ensures we get temp tables from ALL procedures in this batch, not just the last one
+                        # Previously we used saved_temp_* which was local and got overwritten - that was a bug
+                        temp_keys_with_owner = set()  # Set of (owner, temp_name) tuples
+                        
+                        # Extract from global_saved_temp_lineage (prefixed keys)
+                        for prefixed_key in global_saved_temp_lineage.keys():
+                            if isinstance(prefixed_key, str) and '::' in prefixed_key:
+                                owner, temp_key = prefixed_key.split('::', 1)
+                                if temp_key.startswith('#'):
+                                    base_name = get_base_temp_name(temp_key)
+                                    temp_keys_with_owner.add((owner, base_name))
+                        
+                        # Extract from global_saved_temp_registry (prefixed keys)
+                        for prefixed_key in global_saved_temp_registry.keys():
+                            if isinstance(prefixed_key, str) and '::' in prefixed_key:
+                                owner, temp_key = prefixed_key.split('::', 1)
+                                if temp_key.startswith('#'):
+                                    base_name = get_base_temp_name(temp_key)
+                                    temp_keys_with_owner.add((owner, base_name))
+                        
+                        temp_keys_list = sorted(list(temp_keys_with_owner))  # List of (owner, temp_name) tuples
+                    except Exception as e:
+                        logger.warning(f"Phase 3: Failed to build temp_keys_list: {e}")
+                        temp_keys_list = []
+                    
+                    for owner, tmp in temp_keys_list:
                         try:
+                            # Skip if this temp table was already emitted (avoid duplicates)
+                            temp_key = f"{owner}::{tmp}"
+                            if temp_key in emitted_temp_tables:
+                                continue
+                            emitted_temp_tables.add(temp_key)
+                            
+                            # Set parser._ctx_obj to owner for canonical naming
+                            # This ensures temp tables are named correctly based on their owning procedure
+                            prev_ctx_obj = parser._ctx_obj
+                            parser._ctx_obj = owner
+                            
                             # Debug: check context before canonicalization
                             ctx_db_before = getattr(parser, '_ctx_db', None)
                             ctx_obj_before = getattr(parser, '_ctx_obj', None)
                             current_db_before = parser.current_database
-                            logger.debug(f"Phase 3: Before _canonical_temp_name for {tmp}: _ctx_db={ctx_db_before}, _ctx_obj={ctx_obj_before}, current_database={current_db_before}")
+                            logger.debug(f"Phase 3: Before _canonical_temp_name for {owner}::{tmp}: _ctx_db={ctx_db_before}, _ctx_obj={ctx_obj_before}, current_database={current_db_before}")
                             
                             # Canonicalize temp name and derive ns
                             canonical = parser._canonical_temp_name(tmp)
-                            logger.debug(f"Phase 3: After _canonical_temp_name for {tmp}: canonical={canonical}")
+                            logger.debug(f"Phase 3: After _canonical_temp_name for {owner}::{tmp}: canonical={canonical}")
                             # Use _ns_and_name to get proper namespace and name format (schema.object#temp without dot before #)
                             ns_tmp, table_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
-                            logger.debug(f"Phase 3: After _ns_and_name for {tmp}: namespace={ns_tmp}, name={table_name}")
+                            logger.debug(f"Phase 3: After _ns_and_name for {owner}::{tmp}: namespace={ns_tmp}, name={table_name}")
+                            
+                            # Restore previous context
+                            parser._ctx_obj = prev_ctx_obj
+                            
                             # Build schema
                             schema = parser.schema_registry.get(ns_tmp, table_name)
                             if schema:
-                                logger.debug(f"Phase 3: Found schema in registry for {tmp}: namespace={schema.namespace}, name={schema.name}")
+                                logger.debug(f"Phase 3: Found schema in registry for {owner}::{tmp}: namespace={schema.namespace}, name={schema.name}")
                                 # Ensure schema.name matches table_name (might be different if registered earlier)
                                 if schema.name != table_name:
                                     logger.debug(f"Phase 3: Schema name mismatch! schema.name={schema.name}, table_name={table_name}, updating schema.name")
                                     schema.name = table_name
                             else:
-                                logger.debug(f"Phase 3: No schema in registry for {tmp}, creating new schema with name={table_name}")
-                                # Use saved_temp_registry instead of parser.temp_registry
-                                # because parser.temp_registry is cleared before each parsing (line 301)
-                                # Try both with and without version suffix (e.g., #tmp and #tmp@1)
-                                # Do NOT use global_saved_temp_registry - temp tables are local to procedure
-                                col_names = (saved_temp_registry.get(tmp, []) or 
-                                           parser.temp_registry.get(tmp, []) or
-                                           saved_temp_registry.get(f"{tmp}@1", []) or
-                                           parser.temp_registry.get(f"{tmp}@1", []) or [])
+                                logger.debug(f"Phase 3: No schema in registry for {owner}::{tmp}, creating new schema with name={table_name}")
+                                # Use global_saved_temp_registry with prefixed keys (owner::temp)
+                                prefixed_key = f"{owner}::{tmp}"
+                                col_names = (global_saved_temp_registry.get(prefixed_key, []) or 
+                                           global_saved_temp_registry.get(f"{prefixed_key}@1", []) or [])
                                 cols = [ColumnSchema(name=c, data_type='unknown', nullable=True, ordinal=i) for i, c in enumerate(col_names)]
                                 schema = TableSchema(namespace=ns_tmp, name=table_name, columns=cols)
                             # Build lineage
                             lin_list = []
-                            # Use saved_temp_lineage instead of parser.temp_lineage
-                            # because parser.temp_lineage is cleared before each parsing (line 303)
-                            # Try both with and without version suffix (e.g., #tmp and #tmp@1)
-                            # Do NOT use global_saved_temp_lineage - temp tables are local to procedure
-                            col_map = (saved_temp_lineage.get(tmp) or 
-                                      parser.temp_lineage.get(tmp) or
-                                      saved_temp_lineage.get(f"{tmp}@1") or
+                            # Use global_saved_temp_lineage with prefixed keys (owner::temp)
+                            prefixed_key = f"{owner}::{tmp}"
+                            col_map = (global_saved_temp_lineage.get(prefixed_key) or 
+                                      global_saved_temp_lineage.get(f"{prefixed_key}@1") or
                                       parser.temp_lineage.get(f"{tmp}@1") or {})
                             logger.debug(f"Phase 3: temp_lineage for {tmp}: {len(col_map)} columns, keys={list(col_map.keys())[:5] if col_map else []}")
                             # If temp_lineage is empty, or if it contains CTE references instead of real tables, try to extract sources from SQL
@@ -719,16 +745,12 @@ class Engine:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=normalized_refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
                                 else:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
-                            # Use saved_temp_sources instead of parser.temp_sources
-                            # because parser.temp_sources is cleared before each parsing (line 302)
-                            # Try both with and without version suffix (e.g., #tmp and #tmp@1)
-                            # Do NOT use global_saved_temp_sources - temp tables are local to procedure
-                            deps = set(saved_temp_sources.get(tmp, set()) or 
-                                     parser.temp_sources.get(tmp, set()) or
-                                     saved_temp_sources.get(f"{tmp}@1", set()) or
-                                     parser.temp_sources.get(f"{tmp}@1", set()) or set())
+                            # Use global_saved_temp_sources with prefixed keys (owner::temp)
+                            prefixed_key_sources = f"{owner}::{tmp}"
+                            deps = set(global_saved_temp_sources.get(prefixed_key_sources, set()) or 
+                                     global_saved_temp_sources.get(f"{prefixed_key_sources}@1", set()) or set())
                             temp_obj = ObjectInfo(name=table_name, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
-                            logger.debug(f"Phase 3: Created temp_obj for {tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
+                            logger.debug(f"Phase 3: Created temp_obj for {owner}::{tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
                             # Include in graph
                             resolved_objects.append(temp_obj)
                             # Write OL JSON
@@ -746,7 +768,7 @@ class Engine:
                             tpath = out_dir / f"{sql_path.stem}__temp__{safe}.json"
                             tpayload = emit_ol_from_object(temp_obj, quality_metrics=True, virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True))
                             tpath.write_text(json.dumps(tpayload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-                            outputs.append([str(sql_path), str(tpath)])
+                            outputs.append([sql_path.stem, str(tpath)])
                         except Exception:
                             pass
 
@@ -779,10 +801,17 @@ class Engine:
                             # Also use saved_temp_sources from procedures (may contain temp tables not in resolved_objects)
                             # Use global_saved_temp_sources to include temp tables from all procedures, not just this obj_name
                             # This allows source JSON for temp tables to use dependencies even if procedure and table have different obj_name
+                            # NOTE: Keys in global_saved_temp_sources are prefixed with owner (owner::#temp) to avoid collisions
                             for temp_key, deps in global_saved_temp_sources.items():
-                                if temp_key.startswith('#'):
+                                # Extract actual temp name from prefixed key (owner::#temp -> #temp)
+                                if '::' in temp_key:
+                                    actual_temp_key = temp_key.split('::', 1)[1]
+                                else:
+                                    actual_temp_key = temp_key
+                                
+                                if actual_temp_key.startswith('#'):
                                     # Try to find canonical name for this temp table
-                                    temp_part = temp_key.lstrip('#')
+                                    temp_part = actual_temp_key.lstrip('#')
                                     # Try to find matching normalized_name from temp_name_map_sources
                                     normalized_name = None
                                     for key, val in temp_name_map_sources.items():
@@ -792,8 +821,8 @@ class Engine:
                                     if not normalized_name:
                                         # Use canonical name if available
                                         try:
-                                            canonical = parser._canonical_temp_name(temp_key)
-                                            ns_tmp, table_name = parser._ns_and_name(temp_key, obj_type_hint="temp_table")
+                                            canonical = parser._canonical_temp_name(actual_temp_key)
+                                            ns_tmp, table_name = parser._ns_and_name(actual_temp_key, obj_type_hint="temp_table")
                                             try:
                                                 ns_db = ns_tmp.rsplit('/', 1)[1] if ns_tmp else None
                                                 if ns_db and table_name.startswith(f"{ns_db}."):
@@ -803,13 +832,13 @@ class Engine:
                                             except Exception:
                                                 normalized_name = table_name
                                         except Exception:
-                                            normalized_name = f"dbo.{temp_key}"
+                                            normalized_name = f"dbo.{actual_temp_key}"
                                     if normalized_name and deps:
                                         temp_sources_map[normalized_name] = deps
                                         # Also add to temp_name_map_sources if not already there
                                         if normalized_name not in temp_name_map_sources.values():
-                                            temp_name_map_sources[f"dbo.{temp_key}"] = normalized_name
-                                            temp_name_map_sources[temp_key] = normalized_name
+                                            temp_name_map_sources[f"dbo.{actual_temp_key}"] = normalized_name
+                                            temp_name_map_sources[actual_temp_key] = normalized_name
                             
                             inputs = ol_payload.get('inputs') or []
                             if inputs:
@@ -883,9 +912,17 @@ class Engine:
                                             # Try to find by temp_part in temp_sources_map or global_saved_temp_sources
                                             temp_part = normalized_s.split('#')[-1] if '#' in normalized_s else ""
                                             temp_key = f"#{temp_part}"
+                                            # Try unprefixed key first (for backward compatibility)
                                             if temp_key in global_saved_temp_sources:
                                                 deps = global_saved_temp_sources[temp_key]
                                                 logger.debug(f"Phase 3: Using dependencies from global_saved_temp_sources for {normalized_s} (temp_key={temp_key}): {len(deps)} deps")
+                                            else:
+                                                # Try all prefixed keys (owner::#temp format)
+                                                for prefixed_key, prefixed_deps in global_saved_temp_sources.items():
+                                                    if '::' in prefixed_key and prefixed_key.endswith(f"::{temp_key}"):
+                                                        deps = prefixed_deps
+                                                        logger.debug(f"Phase 3: Using dependencies from global_saved_temp_sources for {normalized_s} (prefixed_key={prefixed_key}): {len(deps)} deps")
+                                                        break
                                         
                                         if deps:
                                             from ..lineage import _ns_for_dep, _strip_db_prefix
