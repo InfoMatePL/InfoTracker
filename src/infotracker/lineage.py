@@ -125,9 +125,14 @@ class OpenLineageGenerator:
     
     def _build_inputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
         """Build inputs array from object dependencies."""
+        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
         inputs = []
         for dep_name in sorted(obj_info.dependencies):
             if _is_noise_dep(dep_name):
+                continue
+            # Skip JOIN keywords early
+            dep_simple = dep_name.split('.')[-1].lower() if dep_name else ""
+            if dep_simple in JOIN_KEYWORDS:
                 continue
             d = _dequote(dep_name)
             # tempdb legacy pattern
@@ -219,6 +224,12 @@ class OpenLineageGenerator:
                     namespace = "mssql://localhost/tempdb"
                 else:
                     namespace = input_ref.namespace
+                
+                # Skip SQL keywords that should never be table names
+                JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+                table_name_simple = input_ref.table_name.split('.')[-1] if input_ref.table_name else ""
+                if table_name_simple.lower() in JOIN_KEYWORDS:
+                    continue  # Skip this input
                     
                 input_fields.append({
                     "namespace": namespace,
@@ -278,6 +289,11 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
             if '+' in n:
                 return True
             if n.startswith('[') and n.endswith(']') and '.' not in n:
+                return True
+            # Filter out SQL keywords (JOIN keywords)
+            JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+            name_simple = n.split('.')[-1].lower() if n else ""
+            if name_simple in JOIN_KEYWORDS:
                 return True
             return False
         filtered = [ (ns2, nm2) for (ns2, nm2) in all_input_pairs if not _is_noise_name(nm2) ]

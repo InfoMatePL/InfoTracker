@@ -149,7 +149,8 @@ def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
 
 
     from_pattern = r'FROM\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
-    join_pattern = r'JOIN\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
+    # Note: Exclude JOIN keywords (LEFT/RIGHT/FULL/INNER/OUTER/CROSS) - they should not be captured as table names
+    join_pattern = r'(?:LEFT|RIGHT|FULL|INNER|OUTER|CROSS)?\s*JOIN\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
     update_pattern = r'UPDATE\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
     delete_from_pattern = r'DELETE\s+FROM\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
     merge_into_pattern = r'MERGE\s+INTO\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
@@ -157,7 +158,9 @@ def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
     sql_keywords = {
         'select','from','join','on','where','group','having','order','into',
         'update','delete','merge','as','and','or','not','case','when','then','else','set',
-        'distinct','top','with','nolock','commit','rollback','transaction','begin','try','catch','exists'
+        'distinct','top','with','nolock','commit','rollback','transaction','begin','try','catch','exists',
+        # JOIN keywords that should never be table names
+        'left','right','inner','outer','cross','full'
     }
     builtin_functions = {
         'getdate','sysdatetime','xact_state','row_number','count','sum','min','max','avg',

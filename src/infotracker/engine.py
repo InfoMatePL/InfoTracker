@@ -626,7 +626,8 @@ class Engine:
                                                     cte_start_pos = cte_start_match.end()
                                                     # Look for FROM [dbo].TableName in the CTE definition (handle nested subqueries)
                                                     # Use a pattern that finds FROM/JOIN followed by [dbo].TableName
-                                                    cte_from_pattern = rf'(?is)(?:FROM|JOIN)\s+\[?dbo\]?\.(\w+)'
+                                                    # Note: Exclude JOIN keywords (LEFT/RIGHT/FULL/INNER/OUTER/CROSS) from capture group
+                                                    cte_from_pattern = rf'(?is)(?:FROM|(?:LEFT|RIGHT|FULL|INNER|OUTER|CROSS)\s+JOIN|JOIN)\s+\[?dbo\]?\.(\w+)'
                                                     # Search in the text after CTE definition start, but limit to reasonable length
                                                     cte_section = sql_text[cte_start_pos:cte_start_pos+2000]  # Limit search to 2000 chars
                                                     cte_from_match = re.search(cte_from_pattern, cte_section)

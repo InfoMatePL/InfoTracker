@@ -43,6 +43,15 @@ def _split_fqn(self, fqn: str) -> Tuple[Optional[str], Optional[str], Optional[s
 
 
 def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[str, str]:
+    # SQL keywords that should never be treated as table names
+    JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+    
+    # Check if table_name is a SQL keyword - return empty namespace and keyword as-is
+    parts_check = (table_name or "").split('.')
+    if parts_check and parts_check[-1].lower() in JOIN_KEYWORDS:
+        # Return a marker that this is not a valid table
+        return "", "unknown"
+    
     if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
         # If table_name is already canonical (contains '.#'), use it directly
         # Otherwise, get canonical temp name which includes procedure context
@@ -174,6 +183,9 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
     if isinstance(table_expr, exp.Schema):
         table_expr = table_expr.this
 
+    # SQL keywords that should never be treated as table names (JOIN keywords, etc.)
+    JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+    
     if isinstance(table_expr, exp.Table):
         # sqlglot drops the leading '#' from temp table identifiers in T-SQL.
         # Detect temps via context:
@@ -182,6 +194,9 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
         # Also detect table variables (starting with '@') and preserve the '@' prefix
         try:
             simple = str(table_expr.name)
+            # CRITICAL: Filter out JOIN keywords that should never be table names
+            if simple.lower() in JOIN_KEYWORDS:
+                return "unknown"
             # Check if original expression starts with @ (table variable)
             # Table variables should be skipped from lineage (not materialized outputs)
             if str(table_expr).startswith('@'):
@@ -256,6 +271,15 @@ def _get_full_table_name(self, table_name: str) -> str:
     - schema.table -> db.schema.table
     - db.schema.table -> as-is
     """
+    # SQL keywords that should never be treated as table names
+    JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+    
+    # Check if table_name is a SQL keyword - return as-is to prevent qualification
+    parts_check = (table_name or "").split('.')
+    if parts_check and parts_check[-1].lower() in JOIN_KEYWORDS:
+        # Don't qualify keywords - return original to signal it's not a real table
+        return table_name
+    
     db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
     parts = (table_name or "").split('.')
     parts = [p for p in parts if p != ""]
