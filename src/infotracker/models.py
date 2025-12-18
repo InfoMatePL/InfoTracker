@@ -359,8 +359,11 @@ class ColumnGraph:
         
         # Build a map of old temp table names to new ones (e.g., "dbo.#asefl_temp" -> "dbo.update_asefl_TrialBalance_BV#asefl_temp")
         # Also build a map of temp table names to their ObjectInfo for lineage expansion
+        # IMPORTANT: Owner-aware mapping to prevent cross-procedure temp table edges
         temp_name_map: Dict[str, str] = {}
         temp_obj_map: Dict[str, ObjectInfo] = {}  # temp table name -> ObjectInfo
+        temp_owners_registry: Dict[str, Set[str]] = {}  # temp_raw (e.g., "#temp") -> set of owner procedures
+        
         for obj in objects:
             if obj.object_type == "temp_table" and obj.schema.name:
                 # obj.schema.name is in new format: "dbo.update_asefl_TrialBalance_BV#asefl_temp" (or with DB prefix)
@@ -372,20 +375,35 @@ class ColumnGraph:
                         normalized_name = normalized_name[len(ns_db) + 1:]
                 except Exception:
                     pass
-                # Extract temp table name (part after last '#')
+                # Extract temp table name (part after last '#') and owner (part before '#')
                 if '#' in normalized_name:
                     temp_part = normalized_name.split('#')[-1]
-                    # Map various old formats to new canonical format
+                    owner_part = normalized_name.rsplit('#', 1)[0]  # Everything before last '#'
+                    
+                    # Register in owners_registry for uniqueness checks
+                    temp_raw = f"#{temp_part}"
+                    if temp_raw not in temp_owners_registry:
+                        temp_owners_registry[temp_raw] = set()
+                    temp_owners_registry[temp_raw].add(owner_part)
+                    
+                    # Map owner-aware keys (exact match, highest priority)
+                    # Format: "dbo.update_X#temp" -> "dbo.update_X#temp"
+                    temp_name_map[normalized_name] = normalized_name
+                    if ns_db:
+                        temp_name_map[f"{ns_db}.{normalized_name}"] = normalized_name
+                    
+                    # Map fallback keys (lower priority, used only if unique owner)
+                    # These will be used only if temp_owners_registry shows single owner
                     old_name = f"dbo.#{temp_part}"
                     temp_name_map[old_name] = normalized_name
-                    temp_obj_map[normalized_name] = obj
-                    # Also map without schema
-                    temp_name_map[f"#{temp_part}"] = normalized_name
-                    # Map with DB prefix if namespace has DB
+                    temp_name_map[temp_raw] = normalized_name
                     if ns_db:
                         temp_name_map[f"{ns_db}.dbo.#{temp_part}"] = normalized_name
                         temp_name_map[f"{ns_db}.#{temp_part}"] = normalized_name
-                        # Also map with DB prefix for temp_obj_map
+                    
+                    # Map in temp_obj_map for lineage expansion
+                    temp_obj_map[normalized_name] = obj
+                    if ns_db:
                         temp_obj_map[f"{ns_db}.{normalized_name}"] = obj
         
         for obj in objects:
@@ -436,33 +454,48 @@ class ColumnGraph:
                         in_db = None
                     
                     # Check temp_name_map BEFORE normalizing DB prefix, as map may contain DB-prefixed keys
-                    # Try multiple variants: with DB prefix, without DB prefix, with schema, without schema
+                    # OWNER-AWARE LOOKUP: Prefer exact match, then fallback only if unique owner
                     original_tbl = in_tbl
                     temp_obj = None
                     if in_tbl and '#' in in_tbl:
-                        # Try different variants to find mapping
-                        variants = [in_tbl]
-                        if in_db:
-                            # Try with DB prefix
-                            if not in_tbl.startswith(f"{in_db}."):
-                                variants.append(f"{in_db}.{in_tbl}")
-                            # Try without DB prefix (after normalization)
-                            if in_tbl.startswith(f"{in_db}."):
-                                variants.append(in_tbl[len(in_db) + 1:])
-                        # Try without schema (just #temp)
-                        if '.' in in_tbl:
-                            temp_part = in_tbl.split('#')[-1] if '#' in in_tbl else None
-                            if temp_part:
-                                variants.append(f"#{temp_part}")
-                                if in_db:
-                                    variants.append(f"{in_db}.#{temp_part}")
+                        # Extract temp_raw for uniqueness check
+                        temp_part = in_tbl.split('#')[-1] if '#' in in_tbl else None
+                        temp_raw = f"#{temp_part}" if temp_part else None
                         
-                        # Check each variant for temp_name_map
+                        # Build variants in priority order:
+                        # 1. Exact match (owner-aware): "dbo.update_X#temp"
+                        # 2. With DB prefix: "EDW_CORE.dbo.update_X#temp"
+                        # 3. Fallback (only if unique owner): "#temp", "dbo.#temp"
+                        exact_variants = [in_tbl]
+                        if in_db and not in_tbl.startswith(f"{in_db}."):
+                            exact_variants.append(f"{in_db}.{in_tbl}")
+                        if in_db and in_tbl.startswith(f"{in_db}."):
+                            exact_variants.append(in_tbl[len(in_db) + 1:])
+                        
+                        fallback_variants = []
+                        if temp_raw:
+                            # Only use fallback if this temp has UNIQUE owner
+                            is_unique = temp_raw in temp_owners_registry and len(temp_owners_registry[temp_raw]) == 1
+                            if is_unique:
+                                fallback_variants.append(temp_raw)
+                                fallback_variants.append(f"dbo.{temp_raw}")
+                                if in_db:
+                                    fallback_variants.append(f"{in_db}.dbo.{temp_raw}")
+                                    fallback_variants.append(f"{in_db}.{temp_raw}")
+                        
+                        # Try exact variants first
                         mapped_tbl = None
-                        for variant in variants:
+                        for variant in exact_variants:
                             if variant in temp_name_map:
                                 mapped_tbl = temp_name_map[variant]
                                 break
+                        
+                        # If no exact match, try fallback (only if unique owner)
+                        if not mapped_tbl:
+                            for variant in fallback_variants:
+                                if variant in temp_name_map:
+                                    mapped_tbl = temp_name_map[variant]
+                                    break
                         
                         # If we found a mapping, also check if we have temp_obj for lineage expansion
                         if mapped_tbl:
@@ -471,11 +504,6 @@ class ColumnGraph:
                             search_variants = [mapped_tbl]
                             if in_db:
                                 search_variants.append(f"{in_db}.{mapped_tbl}")
-                            # Also try with original_tbl variants if they map to the same temp
-                            if original_tbl and original_tbl != mapped_tbl:
-                                search_variants.append(original_tbl)
-                                if in_db:
-                                    search_variants.append(f"{in_db}.{original_tbl}")
                             # Try all variants
                             for variant in search_variants:
                                 if variant in temp_obj_map:
@@ -559,9 +587,9 @@ class ColumnGraph:
                                 base_tbl_name = base_input.table_name or ""
                                 # Skip if this is a self-reference to the temp table
                                 if '#' in base_tbl_name:
-                                    # Check if it's the same temp table
+                                    # Check if it's the same temp table (use in_tbl which is already mapped)
                                     temp_part = base_tbl_name.split('#')[-1] if '#' in base_tbl_name else ""
-                                    if temp_part and temp_part in mapped_tbl:
+                                    if temp_part and in_tbl and temp_part in in_tbl:
                                         # This is a self-reference, skip it
                                         continue
                                 # This is a base source, include it
