@@ -209,6 +209,11 @@ class Engine:
                     parser._current_file = sql_path.relative_to(sql_root).as_posix()
                 except Exception:
                     parser._current_file = str(sql_path)
+                
+                # CRITICAL: Reset _ctx_obj before parsing each file to prevent context leakage
+                # between procedures. Each file will set its own context during parsing.
+                parser._ctx_obj = None
+                
                 obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
                 
                 # IMPORTANT: Save context AFTER parsing in Phase 1, so it can be used in Phase 3
@@ -277,6 +282,8 @@ class Engine:
         global_saved_temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}
         global_saved_temp_sources: Dict[str, Set[str]] = {}
         global_saved_temp_registry: Dict[str, List[str]] = {}
+        # NEW: Store temp registries PER SQL FILE (not per owner) to avoid cross-contamination
+        file_temp_registries: Dict[Path, Dict[str, Any]] = {}  # sql_path -> {lineage, sources, registry, owner}
         # Store CTE registry from ALL procedures for column graph expansion (similar to temp_lineage)
         # CTE need to be expanded to base sources in column_graph (like temp tables)
         global_saved_cte_registry: Dict[str, Any] = {}
@@ -342,6 +349,14 @@ class Engine:
                         # Also save globally for source JSON creation (temp tables may be referenced from other obj_name)
                         # PREFIX keys with owner procedure to avoid collision between procedures with same temp names
                         owner_prefix = parser._ctx_obj or obj_name or sql_path.stem
+                        # NEW: Save per-file temp registries to avoid cross-contamination when multiple procedures share same obj_name
+                        file_temp_registries[sql_path] = {
+                            'lineage': dict(parser.temp_lineage),
+                            'sources': dict(parser.temp_sources),
+                            'registry': dict(parser.temp_registry),
+                            'owner': owner_prefix
+                        }
+                        # Also save globally (with prefixes) for column_graph expansion
                         for key, value in parser.temp_lineage.items():
                             prefixed_key = f"{owner_prefix}::{key}"
                             global_saved_temp_lineage[prefixed_key] = value
@@ -438,38 +453,39 @@ class Engine:
 
                     outputs.append([str(sql_path), str(target)])
 
-                    # Additionally, emit separate OL events for temp tables created in this file
-                    # Use saved_temp_lineage/global_saved_temp_lineage instead of parser.temp_registry
-                    # because parser.temp_registry is cleared before each parsing (line 301)
-                    # This ensures temp tables from procedures are included even when CREATE TABLE is processed after
+                    # Additionally, emit separate OL events for temp tables created in THIS FILE ONLY
+                    # Use per-file temp registry to avoid emitting temp tables from other procedures in same obj_name group
                     try:
-                        temp_keys_set = set()
                         # Helper function to extract base temp name (without version suffix)
                         def get_base_temp_name(k: str) -> str:
                             if '@' in k:
                                 return k.split('@')[0]
                             return k
                         
-                        # BUILD temp_keys from global_saved_temp_* (with prefixed keys like "owner::#temp")
-                        # This ensures we get temp tables from ALL procedures in this batch, not just the last one
-                        # Previously we used saved_temp_* which was local and got overwritten - that was a bug
+                        # Get temp registry for THIS specific file (not all files in the group)
+                        if sql_path not in file_temp_registries:
+                            # No temp tables in this file, skip
+                            continue  # Continue to next file in the loop
+                        
+                        file_temp_data = file_temp_registries[sql_path]
+                        owner = file_temp_data['owner']
+                        file_temp_lineage = file_temp_data['lineage']
+                        file_temp_registry = file_temp_data['registry']
+                        
+                        # Build temp_keys from THIS file's temp registry only
                         temp_keys_with_owner = set()  # Set of (owner, temp_name) tuples
                         
-                        # Extract from global_saved_temp_lineage (prefixed keys)
-                        for prefixed_key in global_saved_temp_lineage.keys():
-                            if isinstance(prefixed_key, str) and '::' in prefixed_key:
-                                owner, temp_key = prefixed_key.split('::', 1)
-                                if temp_key.startswith('#'):
-                                    base_name = get_base_temp_name(temp_key)
-                                    temp_keys_with_owner.add((owner, base_name))
+                        # Extract from file's temp lineage
+                        for temp_key in file_temp_lineage.keys():
+                            if temp_key.startswith('#'):
+                                base_name = get_base_temp_name(temp_key)
+                                temp_keys_with_owner.add((owner, base_name))
                         
-                        # Extract from global_saved_temp_registry (prefixed keys)
-                        for prefixed_key in global_saved_temp_registry.keys():
-                            if isinstance(prefixed_key, str) and '::' in prefixed_key:
-                                owner, temp_key = prefixed_key.split('::', 1)
-                                if temp_key.startswith('#'):
-                                    base_name = get_base_temp_name(temp_key)
-                                    temp_keys_with_owner.add((owner, base_name))
+                        # Extract from file's temp registry
+                        for temp_key in file_temp_registry.keys():
+                            if temp_key.startswith('#'):
+                                base_name = get_base_temp_name(temp_key)
+                                temp_keys_with_owner.add((owner, base_name))
                         
                         temp_keys_list = sorted(list(temp_keys_with_owner))  # List of (owner, temp_name) tuples
                     except Exception as e:
@@ -486,24 +502,26 @@ class Engine:
                             
                             # Set parser._ctx_obj to owner for canonical naming
                             # This ensures temp tables are named correctly based on their owning procedure
+                            # CRITICAL: Use try/finally to ensure context is always restored
                             prev_ctx_obj = parser._ctx_obj
-                            parser._ctx_obj = owner
-                            
-                            # Debug: check context before canonicalization
-                            ctx_db_before = getattr(parser, '_ctx_db', None)
-                            ctx_obj_before = getattr(parser, '_ctx_obj', None)
-                            current_db_before = parser.current_database
-                            logger.debug(f"Phase 3: Before _canonical_temp_name for {owner}::{tmp}: _ctx_db={ctx_db_before}, _ctx_obj={ctx_obj_before}, current_database={current_db_before}")
-                            
-                            # Canonicalize temp name and derive ns
-                            canonical = parser._canonical_temp_name(tmp)
-                            logger.debug(f"Phase 3: After _canonical_temp_name for {owner}::{tmp}: canonical={canonical}")
-                            # Use _ns_and_name to get proper namespace and name format (schema.object#temp without dot before #)
-                            ns_tmp, table_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
-                            logger.debug(f"Phase 3: After _ns_and_name for {owner}::{tmp}: namespace={ns_tmp}, name={table_name}")
-                            
-                            # Restore previous context
-                            parser._ctx_obj = prev_ctx_obj
+                            try:
+                                parser._ctx_obj = owner
+                                
+                                # Debug: check context before canonicalization
+                                ctx_db_before = getattr(parser, '_ctx_db', None)
+                                ctx_obj_before = getattr(parser, '_ctx_obj', None)
+                                current_db_before = parser.current_database
+                                logger.debug(f"Phase 3: Before _canonical_temp_name for {owner}::{tmp}: _ctx_db={ctx_db_before}, _ctx_obj={ctx_obj_before}, current_database={current_db_before}")
+                                
+                                # Canonicalize temp name and derive ns
+                                canonical = parser._canonical_temp_name(tmp)
+                                logger.debug(f"Phase 3: After _canonical_temp_name for {owner}::{tmp}: canonical={canonical}")
+                                # Use _ns_and_name to get proper namespace and name format (schema.object#temp without dot before #)
+                                ns_tmp, table_name = parser._ns_and_name(tmp, obj_type_hint="temp_table")
+                                logger.debug(f"Phase 3: After _ns_and_name for {owner}::{tmp}: namespace={ns_tmp}, name={table_name}")
+                            finally:
+                                # Restore previous context
+                                parser._ctx_obj = prev_ctx_obj
                             
                             # Build schema
                             schema = parser.schema_registry.get(ns_tmp, table_name)
