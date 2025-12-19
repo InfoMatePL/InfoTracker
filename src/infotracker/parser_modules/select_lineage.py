@@ -8,6 +8,16 @@ from sqlglot import expressions as exp
 from ..models import ColumnReference, ColumnSchema, ColumnLineage, TransformationType
 import re
 
+# SQL keywords that should never be treated as table names
+JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+
+def _is_join_keyword(table_name: str) -> bool:
+    """Check if table_name (or its last segment) is a JOIN keyword."""
+    if not table_name:
+        return False
+    simple = table_name.split('.')[-1]
+    return simple.lower() in JOIN_KEYWORDS
+
 # Minimal tail-strip regex similar to legacy dev_parser for stable derived column names
 _FUNC_TAIL_RE = re.compile(r"\b(?:COALESCE|ISNULL|CAST|CONVERT|TRY_CAST|HASHBYTES|IIF)\s*\(", re.I)
 
@@ -794,13 +804,30 @@ def _extract_column_references(self, select_expr: exp.Expression, select_stmt: e
             table_alias = str(column_expr.table)
             table_name = self._resolve_table_from_alias(table_alias, select_stmt)
         else:
-            tables = [self._get_table_name(t) for t in select_stmt.find_all(exp.Table)]
+            # Get all tables, but exclude INTO target table (which is not a source)
+            all_tables = list(select_stmt.find_all(exp.Table))
+            into_node = select_stmt.args.get('into') if hasattr(select_stmt, 'args') else None
+            into_table = into_node.this if into_node else None
+            # Filter out INTO table from source tables
+            source_tables = [t for t in all_tables if not (into_table and t == into_table)]
+            tables = [self._get_table_name(t) for t in source_tables]
             if len(tables) == 1:
                 table_name = tables[0]
         if table_name and (table_name.startswith('@') or ('+' in table_name) or (table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name)):
             continue
+        # Skip SQL keywords (JOIN keywords like LEFT/RIGHT/etc)
+        if _is_join_keyword(table_name):
+            continue  # Skip this ref entirely - it's not a real table
         if table_name != "unknown":
             ns, nm = self._ns_and_name(table_name)
+            if nm == "unknown":
+                import sys, traceback
+                print(f"\n=== DEBUG: Created 'unknown' ref ===", file=sys.stderr)
+                print(f"table_name={table_name}, ns={ns}, nm={nm}, column={column_name}", file=sys.stderr)
+                print("Traceback:", file=sys.stderr)
+                for line in traceback.format_stack()[-6:-1]:
+                    print(line.strip(), file=sys.stderr)
+                print("===\n", file=sys.stderr)
             refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=column_name))
     return refs
 
@@ -836,7 +863,7 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             if hasattr(select_expr, 'table') and select_expr.table:
                 alias = str(select_expr.table)
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
-                if table_name != "unknown":
+                if table_name != "unknown" and not _is_join_keyword(table_name):
                     columns = self._infer_table_columns_unified(table_name)
                     for column_name in columns:
                         if column_name not in seen_columns:
@@ -852,6 +879,9 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                     if table_name != "unknown":
                         source_tables.append(table_name)
                 for table_name in source_tables:
+                    # Skip JOIN keywords that should not be table names
+                    if _is_join_keyword(table_name):
+                        continue
                     columns = self._infer_table_columns_unified(table_name)
                     for column_name in columns:
                         if column_name not in seen_columns:
@@ -864,7 +894,7 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             if hasattr(select_expr, 'table') and select_expr.table:
                 alias = str(select_expr.table)
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
-                if table_name != "unknown":
+                if table_name != "unknown" and not _is_join_keyword(table_name):
                     columns = self._infer_table_columns_unified(table_name)
                     for column_name in columns:
                         if column_name not in seen_columns:
@@ -1045,6 +1075,8 @@ def _analyze_expression_lineage(self, output_name: str, expr: exp.Expression, co
         table_name = _resolve_table_from_alias(self, table_alias, context)
         if table_name and (table_name.startswith('@') or ('+' in table_name) or (table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name)):
             return ColumnLineage(output_column=output_name, input_fields=[], transformation_type=TransformationType.EXPRESSION, transformation_description=f"Expression: {str(expr)}")
+        if _is_join_keyword(table_name):
+            return ColumnLineage(output_column=output_name, input_fields=[], transformation_type=TransformationType.EXPRESSION, transformation_description=f"Expression: {str(expr)}")
         ns, nm = self._ns_and_name(table_name)
         input_fields.append(ColumnReference(namespace=ns, table_name=nm, column_name=column_name))
         table_simple = table_name.split('.')[-1] if '.' in table_name else table_name
@@ -1065,8 +1097,9 @@ def _analyze_expression_lineage(self, output_name: str, expr: exp.Expression, co
                 table_alias = str(column_ref.table) if column_ref.table else None
                 column_name = str(column_ref.this)
                 table_name = _resolve_table_from_alias(self, table_alias, context)
-                ns, nm = self._ns_and_name(table_name)
-                input_fields.append(ColumnReference(namespace=ns, table_name=nm, column_name=column_name))
+                if not _is_join_keyword(table_name):
+                    ns, nm = self._ns_and_name(table_name)
+                    input_fields.append(ColumnReference(namespace=ns, table_name=nm, column_name=column_name))
             expr_str = str(inner_expr)
             if '*' in expr_str:
                 operands = [str(col.this) for col in inner_expr.find_all(exp.Column)]

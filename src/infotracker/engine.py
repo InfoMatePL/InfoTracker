@@ -669,6 +669,12 @@ class Engine:
                                             # Normalize table name
                                             if '.' not in from_table and not from_table.startswith('#'):
                                                 from_table = f"dbo.{from_table}"
+                                            # Skip JOIN keywords
+                                            from_table_simple = from_table.split('.')[-1] if from_table else ""
+                                            JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+                                            if from_table_simple.lower() in JOIN_KEYWORDS:
+                                                logger.debug(f"Phase 3: Skipping JOIN keyword '{from_table}' in fallback lineage for {tmp}")
+                                                break
                                             # Create basic lineage for all columns
                                             ns_from, nm_from = parser._ns_and_name(from_table, obj_type_hint="table")
                                             for col in schema.columns:

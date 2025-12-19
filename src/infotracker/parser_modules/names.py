@@ -52,6 +52,19 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
         # Return a marker that this is not a valid table
         return "", "unknown"
     
+    # Check if this is a CTE reference - CTEs don't need database qualification
+    # They exist only in the query context, not in the database
+    simple_name = parts_check[-1] if parts_check else table_name
+    if simple_name and simple_name in self.cte_registry:
+        # CTEs are query-scoped, but give them a namespace for visualization
+        # Use current database namespace to group them properly
+        db = self.current_database or self.default_database or "InfoTrackerDW"
+        ns = f"mssql://localhost/{db}"
+        # Prefix CTE name with schema for proper grouping in visualization
+        schema = getattr(self, '_ctx_schema', None) or self.default_schema or "dbo"
+        name = f"{schema}.{simple_name}"
+        return ns, name
+    
     if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
         # If table_name is already canonical (contains '.#'), use it directly
         # Otherwise, get canonical temp name which includes procedure context
@@ -223,6 +236,10 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
             full_name = qualify_identifier(table_name, database_to_use)
         else:
             table_name = str(table_expr.name)
+            # Check if this is a CTE reference - CTEs should not be qualified with database
+            if table_name in self.cte_registry:
+                # Return CTE name as-is without qualification
+                return table_name
             full_name = qualify_identifier(table_name, database_to_use)
     elif isinstance(table_expr, exp.Identifier):
         # Identifiers may also point at temps without leading '#'. If present in temp_registry, use canonical name.
@@ -230,6 +247,9 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
             ident = str(table_expr.this)
             if ident and (f"#{ident}" in self.temp_registry):
                 return self._canonical_temp_name(f"#{ident}")
+            # Check if this is a CTE reference
+            if ident in self.cte_registry:
+                return ident
         except Exception:
             pass
         table_name = str(table_expr.this)
@@ -279,6 +299,12 @@ def _get_full_table_name(self, table_name: str) -> str:
     if parts_check and parts_check[-1].lower() in JOIN_KEYWORDS:
         # Don't qualify keywords - return original to signal it's not a real table
         return table_name
+    
+    # Check if this is a CTE reference - CTEs should not be qualified
+    simple_name = parts_check[-1] if parts_check else table_name
+    if simple_name and simple_name in self.cte_registry:
+        # Return CTE name as-is without qualification
+        return simple_name
     
     db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
     parts = (table_name or "").split('.')

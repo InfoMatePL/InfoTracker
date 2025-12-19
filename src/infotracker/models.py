@@ -422,6 +422,10 @@ class ColumnGraph:
             if ns_db and output_table and output_table.startswith(f"{ns_db}."):
                 output_table = output_table[len(ns_db) + 1:]
             
+            # Skip objects with table_name="unknown" (e.g., unresolved objects)
+            if output_table == "unknown":
+                continue
+            
             # Add nodes for all columns, even if they don't have edges
             for col in obj.schema.columns or []:
                 output_column = ColumnNode(
@@ -443,6 +447,9 @@ class ColumnGraph:
                 for input_field in lineage.input_fields:
                     # Skip table variables (starting with @) - they should not appear in column_graph
                     if input_field.table_name and input_field.table_name.startswith('@'):
+                        continue
+                    # Skip "unknown" table names (e.g., unresolved JOIN keywords)
+                    if input_field.table_name == "unknown":
                         continue
                     
                     in_ns = input_field.namespace
@@ -556,6 +563,9 @@ class ColumnGraph:
                                     # Create edges from CTE base sources to output (expand CTE)
                                     if base_tables:
                                         for base_tbl_name in base_tables:
+                                            # Skip "unknown" table names
+                                            if base_tbl_name == "unknown":
+                                                continue
                                             # Use same namespace as CTE
                                             base_column = ColumnNode(
                                                 namespace=in_ns,
@@ -600,6 +610,9 @@ class ColumnGraph:
                                 for base_input in base_inputs:
                                     base_ns = base_input.namespace
                                     base_tbl = base_input.table_name
+                                    # Skip "unknown" table names
+                                    if base_tbl == "unknown":
+                                        continue
                                     # Normalize base table name
                                     try:
                                         base_db = base_ns.rsplit('/', 1)[1] if base_ns else None

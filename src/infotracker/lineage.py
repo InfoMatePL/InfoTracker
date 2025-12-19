@@ -230,6 +230,10 @@ class OpenLineageGenerator:
                 table_name_simple = input_ref.table_name.split('.')[-1] if input_ref.table_name else ""
                 if table_name_simple.lower() in JOIN_KEYWORDS:
                     continue  # Skip this input
+                
+                # Skip "unknown" table names (e.g., unresolved references)
+                if input_ref.table_name == "unknown":
+                    continue
                     
                 input_fields.append({
                     "namespace": namespace,
@@ -320,12 +324,20 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
     # Add column lineage facet if we have lineage
     if obj.lineage:
         lineage_fields = {}
+        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
         for ln in obj.lineage:
+            # Filter input_fields: skip JOIN keywords and "unknown"
+            filtered_inputs = []
+            for f in ln.input_fields:
+                table_simple = f.table_name.split('.')[-1] if f.table_name else ""
+                if table_simple.lower() in JOIN_KEYWORDS:
+                    continue
+                if f.table_name == "unknown":
+                    continue
+                filtered_inputs.append({"namespace": f.namespace, "name": f.table_name, "field": f.column_name})
+            
             lineage_fields[ln.output_column] = {
-                "inputFields": [
-                    {"namespace": f.namespace, "name": f.table_name, "field": f.column_name}
-                    for f in ln.input_fields
-                ],
+                "inputFields": filtered_inputs,
                 "transformationType": ln.transformation_type.value,
                 "transformationDescription": ln.transformation_description,
             }
