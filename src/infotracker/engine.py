@@ -950,7 +950,7 @@ class Engine:
                                                         break
                                         
                                         if deps:
-                                            from ..lineage import _ns_for_dep, _strip_db_prefix
+                                            from .lineage import _ns_for_dep, _strip_db_prefix
                                             for dep in sorted(deps):
                                                 dep_ns = _ns_for_dep(dep, ns_in or "mssql://localhost/InfoTrackerDW")
                                                 dep_name = _strip_db_prefix(dep)
