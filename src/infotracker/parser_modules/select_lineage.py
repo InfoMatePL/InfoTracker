@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from typing import List, Dict, Set, Optional, Tuple
+import logging
 
 import sqlglot
 from sqlglot import expressions as exp
 
 from ..models import ColumnReference, ColumnSchema, ColumnLineage, TransformationType
 import re
+
+logger = logging.getLogger(__name__)
 
 # SQL keywords that should never be treated as table names
 JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
@@ -857,9 +860,13 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
     output_columns = []
     ordinal = 0
     seen_columns = set()
+    
+    logger.debug(f"_handle_star_expansion: Called for {view_name}, select_stmt has {len(select_stmt.expressions)} expressions")
 
     for select_expr in select_stmt.expressions:
+        logger.debug(f"_handle_star_expansion: Processing expression type={type(select_expr).__name__}")
         if isinstance(select_expr, exp.Star):
+            logger.debug(f"_handle_star_expansion: Found exp.Star, has table attr: {hasattr(select_expr, 'table')}, table value: {getattr(select_expr, 'table', None)}")
             if hasattr(select_expr, 'table') and select_expr.table:
                 alias = str(select_expr.table)
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
@@ -873,16 +880,21 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                             ns, nm = self._ns_and_name(table_name)
                             lineage.append(ColumnLineage(output_column=column_name, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=column_name)], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
             else:
+                logger.debug(f"_handle_star_expansion: Bare * without table alias, searching for source tables in FROM")
                 source_tables = []
                 for table in select_stmt.find_all(exp.Table):
                     table_name = self._get_table_name(table)
                     if table_name != "unknown":
                         source_tables.append(table_name)
+                logger.debug(f"_handle_star_expansion: Found {len(source_tables)} source tables: {source_tables}")
                 for table_name in source_tables:
                     # Skip JOIN keywords that should not be table names
                     if _is_join_keyword(table_name):
+                        logger.debug(f"_handle_star_expansion: Skipping JOIN keyword: {table_name}")
                         continue
+                    logger.debug(f"_handle_star_expansion: Getting columns for table: {table_name}")
                     columns = self._infer_table_columns_unified(table_name)
+                    logger.debug(f"_handle_star_expansion: Got {len(columns)} columns from {table_name}")
                     for column_name in columns:
                         if column_name not in seen_columns:
                             seen_columns.add(column_name)
@@ -904,7 +916,9 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                             ns, nm = self._ns_and_name(table_name)
                             lineage.append(ColumnLineage(output_column=column_name, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=column_name)], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
         else:
+            logger.debug(f"_handle_star_expansion: Non-star expression, extracting alias")
             col_name = self._extract_column_alias(select_expr) or f"col_{ordinal}"
+            logger.debug(f"_handle_star_expansion: Extracted alias: {col_name}")
             output_columns.append(ColumnSchema(name=col_name, data_type="unknown", nullable=True, ordinal=ordinal))
             ordinal += 1
             input_refs = self._extract_column_references(select_expr, select_stmt)
@@ -913,6 +927,7 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             # while preserving the lineage entry with proper transformation metadata.
             lineage.append(ColumnLineage(output_column=col_name, input_fields=input_refs, transformation_type=TransformationType.EXPRESSION, transformation_description=f"SELECT {str(select_expr)}"))
 
+    logger.debug(f"_handle_star_expansion: Returning {len(output_columns)} columns, {len(lineage)} lineage entries")
     return lineage, output_columns
 
 
@@ -967,22 +982,31 @@ def _handle_union_lineage(self, stmt: exp.Expression, view_name: str) -> tuple[L
 
 
 def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
+    logger.debug(f"_extract_column_lineage: Called for view_name={view_name}, stmt type={type(stmt).__name__}")
     lineage = []
     output_columns = []
     if isinstance(stmt, exp.Union):
+        logger.debug(f"_extract_column_lineage: stmt is Union, calling _handle_union_lineage")
         return _handle_union_lineage(self, stmt, view_name)
     if not isinstance(stmt, exp.Select):
+        logger.debug(f"_extract_column_lineage: stmt is not Select, returning empty")
         return lineage, output_columns
     select_stmt = stmt
     alias_map, derived_cols = _build_alias_maps(self, select_stmt)
     # Store select_stmt in self so _append_column_ref can access it for CTE expansion
     self._current_select_stmt = select_stmt
     projections = list(getattr(select_stmt, 'expressions', None) or [])
+    logger.debug(f"_extract_column_lineage: projections count={len(projections)}")
     if not projections:
+        logger.debug(f"_extract_column_lineage: No projections, returning empty")
         return lineage, output_columns
-    if _has_star_expansion(self, select_stmt):
+    has_star = _has_star_expansion(self, select_stmt)
+    logger.debug(f"_extract_column_lineage: _has_star_expansion returned {has_star}")
+    if has_star:
+        logger.debug(f"_extract_column_lineage: Calling _handle_star_expansion")
         return _handle_star_expansion(self, select_stmt, view_name)
     if _has_union(self, select_stmt):
+        logger.debug(f"_extract_column_lineage: Has union, calling _handle_union_lineage")
         return _handle_union_lineage(self, select_stmt, view_name)
     ordinal = 0
     for proj in projections:

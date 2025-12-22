@@ -119,7 +119,15 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     logger.debug(f"_parse_select_into: select_stmt type={type(select_stmt).__name__}, has_with={bool(select_stmt.args.get('with') if isinstance(select_stmt, exp.Select) else False)}")
     
     logger.debug(f"_parse_select_into: About to extract column lineage for {table_name}, select_stmt type: {type(select_stmt).__name__}")
-    lineage, output_columns = self._extract_column_lineage(select_stmt, table_name)
+    try:
+        lineage, output_columns = self._extract_column_lineage(select_stmt, table_name)
+        logger.debug(f"_parse_select_into: Successfully extracted lineage for {table_name}")
+    except Exception as e:
+        logger.debug(f"_parse_select_into: ERROR extracting lineage for {table_name}: {e}")
+        import traceback
+        logger.debug(f"_parse_select_into: Traceback: {traceback.format_exc()}")
+        lineage = []
+        output_columns = []
     
     # Fix for empty columns: if parser fails to extract columns (e.g. complex CTEs), default to *
     if not output_columns:

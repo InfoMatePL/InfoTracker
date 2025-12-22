@@ -356,7 +356,8 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                                 if tkey not in self.temp_registry:
                                     # Try to extract column names from SELECT
                                     import re as _re2
-                                    select_match = _re2.search(r'(?is)SELECT\s+(.*?)\s+INTO', raw_seg)
+                                    # Use negative lookahead to avoid matching across multiple INTO statements
+                                    select_match = _re2.search(r'(?is)SELECT\s+((?:(?!INTO).)+)\s+INTO', raw_seg)
                                     if select_match:
                                         select_list = select_match.group(1)
                                         # Simple column extraction - take aliases or column names
@@ -1589,7 +1590,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             # Extract column names from SELECT clause using simple regex
                             select_part = match.group(1)
                             # Find SELECT ... INTO pattern
-                            col_match = re.search(r'(?is)SELECT\s+(.*?)\s+INTO\s+', select_part)
+                            # Use negative lookahead to avoid matching across multiple INTO statements
+                            col_match = re.search(r'(?is)SELECT\s+((?:(?!INTO).)+)\s+INTO\s+', select_part)
                             if col_match:
                                 col_list_str = col_match.group(1)
                                 # Extract column names (simple approach - split by comma and take last part after AS or space)
@@ -2049,7 +2051,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from UPDATE ... OUTPUT ... INTO fallback (chunk exception): {col_names[:5]}")
                         # Try SELECT ... INTO
                         else:
-                            select_into_match = re.search(r'(?is)SELECT\s+(.*?)\s+INTO\s+(#\w+)', stmt_sql, re.IGNORECASE)
+                            # Use negative lookahead to avoid matching previous SELECT...INTO statements
+                            # Pattern (?:(?!INTO).)* matches any character except sequences containing INTO
+                            select_into_match = re.search(r'(?is)SELECT\s+((?:(?!INTO).)*)\s+INTO\s+(#\w+)', stmt_sql, re.IGNORECASE)
                             if select_into_match:
                                 temp_name = select_into_match.group(2)
                                 
@@ -2069,8 +2073,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL)
                                     
                                     col_expr = col_expr.strip()
-                                    # Skip if empty or too short
-                                    if not col_expr or len(col_expr) < 2:
+                                    # Skip if empty, but allow single-character wildcards like '*'
+                                    if not col_expr or (len(col_expr) < 2 and col_expr != '*'):
                                         continue
                                     
                                     # Try to expand wildcards first
@@ -2081,9 +2085,15 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                         continue
                                     
                                     # Not a wildcard - process as normal column
-                                    # Remove newlines and tabs - if there are newlines, it's probably not a column name
-                                    if '\n' in col_expr or '\t' in col_expr or '\r' in col_expr:
-                                        continue
+                                    # Remove newlines and tabs AFTER checking for AS alias
+                                    # For CASE...END AS alias, extract alias first
+                                    if ('\n' in col_expr or '\t' in col_expr or '\r' in col_expr):
+                                        # Try to extract alias from AS clause (e.g., "CASE...END AS alias")
+                                        as_match = re.search(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$', col_expr, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                                        if as_match:
+                                            col_expr = as_match.group(1)
+                                        else:
+                                            continue
                                     # Remove AS alias if present
                                     if ' AS ' in col_expr.upper():
                                         col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
