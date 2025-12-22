@@ -408,6 +408,23 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
             if not any(o.name == obj.name for o in outputs):
                 outputs.append(obj)
     
+    # Collect UPDATE TABLE as output operation (table is modified)
+    # Pattern: UPDATE table SET ... WHERE ...
+    for m in re.finditer(r'(?is)\bUPDATE\s+([^\s,()\r\n;]+)\s+SET\b', s):
+        table_token = m.group(1).strip().rstrip(';')
+        # Skip temp tables
+        if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            continue
+        obj = _to_obj(table_token)
+        if obj:
+            logger.debug(f"_extract_materialized_output_from_procedure_string: Detected UPDATE {obj.name}")
+            # Check if this table is already in outputs (from INSERT INTO)
+            # If so, don't add it again (INSERT takes precedence as it has better lineage)
+            if not any(o.name == obj.name for o in outputs):
+                # For UPDATE, also add the table as a dependency (it reads from itself)
+                obj.dependencies = {obj.name}
+                outputs.append(obj)
+    
     logger.debug(f"_extract_materialized_output_from_procedure_string: Found {len(outputs)} outputs")
     return outputs
 

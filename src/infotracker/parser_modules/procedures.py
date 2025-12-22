@@ -639,6 +639,84 @@ def _extract_procedure_body(self, sql_content: str) -> Optional[str]:
     return None
 
 
+def _expand_wildcard_columns(self, col_expr: str, sql_text: str) -> List[str]:
+    """
+    Helper function to expand wildcard columns (table.* or *) in SELECT INTO statements.
+    
+    Args:
+        col_expr: Column expression that might be a wildcard (e.g., "offer.*" or "*")
+        sql_text: The full SQL text to extract table aliases from FROM/JOIN clauses
+    
+    Returns:
+        List of column names. If col_expr is a wildcard, returns expanded columns from source table.
+        Otherwise returns [col_expr] as-is.
+    """
+    # Remove SQL comments first
+    col_expr_clean = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+    col_expr_clean = re.sub(r'/\*.*?\*/', '', col_expr_clean, flags=re.DOTALL).strip()
+    
+    # Check if this is a wildcard pattern
+    is_wildcard = (col_expr_clean == '*' or col_expr_clean.endswith('.*'))
+    
+    if not is_wildcard:
+        return [col_expr]  # Not a wildcard, return as-is for normal processing
+    
+    # Extract table name/alias from wildcard (e.g., "offer.*" -> "offer")
+    if col_expr_clean.endswith('.*'):
+        table_alias = col_expr_clean[:-2]  # Remove ".*"
+    else:
+        # Bare "*" - need to find the first table in FROM clause
+        from_match = re.search(r'\bFROM\s+([\w.#@\[\]]+)(?:\s+(?:AS\s+)?([\w#]+))?', sql_text, re.IGNORECASE)
+        if not from_match:
+            logger.debug(f"_expand_wildcard_columns: Cannot expand bare '*' - no FROM clause found")
+            return [col_expr]  # Cannot expand, return as-is
+        
+        # Use alias if present, otherwise table name
+        table_alias = from_match.group(2) if from_match.group(2) else from_match.group(1)
+    
+    # Try to resolve alias to actual table name
+    # Look for "FROM table_name AS alias" or "FROM table_name alias"
+    table_name = None
+    
+    # Pattern: FROM table_name AS alias or FROM table_name alias
+    from_pattern = rf'\bFROM\s+([\w.#@\[\]]+)(?:\s+(?:AS\s+)?{re.escape(table_alias)}\b)'
+    from_match = re.search(from_pattern, sql_text, re.IGNORECASE)
+    if from_match:
+        table_name = from_match.group(1).strip().strip('[]')
+    else:
+        # Maybe alias IS the table name (no alias used)
+        table_name = table_alias.strip().strip('[]')
+    
+    # Clean table name
+    if table_name:
+        table_name = table_name.replace('[', '').replace(']', '')
+    
+    logger.debug(f"_expand_wildcard_columns: Expanding wildcard '{col_expr_clean}' from alias '{table_alias}' -> table '{table_name}'")
+    
+    # Get columns from temp_registry or schema_registry
+    columns = []
+    if table_name:
+        # Try temp_registry first (for temp tables)
+        simple_name = table_name.split('.')[-1]
+        if simple_name in self.temp_registry:
+            columns = self.temp_registry[simple_name]
+            logger.debug(f"_expand_wildcard_columns: Found {len(columns)} columns in temp_registry for {simple_name}")
+        else:
+            # Try _infer_table_columns_unified
+            try:
+                columns = self._infer_table_columns_unified(table_name)
+                logger.debug(f"_expand_wildcard_columns: Inferred {len(columns)} columns for {table_name}")
+            except Exception as e:
+                logger.debug(f"_expand_wildcard_columns: Failed to infer columns for {table_name}: {e}")
+    
+    if not columns:
+        logger.debug(f"_expand_wildcard_columns: Could not expand wildcard '{col_expr_clean}' - no columns found for table '{table_name}'")
+        return [col_expr]  # Cannot expand, return as-is
+    
+    logger.debug(f"_expand_wildcard_columns: Successfully expanded '{col_expr_clean}' to {len(columns)} columns")
+    return columns
+
+
 def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[str] = None, full_sql: str = "") -> ObjectInfo:
     """
     Parse procedure body statements directly (fallback when CREATE PROCEDURE fails in sqlglot).
@@ -1341,12 +1419,25 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     # Skip if empty or too short
                                     if not col_expr or len(col_expr) < 2:
                                         continue
+                                    
+                                    # Try to expand wildcards first (this handles table.* patterns)
+                                    expanded_cols = self._expand_wildcard_columns(col_expr, match.group(1))
+                                    if len(expanded_cols) > 1 or (len(expanded_cols) == 1 and expanded_cols[0] != col_expr):
+                                        # Wildcard was expanded or processed successfully
+                                        col_names.extend(expanded_cols)
+                                        continue
+                                    
+                                    # Not a wildcard - process as normal column
                                     # Remove AS alias if present
                                     if ' AS ' in col_expr.upper():
                                         col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
                                     elif ' ' in col_expr and not col_expr.startswith('['):
+                                        # Remove SQL comments first (BEFORE splitting for implicit alias)
+                                        col_expr_no_comment = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                        col_expr_no_comment = re.sub(r'/\*.*?\*/', '', col_expr_no_comment, flags=re.DOTALL).strip()
+                                        
                                         # Might be alias without AS - take last word only if it's a simple identifier
-                                        parts = col_expr.split()
+                                        parts = col_expr_no_comment.split()
                                         if len(parts) > 1:
                                             # Only use last part if it's a simple identifier (no special chars, no keywords)
                                             last_part = parts[-1].strip('[]').strip()
@@ -1355,6 +1446,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                             else:
                                                 # Skip this column - it's too complex
                                                 continue
+                                        else:
+                                            col_expr = col_expr_no_comment
                                     # Remove brackets
                                     col_expr = col_expr.strip('[]').strip()
                                     # Remove SQL comments (-- and /* */)
@@ -1506,12 +1599,25 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     # Skip if empty or too short
                                     if not col_expr or len(col_expr) < 2:
                                         continue
+                                    
+                                    # Try to expand wildcards first (this handles table.* patterns)
+                                    expanded_cols = self._expand_wildcard_columns(col_expr, select_part)
+                                    if len(expanded_cols) > 1 or (len(expanded_cols) == 1 and expanded_cols[0] != col_expr):
+                                        # Wildcard was expanded or processed successfully
+                                        col_names.extend(expanded_cols)
+                                        continue
+                                    
+                                    # Not a wildcard - process as normal column
                                     # Remove AS alias if present
                                     if ' AS ' in col_expr.upper():
                                         col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
                                     elif ' ' in col_expr and not col_expr.startswith('['):
+                                        # Remove SQL comments first (BEFORE splitting for implicit alias)
+                                        col_expr_no_comment = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE).strip()
+                                        col_expr_no_comment = re.sub(r'/\*.*?\*/', '', col_expr_no_comment, flags=re.DOTALL).strip()
+                                        
                                         # Might be alias without AS - take last word only if it's a simple identifier
-                                        parts = col_expr.split()
+                                        parts = col_expr_no_comment.split()
                                         if len(parts) > 1:
                                             # Only use last part if it's a simple identifier (no special chars, no keywords)
                                             last_part = parts[-1].strip('[]').strip()
@@ -1520,6 +1626,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                             else:
                                                 # Skip this column - it's too complex
                                                 continue
+                                        else:
+                                            col_expr = col_expr_no_comment
                                     # Remove brackets
                                     col_expr = col_expr.strip('[]').strip()
                                     # Remove SQL comments (-- and /* */)
@@ -1964,6 +2072,15 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     # Skip if empty or too short
                                     if not col_expr or len(col_expr) < 2:
                                         continue
+                                    
+                                    # Try to expand wildcards first
+                                    expanded_cols = self._expand_wildcard_columns(col_expr, stmt_sql)
+                                    if len(expanded_cols) > 1 or (len(expanded_cols) == 1 and expanded_cols[0] != col_expr):
+                                        # Wildcard was expanded or processed successfully
+                                        col_names.extend(expanded_cols)
+                                        continue
+                                    
+                                    # Not a wildcard - process as normal column
                                     # Remove newlines and tabs - if there are newlines, it's probably not a column name
                                     if '\n' in col_expr or '\t' in col_expr or '\r' in col_expr:
                                         continue
@@ -2754,6 +2871,25 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         
         return result_output
+    
+    # If no outputs found through AST parsing, try string-based materialized output extraction
+    # This fallback handles cases where sqlglot fails to parse CREATE PROCEDURE properly
+    # (e.g., when procedure has inline comments in parameter list or other T-SQL specific syntax)
+    if not all_outputs:
+        logger.debug(f"_parse_procedure_body_statements: No outputs found via AST, trying string-based materialized extraction")
+        try:
+            materialized_outputs = self._extract_materialized_output_from_procedure_string(full_sql)
+            if materialized_outputs:
+                logger.debug(f"_parse_procedure_body_statements: String extraction found {len(materialized_outputs)} materialized outputs")
+                # Use first materialized output as primary output
+                # (procedure can have multiple outputs, but we return the first one for backward compat)
+                result_output = materialized_outputs[0]
+                # Update namespace to match procedure context
+                if result_output.schema:
+                    result_output.schema.namespace = namespace
+                return result_output
+        except Exception as e:
+            logger.debug(f"_parse_procedure_body_statements: String extraction failed: {e}")
     
     # Filter out known garbage dependencies that might have leaked from comments or partial parsing
     garbage_tokens = {'previous', 'end', 'desc', 'asc', 'case', 'when', 'then', 'else', 'select', 'from', 'where', 'group', 'by', 'order', 'having', 'ca', '=', 'int', 'date', 'bit', 'datetime', 'datetime2'}

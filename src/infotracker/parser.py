@@ -838,13 +838,82 @@ class SqlParser:
         return self._infer_table_columns_unified(table_name)
     
     def _infer_table_columns_unified(self, table_name: str) -> List[str]:
-        """Unified column lookup using registry chain: temp -> cte -> schema -> fallback."""
+        """Unified column lookup using registry chain: temp -> cte -> schema -> fallback.
+        
+        IMPORTANT: This function now recursively expands wildcards (e.g., offer.*) found in temp_registry.
+        When a temp table contains wildcards like '#LeadTime_STEP1.*', this function will expand them
+        to the actual column list from #LeadTime_STEP1.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         # Clean table name for registry lookup
         simple_name = table_name.split('.')[-1]
         
         # 1. Check temp_registry first
         if simple_name in self.temp_registry:
-            return self.temp_registry[simple_name]
+            cols = self.temp_registry[simple_name]
+            # EXPAND WILDCARDS: If any column in the list is a wildcard, expand it
+            expanded_cols = []
+            seen_cols = set()
+            
+            for col in cols:
+                # Check if this is a wildcard pattern (*.* or ends with .*)
+                is_wildcard = (col == '*' or col.endswith('.*') or '*' in col)
+                
+                if is_wildcard:
+                    # Extract the table reference from wildcard (e.g., "offer.*" -> "offer")
+                    if col.endswith('.*'):
+                        # Pattern like "offer.*" or "#LeadTime_STEP1.*"
+                        wildcard_table = col[:-2]  # Remove the ".*" suffix
+                    elif col == '*':
+                        # Just "*" - can't expand without knowing source table
+                        logger.debug(f"_infer_table_columns_unified: Found bare wildcard '*' in {simple_name}, cannot expand")
+                        if col not in seen_cols:
+                            seen_cols.add(col)
+                            expanded_cols.append(col)
+                        continue
+                    else:
+                        # Other wildcard patterns - skip for now
+                        logger.debug(f"_infer_table_columns_unified: Found complex wildcard '{col}' in {simple_name}, keeping as-is")
+                        if col not in seen_cols:
+                            seen_cols.add(col)
+                            expanded_cols.append(col)
+                        continue
+                    
+                    logger.debug(f"_infer_table_columns_unified: Expanding wildcard '{col}' from {simple_name}")
+                    
+                    # Recursively get columns from the wildcard table
+                    # Avoid infinite recursion by checking if wildcard_table == simple_name
+                    if wildcard_table == simple_name or wildcard_table == table_name:
+                        logger.debug(f"_infer_table_columns_unified: Avoiding infinite recursion for {wildcard_table}")
+                        if col not in seen_cols:
+                            seen_cols.add(col)
+                            expanded_cols.append(col)
+                        continue
+                    
+                    try:
+                        # Recursively call self to get columns from wildcard table
+                        wildcard_cols = self._infer_table_columns_unified(wildcard_table)
+                        logger.debug(f"_infer_table_columns_unified: Expanded '{col}' to {len(wildcard_cols)} columns")
+                        
+                        for wc in wildcard_cols:
+                            if wc not in seen_cols:
+                                seen_cols.add(wc)
+                                expanded_cols.append(wc)
+                    except Exception as e:
+                        logger.debug(f"_infer_table_columns_unified: Failed to expand wildcard '{col}': {e}")
+                        # Keep wildcard as-is if expansion fails
+                        if col not in seen_cols:
+                            seen_cols.add(col)
+                            expanded_cols.append(col)
+                else:
+                    # Not a wildcard - add as-is
+                    if col not in seen_cols:
+                        seen_cols.add(col)
+                        expanded_cols.append(col)
+            
+            return expanded_cols
         
         # 2. Check cte_registry
         if simple_name in self.cte_registry:
@@ -867,6 +936,11 @@ class SqlParser:
         """Parse CREATE FUNCTION using string-based approach (delegated)."""
         from .parser_modules import functions as _func
         return _func._parse_function_string(self, sql_content, object_hint)
+    
+    def _expand_wildcard_columns(self, col_expr: str, sql_text: str) -> List[str]:
+        """Helper to expand wildcard columns (delegated to procedures module)."""
+        from .parser_modules import procedures as _proc
+        return _proc._expand_wildcard_columns(self, col_expr, sql_text)
     
     def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse CREATE PROCEDURE using string-based approach (delegated)."""

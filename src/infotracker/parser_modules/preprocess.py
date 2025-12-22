@@ -236,6 +236,29 @@ def _preprocess_sql(self, sql: str) -> str:
         processed_lines.append(line)
 
     processed_sql = '\n'.join(processed_lines)
+    
+    # Compress CREATE PROCEDURE parameter lists to help sqlglot parsing
+    # Problem: sqlglot doesn't handle multi-line parameter lists well
+    # Solution: compress "CREATE PROCEDURE name \n @param1, \n @param2 \n AS" 
+    #           to "CREATE PROCEDURE name @param1, @param2 AS"
+    try:
+        # Find CREATE PROCEDURE ... AS blocks and compress parameters
+        proc_pattern = r'(CREATE\s+(?:OR\s+ALTER\s+)?PROCEDURE\s+\[?[\w.]+\]?)(.*?)\s+AS\b'
+        def _compress_params(match):
+            proc_keyword = match.group(1)  # CREATE PROCEDURE name
+            params_block = match.group(2)  # everything between name and AS
+            
+            # Remove inline comments from parameter block
+            params_cleaned = re.sub(r'--.*?(\n|$)', r'\1', params_block)
+            
+            # Compress whitespace: replace multiple spaces/newlines with single space
+            params_compressed = ' '.join(params_cleaned.split())
+            
+            return f"{proc_keyword} {params_compressed} AS"
+        
+        processed_sql = re.sub(proc_pattern, _compress_params, processed_sql, flags=re.IGNORECASE | re.DOTALL)
+    except Exception:
+        pass
     processed_sql = re.sub(r'(INSERT\s+INTO\s+#\w+)\s*\n\s*(EXEC\b)', r'\1 \2', processed_sql, flags=re.IGNORECASE)
     
     # Remove TRY/CATCH blocks BEFORE cutting to first statement
