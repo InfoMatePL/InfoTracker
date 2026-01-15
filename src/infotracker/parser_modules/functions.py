@@ -21,6 +21,10 @@ def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = 
 
     # Scalar function: no lineage, empty schema
     if not self._is_table_valued_function_string(sql_content):
+        # Attempt to extract dependencies from the function body (e.g. tables used in SELECT)
+        # We use the basic string extractor which finds FROM/JOIN/etc.
+        deps = self._extract_basic_dependencies(sql_content)
+
         obj = ObjectInfo(
             name=function_name,
             object_type="function",
@@ -30,7 +34,7 @@ def _parse_function_string(self, sql_content: str, object_hint: Optional[str] = 
                 columns=[]
             ),
             lineage=[],
-            dependencies=set()
+            dependencies=deps
         )
         try:
             m = re.search(r'(?is)\bCREATE\s+FUNCTION\s+([^\s(]+)', sql_content)

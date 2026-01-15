@@ -842,11 +842,14 @@ def _is_string_function(self, expr: exp.Expression) -> bool:
 
 
 def _has_star_expansion(self, select_stmt: exp.Select) -> bool:
+    logger.debug(f"_has_star_expansion: Checking {len(select_stmt.expressions)} expressions")
     for expr in select_stmt.expressions:
         if isinstance(expr, exp.Star):
+            logger.debug(f"_has_star_expansion: Found exp.Star")
             return True
         if isinstance(expr, exp.Column):
             if str(expr.this) == "*" or str(expr).endswith(".*"):
+                logger.debug(f"_has_star_expansion: Found exp.Column star: {expr}")
                 return True
     return False
 
@@ -882,9 +885,21 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             else:
                 logger.debug(f"_handle_star_expansion: Bare * without table alias, searching for source tables in FROM")
                 source_tables = []
+                
+                # Identify target table to exclude (e.g. SELECT * INTO #target FROM source)
+                target_table_name = None
+                if hasattr(select_stmt, 'args') and 'into' in select_stmt.args:
+                    into_expr = select_stmt.args['into']
+                    if into_expr and hasattr(into_expr, 'this') and isinstance(into_expr.this, exp.Table):
+                         target_table_name = self._get_table_name(into_expr.this)
+                         logger.debug(f"_handle_star_expansion: Identified target table to exclude: {target_table_name}")
+
                 for table in select_stmt.find_all(exp.Table):
                     table_name = self._get_table_name(table)
                     if table_name != "unknown":
+                        # Exclude target table
+                        if target_table_name and table_name == target_table_name:
+                             continue
                         source_tables.append(table_name)
                 logger.debug(f"_handle_star_expansion: Found {len(source_tables)} source tables: {source_tables}")
                 for table_name in source_tables:
@@ -903,11 +918,25 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                             ns, nm = self._ns_and_name(table_name)
                             lineage.append(ColumnLineage(output_column=column_name, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=column_name)], transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
         elif isinstance(select_expr, exp.Column) and (str(select_expr.this) == "*" or str(select_expr).endswith(".*")):
+            logger.debug(f"_handle_star_expansion: Found column star: {select_expr}, table={select_expr.table}")
             if hasattr(select_expr, 'table') and select_expr.table:
                 alias = str(select_expr.table)
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
+                logger.debug(f"_handle_star_expansion: Resolved alias {alias} to {table_name}")
                 if table_name != "unknown" and not _is_join_keyword(table_name):
                     columns = self._infer_table_columns_unified(table_name)
+                    logger.debug(f"_handle_star_expansion: Inferred columns for {table_name}: {columns}")
+                    if not columns:
+                        logger.debug(f"_handle_star_expansion: No columns found for {table_name}, falling back to *")
+                        # Fallback: if no columns found, treat as single * column
+                        # This ensures we at least get the wildcard dependency
+                        if "*" not in seen_columns:
+                            seen_columns.add("*")
+                            output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                            ordinal += 1
+                            ns, nm = self._ns_and_name(table_name)
+                            lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
+                    
                     for column_name in columns:
                         if column_name not in seen_columns:
                             seen_columns.add(column_name)

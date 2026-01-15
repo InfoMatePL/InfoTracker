@@ -51,8 +51,11 @@ def _strip_db_prefix(name: str) -> str:
     # Handle canonical temp names (DB.dbo.PROC#temp)
     if "#" in name and "." in name:
         parts = name.split(".")
+        if len(parts) >= 4 and parts[-1].startswith("#"):
+            # Canonical temp: DB.dbo.PROC.#temp -> dbo.PROC#temp (no dot before #)
+            return f"{parts[-3]}.{parts[-2]}{parts[-1]}"
         if len(parts) >= 3:
-            # Return dbo.PROC#temp
+            # Return dbo.table or schema.#temp for short forms
             return ".".join(parts[-2:])
         elif len(parts) == 2:
             # Return as is (already schema.table format)

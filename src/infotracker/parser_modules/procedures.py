@@ -1598,8 +1598,8 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                 col_names = []
                                 for col_expr in re.split(r',\s*(?![^()]*\))', col_list_str):
                                     col_expr = col_expr.strip()
-                                    # Skip if empty or too short
-                                    if not col_expr or len(col_expr) < 2:
+                                    # Skip if empty or too short (unless it is a wildcard)
+                                    if not col_expr or (len(col_expr) < 2 and col_expr != '*'):
                                         continue
                                     
                                     # Try to expand wildcards first (this handles table.* patterns)
@@ -1767,10 +1767,23 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                                     for dep in qualified_deps:
                                                         try:
                                                             dep_ns, dep_name = self._ns_and_name(dep)
+                                                            
+                                                            # Try to resolve column name in dependency
+                                                            source_col = "*"
+                                                            try:
+                                                                # Use _infer_table_columns_unified to get columns for temp or perm tables
+                                                                # It handles temp_registry lookup internally
+                                                                dep_cols = self._infer_table_columns_unified(dep_name)
+                                                                
+                                                                if dep_cols and col in dep_cols:
+                                                                    source_col = col
+                                                            except Exception as e:
+                                                                pass
+                                                            
                                                             input_refs.append(ColumnReference(
                                                                 namespace=dep_ns,
                                                                 table_name=dep_name,
-                                                                column_name="*"
+                                                                column_name=source_col
                                                             ))
                                                         except Exception:
                                                             pass
@@ -2929,9 +2942,5 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     # The context will be restored when the next file is parsed (in parse_sql_file)
     logger.debug(f"_parse_procedure_body_statements: Before return, context: _ctx_db={getattr(self, '_ctx_db', None)}, _ctx_obj={getattr(self, '_ctx_obj', None)}")
     
-    for k, v in self.temp_sources.items():
-        if "previous" in str(v):
-            print(f"DEBUG: temp_sources[{k}] HAS previous: {v}")
-
     # self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
     return obj

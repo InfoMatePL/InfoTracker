@@ -82,16 +82,38 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
         except Exception:
             continue
 
-    # Heuristic: table-valued function calls may appear as Anonymous/Func in FROM/JOIN context
-    for func in select_stmt.find_all(exp.Anonymous):
+    # Heuristic: Extract function calls (TVF and Scalar)
+    # We look for Anonymous and UserDefinedFunction nodes.
+    # TVFs usually appear in FROM/JOIN. Scalar functions appear in expressions.
+    for func in select_stmt.find_all((exp.Anonymous, exp.UserDefinedFunction)):
         try:
             parent = func.parent
-            if isinstance(parent, (exp.From, exp.Join, exp.Lateral)):
-                fname = getattr(func, 'name', None)
-                if fname:
-                    low = fname.lower()
-                    if low not in {"getdate","sysdatetime","row_number","count","sum","min","max","avg","cast","convert"}:
-                        deps.add(self._get_full_table_name(fname))
+            full_name = None
+            
+            # Case 1: schema.function(...) -> Dot(Identifier, Node)
+            if isinstance(parent, exp.Dot) and parent.expression is func:
+                schema = parent.this.name
+                name = func.this if isinstance(func, exp.Anonymous) else func.name
+                full_name = f"{schema}.{name}"
+            
+            # Case 2: Unqualified function call (or TVF in FROM/JOIN)
+            elif not isinstance(parent, exp.Dot):
+                name = func.this if isinstance(func, exp.Anonymous) else func.name
+                full_name = name
+
+            if full_name:
+                low = full_name.split('.')[-1].lower()
+                # Filter common built-ins to avoid noise
+                if low not in {
+                    "getdate","sysdatetime","row_number","count","sum","min","max","avg","cast","convert", 
+                    "coalesce", "isnull", "nullif", "substring", "len", "trim", "ltrim", "rtrim", 
+                    "upper", "lower", "replace", "charindex", "patindex", "left", "right", 
+                    "abs", "round", "ceiling", "floor", "power", "sqrt", "sign", "exp", "log", "log10", 
+                    "sin", "cos", "tan", "cot", "asin", "acos", "atan", "degrees", "radians", "pi", 
+                    "rand", "newid", "isnumeric", "isdate", "dateadd", "datediff", "datename", "datepart", 
+                    "day", "month", "year", "format", "concat", "string_agg", "iif", "choose", "stdev", "var"
+                }:
+                    deps.add(self._get_full_table_name(full_name))
         except Exception:
             continue
     return deps

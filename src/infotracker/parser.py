@@ -850,6 +850,10 @@ class SqlParser:
         # Clean table name for registry lookup
         simple_name = table_name.split('.')[-1]
         
+        # Handle proc#temp format (e.g. update_stage_mis_LeadTime#LeadTime_STEP2 -> #LeadTime_STEP2)
+        if '#' in simple_name and not simple_name.startswith('#'):
+            simple_name = '#' + simple_name.split('#')[-1]
+        
         # 1. Check temp_registry first
         if simple_name in self.temp_registry:
             cols = self.temp_registry[simple_name]
@@ -867,11 +871,39 @@ class SqlParser:
                         # Pattern like "offer.*" or "#LeadTime_STEP1.*"
                         wildcard_table = col[:-2]  # Remove the ".*" suffix
                     elif col == '*':
-                        # Just "*" - can't expand without knowing source table
-                        logger.debug(f"_infer_table_columns_unified: Found bare wildcard '*' in {simple_name}, cannot expand")
-                        if col not in seen_cols:
-                            seen_cols.add(col)
-                            expanded_cols.append(col)
+                        # Just "*" - try to expand using temp_sources if available
+                        sources = self.temp_sources.get(simple_name)
+                        if sources:
+                            logger.debug(f"_infer_table_columns_unified: Expanding bare wildcard '*' in {simple_name} using sources: {sources}")
+                            expanded_any = False
+                            for source in sources:
+                                # Avoid self-reference
+                                source_simple = source.split('.')[-1]
+                                if source_simple == simple_name or f"#{source_simple}" == simple_name:
+                                    continue
+                                
+                                try:
+                                    source_cols = self._infer_table_columns_unified(source)
+                                    if source_cols:
+                                        logger.debug(f"_infer_table_columns_unified: Expanded '*' from source {source} to {len(source_cols)} columns")
+                                        for sc in source_cols:
+                                            if sc not in seen_cols:
+                                                seen_cols.add(sc)
+                                                expanded_cols.append(sc)
+                                        expanded_any = True
+                                except Exception as e:
+                                    logger.debug(f"_infer_table_columns_unified: Failed to expand source {source}: {e}")
+                            
+                            if not expanded_any:
+                                logger.debug(f"_infer_table_columns_unified: Could not expand '*' from sources, keeping as-is")
+                                if col not in seen_cols:
+                                    seen_cols.add(col)
+                                    expanded_cols.append(col)
+                        else:
+                            logger.debug(f"_infer_table_columns_unified: Found bare wildcard '*' in {simple_name} and no sources known, cannot expand")
+                            if col not in seen_cols:
+                                seen_cols.add(col)
+                                expanded_cols.append(col)
                         continue
                     else:
                         # Other wildcard patterns - skip for now
