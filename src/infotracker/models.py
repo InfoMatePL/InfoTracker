@@ -635,8 +635,7 @@ class ColumnGraph:
                                     )
                                     
                                     self.add_edge(edge)
-                                # Skip creating edge from temp table itself
-                                continue
+                                # Also keep the direct temp->output edge for continuity
                     
                     # Normalize DB prefix AFTER temp_name_map lookup
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
