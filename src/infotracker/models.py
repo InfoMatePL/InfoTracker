@@ -193,11 +193,9 @@ class ColumnNode:
     column_name: str
     
     def __post_init__(self) -> None:
-        """Normalize column_name to lowercase for SQL Server case-insensitivity."""
-        # SQL Server is case-insensitive by default, so we normalize to lowercase
-        # to ensure consistent matching across different case variants
-        if self.column_name:
-            self.column_name = self.column_name.lower()
+        """Preserve column_name casing; comparisons are case-insensitive elsewhere."""
+        # Keep original casing for display/output, while hash/eq and graph keys
+        # still use lowercase for SQL Server case-insensitive matching.
     
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
