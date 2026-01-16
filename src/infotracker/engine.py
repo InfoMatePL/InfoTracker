@@ -725,6 +725,39 @@ class Engine:
                                     # If this reference points to the same temp table, update it to new format
                                     should_normalize = False
                                     ref_table = ref.table_name
+                                    # Upgrade temp-source wildcard references to concrete column names when possible
+                                    if ref.column_name == "*" and ref_table and "#" in ref_table:
+                                        try:
+                                            temp_simple = parser._extract_temp_name(ref_table)
+                                            if temp_simple:
+                                                temp_key = temp_simple if temp_simple.startswith('#') else f"#{temp_simple}"
+                                                temp_cols = None
+                                                # Prefer per-file temp registry (most accurate for this procedure)
+                                                if file_temp_registry:
+                                                    temp_cols = file_temp_registry.get(temp_key)
+                                                    if not temp_cols:
+                                                        # Try versioned temp keys (e.g., #tmp@1)
+                                                        for k, v in file_temp_registry.items():
+                                                            if k.startswith(f"{temp_key}@"):
+                                                                temp_cols = v
+                                                                break
+                                                # Fallback to global saved temp registry using owner prefix
+                                                if not temp_cols:
+                                                    prefixed_key = f"{owner}::{temp_key}"
+                                                    temp_cols = (global_saved_temp_registry.get(prefixed_key) or
+                                                                 global_saved_temp_registry.get(f"{prefixed_key}@1"))
+                                                if temp_cols:
+                                                    if col.name in temp_cols:
+                                                        ref = ColumnReference(
+                                                            namespace=ref.namespace,
+                                                            table_name=ref.table_name,
+                                                            column_name=col.name,
+                                                        )
+                                                    else:
+                                                        # Output column not present in source temp table; drop wildcard ref
+                                                        continue
+                                        except Exception:
+                                            pass
                                     if ref_table and '#' in ref_table:
                                         # Check if ref.table_name matches any old format in temp_name_map
                                         # Try different variants: with DB prefix, without DB prefix, with schema, without schema
