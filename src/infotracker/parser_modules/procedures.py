@@ -104,7 +104,7 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                         if self._is_select_into(node):
                             select_into_count += 1
                             logger.debug(f"_parse_procedure_body_statements: Found SELECT INTO node #{select_into_count}: {node_type}")
-                        self._parse_select_into(node, object_hint)
+                            self._parse_select_into(node, object_hint)
                     # Nested INSERT INTO #tmp SELECT ... inside CREATE PROCEDURE body
                     elif isinstance(node, exp.Insert):
                         try:
@@ -360,11 +360,40 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                                     select_match = _re2.search(r'(?is)SELECT\s+((?:(?!INTO).)+)\s+INTO', raw_seg)
                                     if select_match:
                                         select_list = select_match.group(1)
-                                        # Simple column extraction - take aliases or column names
+                                        # Robust column extraction - handle aliases and qualified names
                                         cols = []
-                                        for col_match in _re2.finditer(r'(\w+)(?:\s+AS\s+(\w+))?', select_list):
-                                            alias = col_match.group(2) or col_match.group(1)
-                                            cols.append(alias)
+                                        seen = set()
+
+                                        def _extract_simple_col(expr: str) -> Optional[str]:
+                                            expr = _re2.sub(r'--.*$', '', expr, flags=_re2.MULTILINE).strip()
+                                            expr = _re2.sub(r'/\*.*?\*/', '', expr, flags=_re2.DOTALL).strip()
+                                            if not expr:
+                                                return None
+                                            if expr == "*" or expr.endswith(".*"):
+                                                return "*"
+                                            upper = expr.upper()
+                                            if " AS " in upper:
+                                                expr = expr.rsplit(" AS ", 1)[-1].strip()
+                                            else:
+                                                parts = expr.split()
+                                                if len(parts) > 1:
+                                                    expr = parts[-1].strip()
+                                            expr = expr.strip('[]').strip()
+                                            if _re2.match(r'^[\w\[\]]+\.[\w\[\]]+$', expr):
+                                                expr = expr.split('.')[-1].strip('[]').strip()
+                                            if not _re2.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
+                                                return None
+                                            return expr
+
+                                        for col_expr in _re2.split(r',\s*(?![^()]*\))', select_list):
+                                            col_name = _extract_simple_col(col_expr)
+                                            if not col_name:
+                                                continue
+                                            key = col_name.lower()
+                                            if key in seen:
+                                                continue
+                                            seen.add(key)
+                                            cols.append(col_name)
                                         if cols:
                                             self.temp_registry[tkey] = cols
                     except Exception as e:
@@ -403,9 +432,38 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                                     if insert_match:
                                         select_list = insert_match.group(1)
                                         cols = []
-                                        for col_match in _re2.finditer(r'(\w+)(?:\s+AS\s+(\w+))?', select_list):
-                                            alias = col_match.group(2) or col_match.group(1)
-                                            cols.append(alias)
+                                        seen = set()
+
+                                        def _extract_simple_col(expr: str) -> Optional[str]:
+                                            expr = _re2.sub(r'--.*$', '', expr, flags=_re2.MULTILINE).strip()
+                                            expr = _re2.sub(r'/\*.*?\*/', '', expr, flags=_re2.DOTALL).strip()
+                                            if not expr:
+                                                return None
+                                            if expr == "*" or expr.endswith(".*"):
+                                                return "*"
+                                            upper = expr.upper()
+                                            if " AS " in upper:
+                                                expr = expr.rsplit(" AS ", 1)[-1].strip()
+                                            else:
+                                                parts = expr.split()
+                                                if len(parts) > 1:
+                                                    expr = parts[-1].strip()
+                                            expr = expr.strip('[]').strip()
+                                            if _re2.match(r'^[\w\[\]]+\.[\w\[\]]+$', expr):
+                                                expr = expr.split('.')[-1].strip('[]').strip()
+                                            if not _re2.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
+                                                return None
+                                            return expr
+
+                                        for col_expr in _re2.split(r',\s*(?![^()]*\))', select_list):
+                                            col_name = _extract_simple_col(col_expr)
+                                            if not col_name:
+                                                continue
+                                            key = col_name.lower()
+                                            if key in seen:
+                                                continue
+                                            seen.add(key)
+                                            cols.append(col_name)
                                         if cols:
                                             self.temp_registry[tkey] = cols
                     except Exception as e:
@@ -710,9 +768,26 @@ def _expand_wildcard_columns(self, col_expr: str, sql_text: str) -> List[str]:
             except Exception as e:
                 logger.debug(f"_expand_wildcard_columns: Failed to infer columns for {table_name}: {e}")
     
+    def _is_placeholder_list(cols: List[str]) -> bool:
+        if not cols:
+            return True
+        lowered = [str(c).lower() for c in cols if c]
+        if not lowered:
+            return True
+        if len(lowered) == 1 and lowered[0] == "*":
+            return True
+        return all(c.startswith("unknown_") for c in lowered)
+
     if not columns:
         logger.debug(f"_expand_wildcard_columns: Could not expand wildcard '{col_expr_clean}' - no columns found for table '{table_name}'")
         return [col_expr]  # Cannot expand, return as-is
+
+    # For qualified star (table.*), keep wildcard for temp sources or placeholder schemas
+    if col_expr_clean.endswith('.*'):
+        simple_table = table_name.split('.')[-1] if table_name else ""
+        if (simple_table.startswith('#')) or _is_placeholder_list(columns):
+            logger.debug(f"_expand_wildcard_columns: Keeping wildcard for qualified star '{col_expr_clean}' (temp or placeholder columns)")
+            return ["*"]
     
     logger.debug(f"_expand_wildcard_columns: Successfully expanded '{col_expr_clean}' to {len(columns)} columns")
     return columns
@@ -2080,68 +2155,118 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
 
                                 col_list_str = select_into_match.group(1)
                                 col_names = []
-                                for col_expr in re.split(r',\s*(?![^()]*\))', col_list_str):
-                                    # Remove SQL comments (-- and /* */) FIRST
-                                    col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE)
-                                    col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL)
-                                    
-                                    col_expr = col_expr.strip()
-                                    # Skip if empty, but allow single-character wildcards like '*'
-                                    if not col_expr or (len(col_expr) < 2 and col_expr != '*'):
-                                        continue
-                                    
-                                    # Try to expand wildcards first
-                                    expanded_cols = self._expand_wildcard_columns(col_expr, stmt_sql)
-                                    if len(expanded_cols) > 1 or (len(expanded_cols) == 1 and expanded_cols[0] != col_expr):
-                                        # Wildcard was expanded or processed successfully
-                                        col_names.extend(expanded_cols)
-                                        continue
-                                    
-                                    # Not a wildcard - process as normal column
-                                    # Remove newlines and tabs AFTER checking for AS alias
-                                    # For CASE...END AS alias, extract alias first
-                                    if ('\n' in col_expr or '\t' in col_expr or '\r' in col_expr):
-                                        # Try to extract alias from AS clause (e.g., "CASE...END AS alias")
-                                        as_match = re.search(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$', col_expr, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-                                        if as_match:
-                                            col_expr = as_match.group(1)
-                                        else:
-                                            continue
-                                    # Remove AS alias if present
-                                    if ' AS ' in col_expr.upper():
-                                        col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
-                                    elif ' ' in col_expr and not col_expr.startswith('['):
-                                        # Might be alias without AS - take last word only if it's a simple identifier
-                                        parts = col_expr.split()
-                                        if len(parts) > 1:
-                                            # Only use last part if it's a simple identifier (no special chars, no keywords)
-                                            last_part = parts[-1].strip('[]').strip()
-                                            if last_part and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_part) and len(last_part) >= 2:
-                                                col_expr = last_part
-                                            else:
-                                                # Skip this column - it's too complex
+                                used_sqlglot = False
+                                # Try sqlglot-based projection extraction first (handles complex CASE/COALESCE)
+                                try:
+                                    def _extract_full_select_segment(sql_text: str, temp: str) -> str | None:
+                                        for m_full in re.finditer(r'(?is)\bINTO\s+(#\w+)\b', sql_text):
+                                            if m_full.group(1).lower() != temp.lower():
                                                 continue
-                                    col_expr = col_expr.strip('[]').strip()
-                                    # Remove leading/trailing invalid characters
-                                    col_expr = col_expr.strip('[]').strip()
-                                    # Remove patterns like "abl.[column" -> "column"
-                                    if '.' in col_expr and '[' in col_expr:
-                                        parts = col_expr.split('.')
-                                        col_expr = parts[-1].strip('[]').strip()
-                                    # Validate: must be a valid column name (not SQL expression)
-                                    # Must be a simple identifier (letters, numbers, underscore only)
-                                    if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
-                                       re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', col_expr) and \
-                                       not col_expr.upper().startswith('SELECT') and \
-                                       not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS', 'GROUP', 'BY', 'ORDER', 'HAVING']) and \
-                                       col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING'] and \
-                                       not col_expr.startswith('(') and not col_expr.endswith(')') and \
-                                       not col_expr.endswith('--') and not col_expr.startswith('['):
-                                        col_names.append(col_expr)
-                                
+                                            into_pos_full = m_full.start()
+                                            window_start_full = max(0, into_pos_full - 12000)
+                                            window_full = sql_text[window_start_full:into_pos_full]
+                                            select_idx_full = window_full.lower().rfind('select')
+                                            if select_idx_full == -1:
+                                                continue
+                                            stmt_start_full = window_start_full + select_idx_full
+                                            tail_full = sql_text[into_pos_full:]
+                                            end_full = None
+                                            boundary_full = re.search(r'(?im)^\s*(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|BEGIN|END|GO)\b', tail_full)
+                                            if boundary_full:
+                                                end_full = into_pos_full + boundary_full.start()
+                                            semi_full = tail_full.find(';')
+                                            if semi_full != -1:
+                                                end_full = min(end_full, into_pos_full + semi_full + 1) if end_full else into_pos_full + semi_full + 1
+                                            if end_full is None:
+                                                end_full = min(len(sql_text), into_pos_full + 12000)
+                                            return sql_text[stmt_start_full:end_full]
+                                        return None
+
+                                    stmt_for_sqlglot = _extract_full_select_segment(preprocessed_body, temp_name) or stmt_sql
+                                    clean_stmt_sql = re.sub(r'--.*$', '', stmt_for_sqlglot, flags=re.MULTILINE)
+                                    clean_stmt_sql = re.sub(r'/\*.*?\*/', '', clean_stmt_sql, flags=re.DOTALL)
+                                    parsed_select = sqlglot.parse_one(clean_stmt_sql, read=self.dialect)
+                                    if isinstance(parsed_select, exp.With) and isinstance(parsed_select.this, exp.Select):
+                                        parsed_select = parsed_select.this
+                                    if isinstance(parsed_select, exp.Select):
+                                        _lineage, _out_cols = self._extract_column_lineage(parsed_select, temp_name)
+                                        if _out_cols:
+                                            col_names = [c.name for c in _out_cols if c and c.name]
+                                            used_sqlglot = True
+                                except Exception:
+                                    col_names = []
                                 if col_names:
-                                    self.temp_registry[temp_name] = col_names
-                                    logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SELECT ... INTO fallback (chunk exception): {col_names[:5]}")
+                                    existing_cols = self.temp_registry.get(temp_name)
+                                    if not existing_cols or len(existing_cols) < len(col_names):
+                                        self.temp_registry[temp_name] = col_names
+                                        logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from sqlglot SELECT ... INTO (chunk exception): {col_names[:5]}")
+                                else:
+                                    col_names = []
+                                if not used_sqlglot:
+                                    for col_expr in re.split(r',\s*(?![^()]*\))', col_list_str):
+                                        # Remove SQL comments (-- and /* */) FIRST
+                                        col_expr = re.sub(r'--.*$', '', col_expr, flags=re.MULTILINE)
+                                        col_expr = re.sub(r'/\*.*?\*/', '', col_expr, flags=re.DOTALL)
+                                        
+                                        col_expr = col_expr.strip()
+                                        # Skip if empty, but allow single-character wildcards like '*'
+                                        if not col_expr or (len(col_expr) < 2 and col_expr != '*'):
+                                            continue
+                                        
+                                        # Try to expand wildcards first
+                                        expanded_cols = self._expand_wildcard_columns(col_expr, stmt_sql)
+                                        if len(expanded_cols) > 1 or (len(expanded_cols) == 1 and expanded_cols[0] != col_expr):
+                                            # Wildcard was expanded or processed successfully
+                                            col_names.extend(expanded_cols)
+                                            continue
+                                        
+                                        # Not a wildcard - process as normal column
+                                        # Remove newlines and tabs AFTER checking for AS alias
+                                        # For CASE...END AS alias, extract alias first
+                                        if ('\n' in col_expr or '\t' in col_expr or '\r' in col_expr):
+                                            # Try to extract alias from AS clause (e.g., "CASE...END AS alias")
+                                            as_match = re.search(r'\bAS\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*$', col_expr, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                                            if as_match:
+                                                col_expr = as_match.group(1)
+                                            else:
+                                                continue
+                                        # Remove AS alias if present
+                                        if ' AS ' in col_expr.upper():
+                                            col_expr = col_expr.rsplit(' AS ', 1)[-1].strip()
+                                        elif ' ' in col_expr and not col_expr.startswith('['):
+                                            # Might be alias without AS - take last word only if it's a simple identifier
+                                            parts = col_expr.split()
+                                            if len(parts) > 1:
+                                                # Only use last part if it's a simple identifier (no special chars, no keywords)
+                                                last_part = parts[-1].strip('[]').strip()
+                                                if last_part and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', last_part) and len(last_part) >= 2:
+                                                    col_expr = last_part
+                                                else:
+                                                    # Skip this column - it's too complex
+                                                    continue
+                                        col_expr = col_expr.strip('[]').strip()
+                                        # Remove leading/trailing invalid characters
+                                        col_expr = col_expr.strip('[]').strip()
+                                        # Remove patterns like "abl.[column" -> "column"
+                                        if '.' in col_expr and '[' in col_expr:
+                                            parts = col_expr.split('.')
+                                            col_expr = parts[-1].strip('[]').strip()
+                                        # Validate: must be a valid column name (not SQL expression)
+                                        # Must be a simple identifier (letters, numbers, underscore only)
+                                        if col_expr and len(col_expr) >= 2 and len(col_expr) < 100 and \
+                                           re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', col_expr) and \
+                                           not col_expr.upper().startswith('SELECT') and \
+                                           not any(keyword in col_expr.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS', 'GROUP', 'BY', 'ORDER', 'HAVING']) and \
+                                           col_expr not in [')', '(', 'INSERT', 'SELECT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING'] and \
+                                           not col_expr.startswith('(') and not col_expr.endswith(')') and \
+                                           not col_expr.endswith('--') and not col_expr.startswith('['):
+                                            col_names.append(col_expr)
+                                    
+                                    if col_names:
+                                        existing_cols = self.temp_registry.get(temp_name)
+                                        if not existing_cols or len(existing_cols) < len(col_names):
+                                            self.temp_registry[temp_name] = col_names
+                                            logger.debug(f"_parse_procedure_body_statements: Registered {temp_name} in temp_registry with {len(col_names)} columns from SELECT ... INTO fallback (chunk exception): {col_names[:5]}")
                                     
                                     # Extract dependencies from FROM and JOIN clauses (chunk exception fallback)
                                     deps_from_sql: Set[str] = set()
@@ -2178,6 +2303,55 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                     except Exception as fallback_error:
                         logger.debug(f"_parse_procedure_body_statements: Failed to register temp table from chunk exception fallback: {fallback_error}")
                 continue
+
+        # Post-pass: repair placeholder temp schemas using full SELECT INTO segments
+        try:
+            for m_fix in re.finditer(r'(?is)\bINTO\s+(#\w+)\b', preprocessed_body):
+                temp_name = m_fix.group(1)
+                current_cols = self.temp_registry.get(temp_name, [])
+                current_lower = [str(c).lower() for c in current_cols if c]
+                needs_fix = (
+                    not current_cols or
+                    (len(current_lower) == 1 and current_lower[0] == "*") or
+                    (current_lower and all(c.startswith("unknown_") for c in current_lower))
+                )
+                if not needs_fix:
+                    continue
+
+                # Extract full SELECT ... INTO segment around this temp
+                into_pos_fix = m_fix.start()
+                window_start_fix = max(0, into_pos_fix - 12000)
+                window_fix = preprocessed_body[window_start_fix:into_pos_fix]
+                select_idx_fix = window_fix.lower().rfind('select')
+                if select_idx_fix == -1:
+                    continue
+                stmt_start_fix = window_start_fix + select_idx_fix
+                tail_fix = preprocessed_body[into_pos_fix:]
+                end_fix = None
+                boundary_fix = re.search(r'(?im)^\s*(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|BEGIN|END|GO)\b', tail_fix)
+                if boundary_fix:
+                    end_fix = into_pos_fix + boundary_fix.start()
+                semi_fix = tail_fix.find(';')
+                if semi_fix != -1:
+                    end_fix = min(end_fix, into_pos_fix + semi_fix + 1) if end_fix else into_pos_fix + semi_fix + 1
+                if end_fix is None:
+                    end_fix = min(len(preprocessed_body), into_pos_fix + 12000)
+                stmt_fix = preprocessed_body[stmt_start_fix:end_fix]
+
+                clean_stmt_fix = re.sub(r'--.*$', '', stmt_fix, flags=re.MULTILINE)
+                clean_stmt_fix = re.sub(r'/\*.*?\*/', '', clean_stmt_fix, flags=re.DOTALL)
+                parsed_fix = sqlglot.parse_one(clean_stmt_fix, read=self.dialect)
+                if isinstance(parsed_fix, exp.With) and isinstance(parsed_fix.this, exp.Select):
+                    parsed_fix = parsed_fix.this
+                if isinstance(parsed_fix, exp.Select):
+                    _lineage_fix, _out_cols_fix = self._extract_column_lineage(parsed_fix, temp_name)
+                    if _out_cols_fix:
+                        new_cols = [c.name for c in _out_cols_fix if c and c.name]
+                        if new_cols and (not current_cols or len(new_cols) > len(current_cols)):
+                            self.temp_registry[temp_name] = new_cols
+                            logger.debug(f"_parse_procedure_body_statements: Repaired temp_registry for {temp_name} with {len(new_cols)} columns in post-pass")
+        except Exception:
+            pass
     except Exception as e:
         logger.debug(f"_parse_procedure_body_statements: Exception during parsing: {e}")
         statements = []

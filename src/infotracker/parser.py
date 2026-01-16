@@ -463,7 +463,13 @@ class SqlParser:
                         return self._parse_create_procedure(st, object_hint)
                 except Exception as e:
                     logger.debug(f"parse_sql_file: AST parsing failed for procedure: {e}")
-                # AST failed - try extracting procedure body and parsing statements directly
+                # AST failed - prefer full procedure string parser to preserve temp lineage
+                try:
+                    logger.debug(f"parse_sql_file: Falling back to _parse_procedure_string")
+                    return self._parse_procedure_string(sql_content, object_hint)
+                except Exception as e:
+                    logger.debug(f"parse_sql_file: _parse_procedure_string failed: {e}")
+                # Last resort: extract procedure body and parse statements directly
                 try:
                     body_sql = self._extract_procedure_body(sql_content)
                     if body_sql:
@@ -473,8 +479,6 @@ class SqlParser:
                         return result
                 except Exception as e:
                     logger.debug(f"parse_sql_file: _parse_procedure_body_statements failed: {e}")
-                logger.debug(f"parse_sql_file: Falling back to _parse_procedure_string")
-                return self._parse_procedure_string(sql_content, object_hint)
             
             # If it's multiple functions but no procedures, process the first function as primary
             # This handles files like 94_fn_customer_orders_tvf.sql with multiple function variants
@@ -927,6 +931,14 @@ class SqlParser:
                     try:
                         # Recursively call self to get columns from wildcard table
                         wildcard_cols = self._infer_table_columns_unified(wildcard_table)
+                        lowered = [str(c).lower() for c in (wildcard_cols or []) if c]
+                        if not lowered or (len(lowered) == 1 and lowered[0] == "*") or all(c.startswith("unknown_") for c in lowered):
+                            logger.debug(f"_infer_table_columns_unified: Wildcard '{col}' expansion yielded placeholders, keeping as-is")
+                            if col not in seen_cols:
+                                seen_cols.add(col)
+                                expanded_cols.append(col)
+                            continue
+
                         logger.debug(f"_infer_table_columns_unified: Expanded '{col}' to {len(wildcard_cols)} columns")
                         
                         for wc in wildcard_cols:

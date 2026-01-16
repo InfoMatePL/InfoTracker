@@ -858,6 +858,26 @@ def _has_union(self, stmt: exp.Expression) -> bool:
     return isinstance(stmt, exp.Union) or len(list(stmt.find_all(exp.Union))) > 0
 
 
+def _is_placeholder_cols(columns: list) -> bool:
+    if not columns:
+        return True
+    lowered = [str(c).lower() for c in columns if c]
+    if not lowered:
+        return True
+    if len(lowered) == 1 and lowered[0] == "*":
+        return True
+    return all(c.startswith("unknown_") for c in lowered)
+
+
+def _is_temp_source(table_name: str, temp_registry: dict) -> bool:
+    if not table_name:
+        return False
+    if "#" in str(table_name):
+        return True
+    simple = str(table_name).split(".")[-1]
+    return simple in temp_registry or f"#{simple}" in temp_registry
+
+
 def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
     lineage = []
     output_columns = []
@@ -874,7 +894,43 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                 alias = str(select_expr.table)
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
                 if table_name != "unknown" and not _is_join_keyword(table_name):
+                    if _is_temp_source(table_name, self.temp_registry):
+                        temp_cols = []
+                        try:
+                            simple = str(table_name).split('.')[-1]
+                            temp_cols = self.temp_registry.get(simple) or self.temp_registry.get(f"#{simple}") or []
+                        except Exception:
+                            temp_cols = []
+                        if temp_cols and not _is_placeholder_cols(temp_cols):
+                            for column_name in temp_cols:
+                                if not column_name:
+                                    continue
+                                col_str = str(column_name)
+                                if col_str == "*" or col_str.lower().startswith("unknown_"):
+                                    continue
+                                if col_str not in seen_columns:
+                                    seen_columns.add(col_str)
+                                    output_columns.append(ColumnSchema(name=col_str, data_type="unknown", nullable=True, ordinal=ordinal))
+                                    ordinal += 1
+                                    ns, nm = self._ns_and_name(table_name)
+                                    lineage.append(ColumnLineage(output_column=col_str, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=col_str)], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
+                            continue
+                        if "*" not in seen_columns:
+                            seen_columns.add("*")
+                            output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                            ordinal += 1
+                            ns, nm = self._ns_and_name(table_name)
+                            lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
+                        continue
                     columns = self._infer_table_columns_unified(table_name)
+                    if _is_placeholder_cols(columns):
+                        if "*" not in seen_columns:
+                            seen_columns.add("*")
+                            output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                            ordinal += 1
+                            ns, nm = self._ns_and_name(table_name)
+                            lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
+                        continue
                     for column_name in columns:
                         if column_name not in seen_columns:
                             seen_columns.add(column_name)
@@ -894,6 +950,7 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                          target_table_name = self._get_table_name(into_expr.this)
                          logger.debug(f"_handle_star_expansion: Identified target table to exclude: {target_table_name}")
 
+                temp_sources = []
                 for table in select_stmt.find_all(exp.Table):
                     table_name = self._get_table_name(table)
                     if table_name != "unknown":
@@ -901,14 +958,88 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                         if target_table_name and table_name == target_table_name:
                              continue
                         source_tables.append(table_name)
+                        is_temp_table = False
+                        try:
+                            ident = table.args.get("this")
+                            if hasattr(ident, "args") and ident.args.get("temporary"):
+                                is_temp_table = True
+                        except Exception:
+                            pass
+                        if is_temp_table or _is_temp_source(table_name, self.temp_registry):
+                            temp_sources.append(table_name)
                 logger.debug(f"_handle_star_expansion: Found {len(source_tables)} source tables: {source_tables}")
+                if temp_sources:
+                    temp_table = temp_sources[0]
+                    temp_cols = []
+                    try:
+                        simple = str(temp_table).split('.')[-1]
+                        temp_cols = self.temp_registry.get(simple) or self.temp_registry.get(f"#{simple}") or []
+                    except Exception:
+                        temp_cols = []
+                    if temp_cols and not _is_placeholder_cols(temp_cols):
+                        for column_name in temp_cols:
+                            if not column_name:
+                                continue
+                            col_str = str(column_name)
+                            if col_str == "*" or col_str.lower().startswith("unknown_"):
+                                continue
+                            if col_str not in seen_columns:
+                                seen_columns.add(col_str)
+                                output_columns.append(ColumnSchema(name=col_str, data_type="unknown", nullable=True, ordinal=ordinal))
+                                ordinal += 1
+                                ns, nm = self._ns_and_name(temp_table)
+                                lineage.append(ColumnLineage(output_column=col_str, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=col_str)], transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+                        continue
+                    if "*" not in seen_columns:
+                        seen_columns.add("*")
+                        output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                        ordinal += 1
+                        ns, nm = self._ns_and_name(temp_table)
+                        lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+                    continue
                 for table_name in source_tables:
                     # Skip JOIN keywords that should not be table names
                     if _is_join_keyword(table_name):
                         logger.debug(f"_handle_star_expansion: Skipping JOIN keyword: {table_name}")
                         continue
+                    if _is_temp_source(table_name, self.temp_registry):
+                        temp_cols = []
+                        try:
+                            simple = str(table_name).split('.')[-1]
+                            temp_cols = self.temp_registry.get(simple) or self.temp_registry.get(f"#{simple}") or []
+                        except Exception:
+                            temp_cols = []
+                        if temp_cols and not _is_placeholder_cols(temp_cols):
+                            for column_name in temp_cols:
+                                if not column_name:
+                                    continue
+                                col_str = str(column_name)
+                                if col_str == "*" or col_str.lower().startswith("unknown_"):
+                                    continue
+                                if col_str not in seen_columns:
+                                    seen_columns.add(col_str)
+                                    output_columns.append(ColumnSchema(name=col_str, data_type="unknown", nullable=True, ordinal=ordinal))
+                                    ordinal += 1
+                                    ns, nm = self._ns_and_name(table_name)
+                                    lineage.append(ColumnLineage(output_column=col_str, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=col_str)], transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+                            continue
+                        if "*" not in seen_columns:
+                            seen_columns.add("*")
+                            output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                            ordinal += 1
+                            ns, nm = self._ns_and_name(table_name)
+                            lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+                        continue
                     logger.debug(f"_handle_star_expansion: Getting columns for table: {table_name}")
                     columns = self._infer_table_columns_unified(table_name)
+                    if _is_placeholder_cols(columns):
+                        if "*" not in seen_columns:
+                            seen_columns.add("*")
+                            output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                            ordinal += 1
+                            ns, nm = self._ns_and_name(table_name)
+                            lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+                        continue
                     logger.debug(f"_handle_star_expansion: Got {len(columns)} columns from {table_name}")
                     for column_name in columns:
                         if column_name not in seen_columns:
@@ -924,9 +1055,37 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
                 logger.debug(f"_handle_star_expansion: Resolved alias {alias} to {table_name}")
                 if table_name != "unknown" and not _is_join_keyword(table_name):
+                    if _is_temp_source(table_name, self.temp_registry):
+                        temp_cols = []
+                        try:
+                            simple = str(table_name).split('.')[-1]
+                            temp_cols = self.temp_registry.get(simple) or self.temp_registry.get(f"#{simple}") or []
+                        except Exception:
+                            temp_cols = []
+                        if temp_cols and not _is_placeholder_cols(temp_cols):
+                            for column_name in temp_cols:
+                                if not column_name:
+                                    continue
+                                col_str = str(column_name)
+                                if col_str == "*" or col_str.lower().startswith("unknown_"):
+                                    continue
+                                if col_str not in seen_columns:
+                                    seen_columns.add(col_str)
+                                    output_columns.append(ColumnSchema(name=col_str, data_type="unknown", nullable=True, ordinal=ordinal))
+                                    ordinal += 1
+                                    ns, nm = self._ns_and_name(table_name)
+                                    lineage.append(ColumnLineage(output_column=col_str, input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name=col_str)], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
+                            continue
+                        if "*" not in seen_columns:
+                            seen_columns.add("*")
+                            output_columns.append(ColumnSchema(name="*", data_type="unknown", nullable=True, ordinal=ordinal))
+                            ordinal += 1
+                            ns, nm = self._ns_and_name(table_name)
+                            lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
+                        continue
                     columns = self._infer_table_columns_unified(table_name)
                     logger.debug(f"_handle_star_expansion: Inferred columns for {table_name}: {columns}")
-                    if not columns:
+                    if _is_placeholder_cols(columns):
                         logger.debug(f"_handle_star_expansion: No columns found for {table_name}, falling back to *")
                         # Fallback: if no columns found, treat as single * column
                         # This ensures we at least get the wildcard dependency
@@ -936,7 +1095,8 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                             ordinal += 1
                             ns, nm = self._ns_and_name(table_name)
                             lineage.append(ColumnLineage(output_column="*", input_fields=[ColumnReference(namespace=ns, table_name=nm, column_name="*")], transformation_type=TransformationType.IDENTITY, transformation_description=f"{alias}.*"))
-                    
+                        continue
+
                     for column_name in columns:
                         if column_name not in seen_columns:
                             seen_columns.add(column_name)

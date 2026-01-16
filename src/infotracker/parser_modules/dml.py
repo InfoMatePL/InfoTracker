@@ -6,6 +6,40 @@ from sqlglot import expressions as exp
 from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage, ColumnReference, TransformationType
 
 
+def _is_placeholder_cols(cols: List[str]) -> bool:
+    if not cols:
+        return True
+    lowered = [str(c).lower() for c in cols if c]
+    if not lowered:
+        return True
+    if len(lowered) == 1 and lowered[0] == "*":
+        return True
+    return all(c.startswith("unknown_") for c in lowered)
+
+
+def _should_update_temp_cols(existing: Optional[List[str]], new_cols: List[str]) -> bool:
+    if not new_cols:
+        return False
+    if not existing:
+        return True
+    existing_lower = [str(c).lower() for c in existing if c]
+    new_lower = [str(c).lower() for c in new_cols if c]
+    new_placeholder = _is_placeholder_cols(new_cols)
+    existing_placeholder = _is_placeholder_cols(existing)
+    if existing_placeholder and new_placeholder:
+        if new_lower == ["*"] and existing_lower and all(c.startswith("unknown_") for c in existing_lower):
+            return True
+        if existing_lower == ["*"] and new_lower and all(c.startswith("unknown_") for c in new_lower):
+            return False
+    if existing_placeholder and not new_placeholder:
+        return True
+    if not new_placeholder and len(new_cols) > len(existing):
+        return True
+    if existing_placeholder and new_placeholder and len(new_cols) > len(existing):
+        return True
+    return False
+
+
 def _is_select_into(self, statement: exp.Select) -> bool:
     return statement.args.get('into') is not None
 
@@ -133,6 +167,319 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     if not output_columns:
         logger.debug(f"_parse_select_into: No columns extracted for {table_name}, defaulting to '*'")
         output_columns = [ColumnSchema(name="*", data_type="unknown", ordinal=0, nullable=True)]
+
+    # If SELECT has star expansion but only placeholder columns, keep wildcard instead of unknown_*
+    try:
+        has_star = isinstance(select_stmt, exp.Select) and self._has_star_expansion(select_stmt)
+        col_names = [str(c.name) for c in (output_columns or []) if c and c.name]
+        if has_star and _is_placeholder_cols(col_names) and "*" not in col_names:
+            star_refs: List[ColumnReference] = []
+            for select_expr in select_stmt.expressions:
+                is_star = isinstance(select_expr, exp.Star)
+                is_col_star = isinstance(select_expr, exp.Column) and (str(select_expr.this) == "*" or str(select_expr).endswith(".*"))
+                if not (is_star or is_col_star):
+                    continue
+                alias = str(select_expr.table) if hasattr(select_expr, 'table') and select_expr.table else None
+                if alias:
+                    table_name_star = self._resolve_table_from_alias(alias, select_stmt)
+                    if table_name_star and table_name_star != "unknown":
+                        ns, nm = self._ns_and_name(table_name_star)
+                        star_refs.append(ColumnReference(namespace=ns, table_name=nm, column_name="*"))
+                else:
+                    for tbl in select_stmt.find_all(exp.Table):
+                        table_name_star = self._get_table_name(tbl)
+                        if table_name_star and table_name_star != "unknown":
+                            ns, nm = self._ns_and_name(table_name_star)
+                            star_refs.append(ColumnReference(namespace=ns, table_name=nm, column_name="*"))
+            if star_refs:
+                seen = set()
+                dedup_refs = []
+                for ref in star_refs:
+                    key = (ref.namespace, ref.table_name, ref.column_name)
+                    if key not in seen:
+                        seen.add(key)
+                        dedup_refs.append(ref)
+                lineage = [ColumnLineage(output_column="*", input_fields=dedup_refs, transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *")]
+            output_columns = [ColumnSchema(name="*", data_type="unknown", ordinal=0, nullable=True)]
+    except Exception:
+        pass
+
+    # If temp target uses qualified star (table.*), keep wildcard instead of expanding columns
+    try:
+        raw_target_str = str(raw_target) if raw_target is not None else ""
+        is_temp_target = bool(is_temp or (raw_target_str and (raw_target_str.startswith('#') or '#' in raw_target_str or 'tempdb' in raw_target_str.lower())))
+        if is_temp_target and isinstance(select_stmt, exp.Select):
+            from ..parser_modules import select_lineage as _sl
+            qualified_star_exprs = []
+            non_star_exprs = []
+            for expr in (select_stmt.expressions or []):
+                is_star = isinstance(expr, exp.Star)
+                is_col_star = isinstance(expr, exp.Column) and (str(expr.this) == "*" or str(expr).endswith(".*"))
+                if is_star or is_col_star:
+                    has_table = False
+                    if isinstance(expr, exp.Column) and getattr(expr, "table", None):
+                        has_table = True
+                    elif isinstance(expr, exp.Star) and expr.args.get("this"):
+                        has_table = True
+                    if has_table:
+                        qualified_star_exprs.append(expr)
+                    continue
+                non_star_exprs.append(expr)
+
+            if qualified_star_exprs:
+                current_names = [str(c.name) for c in (output_columns or []) if c and c.name]
+                has_concrete = any(n and n != "*" and not n.lower().startswith("unknown_") for n in current_names)
+                if not has_concrete:
+                    non_star_names = []
+                    for expr in non_star_exprs:
+                        name = _sl._extract_column_alias(self, expr)
+                        if name:
+                            non_star_names.append(str(name).strip().strip("[]"))
+
+                    non_star_lookup = {n.lower() for n in non_star_names if n}
+                    existing_by_name = {}
+                    for col in (output_columns or []):
+                        if col and col.name:
+                            existing_by_name[str(col.name).lower()] = col
+
+                    new_output_columns = []
+                    ordinal = 0
+                    new_output_columns.append(ColumnSchema(name="*", data_type="unknown", ordinal=ordinal, nullable=True))
+                    ordinal += 1
+                    for name in non_star_names:
+                        key = str(name).lower()
+                        col = existing_by_name.get(key)
+                        if not col:
+                            col = ColumnSchema(name=name, data_type="unknown", ordinal=ordinal, nullable=True)
+                        col.ordinal = ordinal
+                        new_output_columns.append(col)
+                        ordinal += 1
+
+                    star_refs: List[ColumnReference] = []
+                    for expr in qualified_star_exprs:
+                        if isinstance(expr, exp.Column) and getattr(expr, "table", None):
+                            alias = str(expr.table)
+                            table_name_star = self._resolve_table_from_alias(alias, select_stmt)
+                            if table_name_star and table_name_star != "unknown":
+                                ns, nm = self._ns_and_name(table_name_star)
+                                star_refs.append(ColumnReference(namespace=ns, table_name=nm, column_name="*"))
+                        elif isinstance(expr, exp.Star) and expr.args.get("this"):
+                            alias = str(expr.args.get("this"))
+                            table_name_star = self._resolve_table_from_alias(alias, select_stmt)
+                            if table_name_star and table_name_star != "unknown":
+                                ns, nm = self._ns_and_name(table_name_star)
+                                star_refs.append(ColumnReference(namespace=ns, table_name=nm, column_name="*"))
+
+                    new_lineage = []
+                    if lineage:
+                        for ln in lineage:
+                            if str(ln.output_column).lower() in non_star_lookup:
+                                new_lineage.append(ln)
+                    if star_refs:
+                        seen = set()
+                        dedup_refs = []
+                        for ref in star_refs:
+                            key = (ref.namespace, ref.table_name, ref.column_name)
+                            if key not in seen:
+                                seen.add(key)
+                                dedup_refs.append(ref)
+                        new_lineage.insert(0, ColumnLineage(output_column="*", input_fields=dedup_refs, transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+
+                    output_columns = new_output_columns
+                    lineage = new_lineage
+    except Exception:
+        pass
+
+    # If temp target uses bare star (*), keep wildcard and non-star expressions only
+    try:
+        raw_target_str = str(raw_target) if raw_target is not None else ""
+        is_temp_target = bool(is_temp or (raw_target_str and (raw_target_str.startswith('#') or '#' in raw_target_str or 'tempdb' in raw_target_str.lower())))
+        if is_temp_target and isinstance(select_stmt, exp.Select):
+            from ..parser_modules import select_lineage as _sl
+            has_bare_star = False
+            non_star_exprs = []
+            for expr in (select_stmt.expressions or []):
+                is_star = isinstance(expr, exp.Star)
+                is_col_star = isinstance(expr, exp.Column) and (str(expr.this) == "*" or str(expr).endswith(".*"))
+                if is_star or is_col_star:
+                    has_table = False
+                    if isinstance(expr, exp.Column) and getattr(expr, "table", None):
+                        has_table = True
+                    elif isinstance(expr, exp.Star) and expr.args.get("this"):
+                        has_table = True
+                    if not has_table:
+                        has_bare_star = True
+                    continue
+                non_star_exprs.append(expr)
+
+            if has_bare_star:
+                current_names = [str(c.name) for c in (output_columns or []) if c and c.name]
+                has_concrete = any(n and n != "*" and not n.lower().startswith("unknown_") for n in current_names)
+                if not has_concrete:
+                    non_star_names = []
+                    for expr in non_star_exprs:
+                        name = _sl._extract_column_alias(self, expr)
+                        if name:
+                            non_star_names.append(str(name).strip().strip("[]"))
+
+                    non_star_lookup = {n.lower() for n in non_star_names if n}
+                    existing_by_name = {}
+                    for col in (output_columns or []):
+                        if col and col.name:
+                            existing_by_name[str(col.name).lower()] = col
+
+                    include_star = not non_star_names
+                    new_output_columns = []
+                    ordinal = 0
+                    if include_star:
+                        new_output_columns.append(ColumnSchema(name="*", data_type="unknown", ordinal=ordinal, nullable=True))
+                        ordinal += 1
+                    for name in non_star_names:
+                        key = str(name).lower()
+                        col = existing_by_name.get(key)
+                        if not col:
+                            col = ColumnSchema(name=name, data_type="unknown", ordinal=ordinal, nullable=True)
+                        col.ordinal = ordinal
+                        new_output_columns.append(col)
+                        ordinal += 1
+
+                    # Build wildcard lineage from source tables, excluding INTO target
+                    star_refs: List[ColumnReference] = []
+                    target_table_name = None
+                    try:
+                        if hasattr(select_stmt, "args") and "into" in select_stmt.args:
+                            into_expr = select_stmt.args["into"]
+                            if into_expr and hasattr(into_expr, "this") and isinstance(into_expr.this, exp.Table):
+                                target_table_name = self._get_table_name(into_expr.this)
+                    except Exception:
+                        target_table_name = None
+
+                    for tbl in select_stmt.find_all(exp.Table):
+                        table_name_star = self._get_table_name(tbl)
+                        if table_name_star and table_name_star != "unknown":
+                            if target_table_name and table_name_star == target_table_name:
+                                continue
+                            ns, nm = self._ns_and_name(table_name_star)
+                            star_refs.append(ColumnReference(namespace=ns, table_name=nm, column_name="*"))
+
+                    new_lineage = []
+                    if lineage:
+                        for ln in lineage:
+                            if str(ln.output_column).lower() in non_star_lookup:
+                                new_lineage.append(ln)
+                    if include_star and star_refs:
+                        seen = set()
+                        dedup_refs = []
+                        for ref in star_refs:
+                            key = (ref.namespace, ref.table_name, ref.column_name)
+                            if key not in seen:
+                                seen.add(key)
+                                dedup_refs.append(ref)
+                        new_lineage.insert(0, ColumnLineage(output_column="*", input_fields=dedup_refs, transformation_type=TransformationType.IDENTITY, transformation_description="SELECT *"))
+
+                    output_columns = new_output_columns
+                    lineage = new_lineage
+    except Exception:
+        pass
+
+    # If wildcard is present, drop placeholder unknown_* columns from schema/lineage
+    try:
+        col_names = [str(c.name) for c in (output_columns or []) if c and c.name]
+        has_wildcard = any(n == "*" for n in col_names)
+        if has_wildcard:
+            output_columns = [c for c in output_columns if not str(c.name).lower().startswith("unknown_")]
+            if lineage:
+                lineage = [ln for ln in lineage if not str(ln.output_column).lower().startswith("unknown_")]
+    except Exception:
+        pass
+
+    # Ensure aliased expressions are represented in output schema/lineage
+    try:
+        if isinstance(select_stmt, exp.Select):
+            from ..parser_modules import select_lineage as _sl
+            alias_exprs = []
+            for expr in (select_stmt.expressions or []):
+                if isinstance(expr, exp.Alias):
+                    alias_name = expr.alias or expr.alias_or_name
+                    if alias_name:
+                        alias_exprs.append((str(alias_name).strip().strip("[]"), expr))
+
+            existing_lower = {str(c.name).lower() for c in (output_columns or []) if c and c.name}
+            lineage_by_name = {str(ln.output_column).lower(): ln for ln in (lineage or []) if ln and ln.output_column}
+            for alias_name, alias_expr in alias_exprs:
+                if not alias_name:
+                    continue
+                alias_lower = alias_name.lower()
+                if alias_lower not in existing_lower:
+                    output_columns.append(ColumnSchema(name=alias_name, data_type="unknown", ordinal=len(output_columns), nullable=True))
+                    existing_lower.add(alias_lower)
+                if alias_lower not in lineage_by_name:
+                    inner = alias_expr.this
+                    input_refs = _sl._extract_column_references(self, inner, select_stmt)
+                    if isinstance(inner, exp.Case):
+                        ttype = TransformationType.CASE
+                    else:
+                        ttype = TransformationType.EXPRESSION
+                    lineage.append(ColumnLineage(output_column=alias_name, input_fields=input_refs, transformation_type=ttype, transformation_description=f"SELECT {str(alias_expr)}"))
+                    lineage_by_name[alias_lower] = lineage[-1]
+
+            for idx, col in enumerate(output_columns):
+                col.ordinal = idx
+    except Exception:
+        pass
+
+    # Remove spurious columns that match table aliases/names (e.g., CTE alias split into columns)
+    try:
+        if isinstance(select_stmt, exp.Select) and output_columns:
+            alias_names = set()
+            for tbl in select_stmt.find_all(exp.Table):
+                try:
+                    if getattr(tbl, "alias", None):
+                        alias_names.add(str(tbl.alias))
+                except Exception:
+                    pass
+                try:
+                    if getattr(tbl, "name", None):
+                        alias_names.add(str(tbl.name))
+                except Exception:
+                    pass
+            alias_names = {a.strip("[]").lower() for a in alias_names if a}
+
+            if not alias_names:
+                try:
+                    import re as _re
+                    sql_text = str(select_stmt)
+                    for m in _re.finditer(r"\bFROM\s+([#\w\.\[\]]+)(?:\s+(?:AS\s+)?([#\w]+))?", sql_text, _re.IGNORECASE):
+                        alias = m.group(2) or m.group(1)
+                        if alias:
+                            alias_names.add(str(alias).strip("[]").lower())
+                    for m in _re.finditer(r"\bJOIN\s+([#\w\.\[\]]+)(?:\s+(?:AS\s+)?([#\w]+))?", sql_text, _re.IGNORECASE):
+                        alias = m.group(2) or m.group(1)
+                        if alias:
+                            alias_names.add(str(alias).strip("[]").lower())
+                except Exception:
+                    pass
+
+            if alias_names:
+                keep_cols = []
+                keep_names = set()
+                for col in output_columns:
+                    if not col or not col.name:
+                        continue
+                    name = str(col.name).strip("[]")
+                    if name.lower() in alias_names:
+                        continue
+                    keep_cols.append(col)
+                    keep_names.add(name.lower())
+
+                if keep_cols and len(keep_cols) < len(output_columns):
+                    output_columns = keep_cols
+                    if lineage:
+                        lineage = [ln for ln in lineage if ln and ln.output_column and str(ln.output_column).strip("[]").lower() in keep_names]
+                    for idx, col in enumerate(output_columns):
+                        col.ordinal = idx
+    except Exception:
+        pass
         
     logger.debug(f"_parse_select_into: lineage count={len(lineage or [])}, output_columns count={len(output_columns or [])}")
     if lineage:
@@ -205,9 +552,16 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
             simple_key = f"#{simple_key}"
         namespace, table_name = self._ns_and_name(simple_key, obj_type_hint="temp_table")
         temp_cols = [col.name for col in output_columns]
+        existing_cols = self.temp_registry.get(simple_key)
         ver_key = self._temp_next(simple_key)
-        self.temp_registry[ver_key] = temp_cols
-        self.temp_registry[simple_key] = temp_cols
+        ver_cols = temp_cols
+        if _is_placeholder_cols(temp_cols) and existing_cols and not _is_placeholder_cols(existing_cols):
+            ver_cols = existing_cols
+        self.temp_registry[ver_key] = ver_cols
+        if _should_update_temp_cols(existing_cols, temp_cols):
+            self.temp_registry[simple_key] = temp_cols
+        else:
+            logger.debug(f"_parse_select_into: Skipping temp_registry overwrite for {simple_key}, existing_cols={len(existing_cols or [])}, new_cols={len(temp_cols)}")
         base_sources: Set[str] = set()
         # Use final_dependencies (with CTE expansion) instead of dependencies
         for d in final_dependencies:
@@ -447,7 +801,11 @@ def _parse_insert_select(self, statement: exp.Insert, object_hint: Optional[str]
             simple_name = f"#{simple_name}"
         namespace, table_name = self._ns_and_name(simple_name, obj_type_hint="temp_table")
         temp_cols = [col.name for col in output_columns]
-        self.temp_registry[simple_name] = temp_cols
+        existing_cols = self.temp_registry.get(simple_name)
+        if _should_update_temp_cols(existing_cols, temp_cols):
+            self.temp_registry[simple_name] = temp_cols
+        else:
+            logger.debug(f"_parse_insert_select: Skipping temp_registry overwrite for {simple_name}, existing_cols={len(existing_cols or [])}, new_cols={len(temp_cols)}")
         base_sources: Set[str] = set()
         for d in dependencies:
             is_dep_temp = ('#' in d or 'tempdb' in d.lower())

@@ -65,7 +65,7 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
         name = f"{schema}.{simple_name}"
         return ns, name
     
-    if table_name and (table_name.startswith('#') or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
+    if table_name and (table_name.startswith('#') or '.#' in table_name or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
         # If table_name is already canonical (contains '.#'), use it directly
         # Otherwise, get canonical temp name which includes procedure context
         # Format: DB.schema.object.#temp[@v] or just #temp[@v] if no context
