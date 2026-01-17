@@ -38,5 +38,13 @@ docs/_build/
 (?i)*phase*.md
 examples/warehouse/sql2
 
+check*.py
+analyze*.py
+debug*.py
+test*.py
 *.txt
 examples/warehouse/recursion
+
+# Katalogi Input i Output - nie commitujemy ich do git
+Input/
+Output/

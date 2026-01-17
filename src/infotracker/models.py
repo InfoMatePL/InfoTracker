@@ -54,6 +54,18 @@ class ColumnReference:
     
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
+    
+    def __hash__(self) -> int:
+        """Case-insensitive hash for SQL Server compatibility."""
+        return hash((self.namespace.lower(), self.table_name.lower(), self.column_name.lower()))
+    
+    def __eq__(self, other) -> bool:
+        """Case-insensitive equality for SQL Server compatibility."""
+        if not isinstance(other, ColumnReference):
+            return False
+        return (self.namespace.lower() == other.namespace.lower() and 
+                self.table_name.lower() == other.table_name.lower() and
+                self.column_name.lower() == other.column_name.lower())
 
 
 @dataclass
@@ -179,6 +191,11 @@ class ColumnNode:
     namespace: str
     table_name: str
     column_name: str
+    
+    def __post_init__(self) -> None:
+        """Preserve column_name casing; comparisons are case-insensitive elsewhere."""
+        # Keep original casing for display/output, while hash/eq and graph keys
+        # still use lowercase for SQL Server case-insensitive matching.
     
     def __str__(self) -> str:
         return f"{self.namespace}.{self.table_name}.{self.column_name}"
@@ -324,11 +341,76 @@ class ColumnGraph:
             "downstream_tables": len(set(str(edge.to_column).rsplit('.', 1)[0] for edge in downstream_edges))
         }
     
-    def build_from_object_lineage(self, objects: List[ObjectInfo]) -> None:
-        """Build column graph from object lineage information."""
+    def build_from_object_lineage(self, objects: List[ObjectInfo], cte_data: Dict[str, Any] = None) -> None:
+        """Build column graph from object lineage information.
+        
+        Args:
+            objects: List of ObjectInfo with lineage
+            cte_data: Optional CTE registry for expanding CTE to base sources (NOT WORKING due to architectural limitation)
+        """
+        if cte_data is None:
+            cte_data = {}
+        
+        # NOTE: CTE expansion was attempted but cte_data is always empty
+        # CTE are registered locally in SelectLineageExtractor and don't propagate to engine/models
+        # Known limitation: CTE will appear in column_graph as intermediate nodes
+        
+        # Build a map of old temp table names to new ones (e.g., "dbo.#asefl_temp" -> "dbo.update_asefl_TrialBalance_BV#asefl_temp")
+        # Also build a map of temp table names to their ObjectInfo for lineage expansion
+        # IMPORTANT: Owner-aware mapping to prevent cross-procedure temp table edges
+        temp_name_map: Dict[str, str] = {}
+        temp_obj_map: Dict[str, ObjectInfo] = {}  # temp table name -> ObjectInfo
+        temp_owners_registry: Dict[str, Set[str]] = {}  # temp_raw (e.g., "#temp") -> set of owner procedures
+        
+        for obj in objects:
+            if obj.object_type == "temp_table" and obj.schema.name:
+                # obj.schema.name is in new format: "dbo.update_asefl_TrialBalance_BV#asefl_temp" (or with DB prefix)
+                # Normalize: strip leading '<DB>.' from table name if it matches namespace DB
+                normalized_name = obj.schema.name
+                try:
+                    ns_db = obj.schema.namespace.rsplit('/', 1)[1] if obj.schema.namespace else None
+                    if ns_db and normalized_name.startswith(f"{ns_db}."):
+                        normalized_name = normalized_name[len(ns_db) + 1:]
+                except Exception:
+                    pass
+                # Extract temp table name (part after last '#') and owner (part before '#')
+                if '#' in normalized_name:
+                    temp_part = normalized_name.split('#')[-1]
+                    owner_part = normalized_name.rsplit('#', 1)[0]  # Everything before last '#'
+                    
+                    # Register in owners_registry for uniqueness checks
+                    temp_raw = f"#{temp_part}"
+                    if temp_raw not in temp_owners_registry:
+                        temp_owners_registry[temp_raw] = set()
+                    temp_owners_registry[temp_raw].add(owner_part)
+                    
+                    # Map owner-aware keys (exact match, highest priority)
+                    # Format: "dbo.update_X#temp" -> "dbo.update_X#temp"
+                    temp_name_map[normalized_name] = normalized_name
+                    if ns_db:
+                        temp_name_map[f"{ns_db}.{normalized_name}"] = normalized_name
+                    
+                    # Map fallback keys (lower priority, used only if unique owner)
+                    # These will be used only if temp_owners_registry shows single owner
+                    old_name = f"dbo.#{temp_part}"
+                    temp_name_map[old_name] = normalized_name
+                    temp_name_map[temp_raw] = normalized_name
+                    if ns_db:
+                        temp_name_map[f"{ns_db}.dbo.#{temp_part}"] = normalized_name
+                        temp_name_map[f"{ns_db}.#{temp_part}"] = normalized_name
+                    
+                    # Map in temp_obj_map for lineage expansion
+                    temp_obj_map[normalized_name] = obj
+                    if ns_db:
+                        temp_obj_map[f"{ns_db}.{normalized_name}"] = obj
+        
         for obj in objects:
             output_namespace = obj.schema.namespace
             output_table = obj.schema.name
+
+            # Skip table variables (starting with @) - they should not appear in column_graph
+            if output_table and output_table.startswith('@'):
+                continue
 
             # Normalize: strip leading '<DB>.' from table name if it matches namespace DB
             try:
@@ -337,6 +419,19 @@ class ColumnGraph:
                 ns_db = None
             if ns_db and output_table and output_table.startswith(f"{ns_db}."):
                 output_table = output_table[len(ns_db) + 1:]
+            
+            # Skip objects with table_name="unknown" (e.g., unresolved objects)
+            if output_table == "unknown":
+                continue
+            
+            # Add nodes for all columns, even if they don't have edges
+            for col in obj.schema.columns or []:
+                output_column = ColumnNode(
+                    namespace=output_namespace,
+                    table_name=output_table,
+                    column_name=col.name
+                )
+                self.add_node(output_column)
             
             for lineage in obj.lineage:
                 # Create output column node
@@ -348,6 +443,13 @@ class ColumnGraph:
                 
                 # Create edges for each input field
                 for input_field in lineage.input_fields:
+                    # Skip table variables (starting with @) - they should not appear in column_graph
+                    if input_field.table_name and input_field.table_name.startswith('@'):
+                        continue
+                    # Skip "unknown" table names (e.g., unresolved JOIN keywords)
+                    if input_field.table_name == "unknown":
+                        continue
+                    
                     in_ns = input_field.namespace
                     in_tbl = input_field.table_name
                     # Normalize inputs similarly
@@ -355,6 +457,185 @@ class ColumnGraph:
                         in_db = in_ns.rsplit('/', 1)[1] if in_ns else None
                     except Exception:
                         in_db = None
+                    
+                    # Check temp_name_map BEFORE normalizing DB prefix, as map may contain DB-prefixed keys
+                    # OWNER-AWARE LOOKUP: Prefer exact match, then fallback only if unique owner
+                    original_tbl = in_tbl
+                    temp_obj = None
+                    if in_tbl and '#' in in_tbl:
+                        # Extract temp_raw for uniqueness check
+                        temp_part = in_tbl.split('#')[-1] if '#' in in_tbl else None
+                        temp_raw = f"#{temp_part}" if temp_part else None
+                        
+                        # Build variants in priority order:
+                        # 1. Exact match (owner-aware): "dbo.update_X#temp"
+                        # 2. With DB prefix: "EDW_CORE.dbo.update_X#temp"
+                        # 3. Fallback (only if unique owner): "#temp", "dbo.#temp"
+                        exact_variants = [in_tbl]
+                        if in_db and not in_tbl.startswith(f"{in_db}."):
+                            exact_variants.append(f"{in_db}.{in_tbl}")
+                        if in_db and in_tbl.startswith(f"{in_db}."):
+                            exact_variants.append(in_tbl[len(in_db) + 1:])
+                        
+                        fallback_variants = []
+                        if temp_raw:
+                            # Only use fallback if this temp has UNIQUE owner
+                            is_unique = temp_raw in temp_owners_registry and len(temp_owners_registry[temp_raw]) == 1
+                            if is_unique:
+                                fallback_variants.append(temp_raw)
+                                fallback_variants.append(f"dbo.{temp_raw}")
+                                if in_db:
+                                    fallback_variants.append(f"{in_db}.dbo.{temp_raw}")
+                                    fallback_variants.append(f"{in_db}.{temp_raw}")
+                        
+                        # Try exact variants first
+                        mapped_tbl = None
+                        for variant in exact_variants:
+                            if variant in temp_name_map:
+                                mapped_tbl = temp_name_map[variant]
+                                break
+                        
+                        # If no exact match, try fallback (only if unique owner)
+                        if not mapped_tbl:
+                            for variant in fallback_variants:
+                                if variant in temp_name_map:
+                                    mapped_tbl = temp_name_map[variant]
+                                    break
+                        
+                        # If we found a mapping, also check if we have temp_obj for lineage expansion
+                        if mapped_tbl:
+                            in_tbl = mapped_tbl
+                            # Try to find temp_obj for this temp table - try multiple variants
+                            search_variants = [mapped_tbl]
+                            if in_db:
+                                search_variants.append(f"{in_db}.{mapped_tbl}")
+                            # Try all variants
+                            for variant in search_variants:
+                                if variant in temp_obj_map:
+                                    temp_obj = temp_obj_map[variant]
+                                    break
+                            # If still not found, try to find by matching the temp part
+                            if not temp_obj and '#' in mapped_tbl:
+                                temp_part = mapped_tbl.split('#')[-1]
+                                for key, obj in temp_obj_map.items():
+                                    if key.endswith(f"#{temp_part}") or key == f"#{temp_part}":
+                                        temp_obj = obj
+                                        break
+                    
+                    # CHECK FOR CTE EXPANSION (before temp table expansion)
+                    # If input is a CTE, expand it to base sources (similar to temp tables)
+                    # CTE are ephemeral query-scoped objects that should be transparent in lineage
+                    cte_expanded = False
+                    if cte_data and in_tbl:
+                        # Check if in_tbl is a CTE (case-insensitive match)
+                        # Try simple name (last part after dots)
+                        cte_simple = in_tbl.split('.')[-1] if '.' in in_tbl else in_tbl
+                        cte_info = None
+                        for cte_name, info in cte_data.items():
+                            if cte_name.lower() == cte_simple.lower():
+                                cte_info = info
+                                break
+                        
+                        if cte_info:
+                            # CTE found - extract base sources from CTE definition
+                            # cte_info is either dict with 'definition' or just columns list
+                            cte_def = None
+                            if isinstance(cte_info, dict) and 'definition' in cte_info:
+                                cte_def = cte_info['definition']
+                                from sqlglot import expressions as exp
+                                if cte_def and isinstance(cte_def, exp.Select):
+                                    # Extract dependencies from CTE definition (base tables)
+                                    # We can't call parser methods here, so use simple FROM extraction
+                                    base_tables = set()
+                                    for table in cte_def.find_all(exp.Table):
+                                        tbl_name = str(table.name) if hasattr(table, 'name') else str(table)
+                                        # Skip if this is another CTE
+                                        is_another_cte = False
+                                        for other_cte_name in cte_data.keys():
+                                            if tbl_name.lower() == other_cte_name.lower():
+                                                is_another_cte = True
+                                                break
+                                        if not is_another_cte and not tbl_name.startswith('#'):
+                                            base_tables.add(tbl_name)
+                                    
+                                    # Create edges from CTE base sources to output (expand CTE)
+                                    if base_tables:
+                                        for base_tbl_name in base_tables:
+                                            # Skip "unknown" table names
+                                            if base_tbl_name == "unknown":
+                                                continue
+                                            # Use same namespace as CTE
+                                            base_column = ColumnNode(
+                                                namespace=in_ns,
+                                                table_name=f"dbo.{base_tbl_name}" if '.' not in base_tbl_name else base_tbl_name,
+                                                column_name=input_field.column_name
+                                            )
+                                            
+                                            edge = ColumnEdge(
+                                                from_column=base_column,
+                                                to_column=output_column,
+                                                transformation_type=lineage.transformation_type,
+                                                transformation_description=lineage.transformation_description
+                                            )
+                                            
+                                            self.add_edge(edge)
+                                        cte_expanded = True
+                                        # Skip creating edge from CTE itself - it's been expanded
+                                        continue
+                    
+                    # If input is a temp table and we have its ObjectInfo, expand to base sources
+                    if temp_obj and temp_obj.lineage:
+                        # Find lineage for this column in temp table
+                        temp_lineage = next((ln for ln in temp_obj.lineage if ln.output_column == input_field.column_name), None)
+                        if temp_lineage and temp_lineage.input_fields:
+                            # Filter out self-references (temp table referencing itself)
+                            # Only include base sources (not temp tables)
+                            base_inputs = []
+                            for base_input in temp_lineage.input_fields:
+                                base_tbl_name = base_input.table_name or ""
+                                # Skip if this is a self-reference to the temp table
+                                if '#' in base_tbl_name:
+                                    # Check if it's the same temp table (use in_tbl which is already mapped)
+                                    temp_part = base_tbl_name.split('#')[-1] if '#' in base_tbl_name else ""
+                                    if temp_part and in_tbl and temp_part in in_tbl:
+                                        # This is a self-reference, skip it
+                                        continue
+                                # This is a base source, include it
+                                base_inputs.append(base_input)
+                            
+                            # Expand temp table to base sources - create edges from base sources to output
+                            if base_inputs:
+                                for base_input in base_inputs:
+                                    base_ns = base_input.namespace
+                                    base_tbl = base_input.table_name
+                                    # Skip "unknown" table names
+                                    if base_tbl == "unknown":
+                                        continue
+                                    # Normalize base table name
+                                    try:
+                                        base_db = base_ns.rsplit('/', 1)[1] if base_ns else None
+                                    except Exception:
+                                        base_db = None
+                                    if base_db and base_tbl and base_tbl.startswith(f"{base_db}."):
+                                        base_tbl = base_tbl[len(base_db) + 1:]
+                                    
+                                    base_column = ColumnNode(
+                                        namespace=base_ns,
+                                        table_name=base_tbl,
+                                        column_name=base_input.column_name
+                                    )
+                                    
+                                    edge = ColumnEdge(
+                                        from_column=base_column,
+                                        to_column=output_column,
+                                        transformation_type=lineage.transformation_type,
+                                        transformation_description=lineage.transformation_description
+                                    )
+                                    
+                                    self.add_edge(edge)
+                                # Also keep the direct temp->output edge for continuity
+                    
+                    # Normalize DB prefix AFTER temp_name_map lookup
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
                         in_tbl = in_tbl[len(in_db) + 1:]
 

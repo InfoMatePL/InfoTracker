@@ -57,8 +57,8 @@ def test_read_utf16_le():
     content = "USE :TestDB:\r\nCREATE VIEW test AS SELECT * FROM ąęćłńóśźż_table;"
     expected = "USE :TestDB:\nCREATE VIEW test AS SELECT * FROM ąęćłńóśźż_table;"
     
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-16le', delete=False, suffix='.sql') as f:
-        f.write(content)
+    with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.sql') as f:
+        f.write(content.encode('utf-16le'))
         temp_path = f.name
     
     try:
@@ -78,8 +78,8 @@ def test_read_utf16_be():
     """Test reading UTF-16 BE file."""
     content = "SELECT * FROM ąęćłńóśźż_table;"
     
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-16be', delete=False, suffix='.sql') as f:
-        f.write(content)
+    with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.sql') as f:
+        f.write(content.encode('utf-16be'))
         temp_path = f.name
     
     try:
@@ -345,8 +345,8 @@ BEGIN
 END
 """
     
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-16le', delete=False, suffix='.sql') as f:
-        f.write(content)
+    with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.sql') as f:
+        f.write(content.encode('utf-16le'))
         temp_path = f.name
     
     try:

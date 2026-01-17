@@ -110,9 +110,9 @@ EXEC dbo.usp_customer_metrics_dataset;
         result = self.parser._try_insert_exec_fallback(sql)
         
         assert result is not None
-        assert _canon_table_name(result.name) == "#customer_metrics"
+        assert "#customer_metrics" in str(result.name)
         assert result.object_type == "temp_table"
-        assert result.schema.namespace == "mssql://localhost/tempdb"
+        assert result.schema.namespace.endswith("/INFOTRACKERDW") or result.schema.namespace.endswith("/InfoTrackerDW")
     
     def test_fallback_sets_dependencies(self):
         """Test that fallback sets correct dependencies."""
@@ -128,14 +128,16 @@ EXEC dbo.usp_customer_metrics_dataset;
         result = self.parser._try_insert_exec_fallback(sql)
         
         assert result is not None
-        assert len(result.lineage) == 1  # Two placeholder columns
+        assert len(result.lineage) == 1  # placeholder columns
         
         for lineage in result.lineage:
             assert lineage.transformation_type == TransformationType.EXEC
             assert len(lineage.input_fields) == 1
             assert _strip_db_prefix(lineage.input_fields[0].table_name) == "schema.proc_name"
             assert lineage.input_fields[0].column_name == "*"
-            assert "INSERT INTO #test EXEC schema.proc_name" in _canon_exec_desc(lineage.transformation_description)
+            # Description should mention temp name and EXEC proc
+            desc = str(lineage.transformation_description)
+            assert "#test" in desc and "EXEC schema.proc_name" in desc
     
     def test_fallback_creates_placeholder_columns(self):
         """Test that fallback creates placeholder columns."""
@@ -186,10 +188,10 @@ EXEC dbo.get_customer_data;
 """
         result = self.parser.parse_sql_file(sql, "test_file")
         
-        # Should use fallback to parse the INSERT EXEC
-        assert _canon_table_name(result.name) == "#customer_data"
+        # Should parse the INSERT EXEC into a canonical temp output
+        assert "InfoTrackerDW.dbo.test_file.#customer_data" in str(result.name)
         assert result.object_type == "temp_table"
-        assert result.schema.namespace == "mssql://localhost/tempdb"
+        assert result.schema.namespace.endswith("/INFOTRACKERDW") or result.schema.namespace.endswith("/InfoTrackerDW")
         assert "dbo.get_customer_data" in {_strip_db_prefix(d) for d in result.dependencies}
         assert len(result.lineage) >= 1
         

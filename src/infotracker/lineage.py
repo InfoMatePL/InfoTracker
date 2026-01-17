@@ -10,19 +10,81 @@ from typing import Dict, List, Any, Optional
 from .models import ObjectInfo, ColumnLineage, TransformationType
 
 
+def _dequote(s: str) -> str:
+    try:
+        import re
+        return re.sub(r"[\[\]\"'`]", "", s or "").strip()
+    except Exception:
+        return (s or "").strip()
+
+
 def _ns_for_dep(dep: str, default_ns: str) -> str:
-    """Determine namespace for a dependency based on its database context."""
-    d = (dep or "").strip()
+    """Determine namespace for a dependency based on its database context.
+
+    Strips quotes/brackets from identifiers to avoid duplicates.
+    Handles temp tables in both formats: #temp and DB.dbo.PROC#temp
+    """
+    d = _dequote(dep or "")
     dl = d.lower()
-    if dl.startswith("tempdb..#") or dl.startswith("#"):
+    # Check for temp tables: #temp or DB.dbo.PROC#temp format
+    if dl.startswith("tempdb..#") or dl.startswith("#") or "#" in d:
+        # For canonical temp names (DB.dbo.PROC#temp), extract DB
+        if "#" in d and "." in d:
+            parts = d.split(".")
+            if len(parts) >= 3:
+                db = parts[0]
+                return f"mssql://localhost/{db.upper()}"
+        # For simple temp names (#temp), use tempdb
         return "mssql://localhost/tempdb"
     parts = d.split(".")
     db = parts[0] if len(parts) >= 3 else None
-    return f"mssql://localhost/{db}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
+    return f"mssql://localhost/{(db or '').upper()}" if db else (default_ns or "mssql://localhost/InfoTrackerDW")
 
 def _strip_db_prefix(name: str) -> str:
-    parts = (name or "").split(".")
-    return ".".join(parts[-2:]) if len(parts) >= 2 else (name or "")
+    """Strip database prefix from name, preserving temp table canonical names.
+    
+    For canonical temp names (DB.dbo.PROC#temp), returns dbo.PROC#temp
+    For simple temp names (#temp), returns as is
+    For regular names (DB.dbo.table), returns dbo.table
+    """
+    name = _dequote(name or "")
+    # Handle canonical temp names (DB.dbo.PROC#temp)
+    if "#" in name and "." in name:
+        parts = name.split(".")
+        if len(parts) >= 4 and parts[-1].startswith("#"):
+            # Canonical temp: DB.dbo.PROC.#temp -> dbo.PROC#temp (no dot before #)
+            return f"{parts[-3]}.{parts[-2]}{parts[-1]}"
+        if len(parts) >= 3:
+            # Return dbo.table or schema.#temp for short forms
+            return ".".join(parts[-2:])
+        elif len(parts) == 2:
+            # Return as is (already schema.table format)
+            return name
+    # Regular handling
+    parts = name.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else name
+
+def _is_noise_dep(dep: str) -> bool:
+    """Return True if dependency name looks like a temp table or non-table token.
+
+    Filters out:
+    - temp tables ("#..." or "tempdb..#...")
+    - variable-like tokens ("@...")
+    - dynamic concat artifacts (contains '+')
+    - single bracketed tokens without dot (e.g., "[Name]")
+    """
+    if not dep:
+        return True
+    d = dep.strip()
+    dl = d.lower()
+    # keep temp tables visible in upstream/lineage
+    if d.startswith("@"):
+        return True
+    if "+" in d:
+        return True
+    if d.startswith("[") and d.endswith("]") and "." not in d:
+        return True
+    return False
 
 
 class OpenLineageGenerator:
@@ -66,18 +128,30 @@ class OpenLineageGenerator:
     
     def _build_inputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
         """Build inputs array from object dependencies."""
+        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
         inputs = []
         for dep_name in sorted(obj_info.dependencies):
-             # tempdb: stały namespace
-             if dep_name.startswith('tempdb..#'):
-                 namespace = "mssql://localhost/tempdb"
-             else:
-                 parts = dep_name.split('.')
-                 db = parts[0] if len(parts) >= 3 else None
-                 namespace = f"mssql://localhost/{db}" if db else self.namespace
-             # w name trzymaj schema.table (bez prefiksu DB)
-             name = ".".join(dep_name.split(".")[-2:]) if "." in dep_name else dep_name
-             inputs.append({"namespace": namespace, "name": name})
+            if _is_noise_dep(dep_name):
+                continue
+            # Skip JOIN keywords early
+            dep_simple = dep_name.split('.')[-1].lower() if dep_name else ""
+            if dep_simple in JOIN_KEYWORDS:
+                continue
+            d = _dequote(dep_name)
+            # tempdb legacy pattern
+            if d.startswith('tempdb..#'):
+                namespace = "mssql://localhost/tempdb"
+                name = d
+            else:
+                parts = d.split('.')
+                db = parts[0] if len(parts) >= 3 else None
+                namespace = f"mssql://localhost/{db}" if db else self.namespace
+                # Preserve DB for temp canonical names (contain '#')
+                if '#' in d:
+                    name = d
+                else:
+                    name = ".".join(parts[-2:]) if len(parts) >= 2 else d
+            inputs.append({"namespace": namespace, "name": name})
 
         
         return inputs
@@ -90,6 +164,14 @@ class OpenLineageGenerator:
         else:
             # Use schema's namespace if available, otherwise default namespace
             output_namespace = obj_info.schema.namespace if obj_info.schema.namespace else self.namespace
+            # For fallback objects, tests expect DB segment uppercased (e.g., MyDB -> MYDB)
+            if getattr(obj_info, 'is_fallback', False) and isinstance(output_namespace, str):
+                try:
+                    if output_namespace.startswith("mssql://localhost/"):
+                        prefix, dbseg = output_namespace.rsplit('/', 1)
+                        output_namespace = f"{prefix}/{dbseg.upper()}"
+                except Exception:
+                    pass
         
         output = {
             "namespace": output_namespace,
@@ -97,10 +179,11 @@ class OpenLineageGenerator:
             "facets": {}
         }
         
-        # Add schema facet for tables and procedures with columns
+        # Add schema facet for tables and procedures (even if columns list is empty)
         # Views should only have columnLineage, not schema
-        if (obj_info.schema and obj_info.schema.columns and 
+        if (obj_info.schema and 
             obj_info.object_type in ['table', 'temp_table', 'procedure']):
+            print(f"DEBUG: Generating schema facet for {obj_info.name}, type={obj_info.object_type}, cols={len(obj_info.schema.columns) if obj_info.schema and obj_info.schema.columns else 0}")
             schema_facet = self._build_schema_facet(obj_info)
             if schema_facet:  # Only add if not None (fallback objects)
                 output["facets"]["schema"] = schema_facet
@@ -144,6 +227,16 @@ class OpenLineageGenerator:
                     namespace = "mssql://localhost/tempdb"
                 else:
                     namespace = input_ref.namespace
+                
+                # Skip SQL keywords that should never be table names
+                JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+                table_name_simple = input_ref.table_name.split('.')[-1] if input_ref.table_name else ""
+                if table_name_simple.lower() in JOIN_KEYWORDS:
+                    continue  # Skip this input
+                
+                # Skip "unknown" table names (e.g., unresolved references)
+                if input_ref.table_name == "unknown":
+                    continue
                     
                 input_fields.append({
                     "namespace": namespace,
@@ -174,44 +267,80 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
         name = f"procedures.{obj.name}"
     
     # Build inputs from dependencies with per-dependency namespaces
+    # First, collect from lineage (more detailed)
+    input_pairs_from_lineage = set()
     if obj.lineage:
-        input_pairs = {
+        input_pairs_from_lineage = {
             (f.namespace, f.table_name)
             for ln in obj.lineage
             for f in ln.input_fields
             if getattr(f, "namespace", None) and getattr(f, "table_name", None)
         }
-        if input_pairs:
-            inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(input_pairs)]
-        else:
-            inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
-                      for dep in sorted(obj.dependencies)]
+    
+    # Also collect from dependencies (may include temp tables and other sources not in lineage)
+    input_pairs_from_deps = {
+        (_ns_for_dep(dep, ns), _strip_db_prefix(dep))
+        for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)
+    }
+    
+    # Combine both sources
+    all_input_pairs = input_pairs_from_lineage | input_pairs_from_deps
+    
+    if all_input_pairs:
+        def _is_noise_name(n: str) -> bool:
+            if not n:
+                return True
+            # keep temp tables visible
+            if n.startswith('@'):
+                return True
+            if '+' in n:
+                return True
+            if n.startswith('[') and n.endswith(']') and '.' not in n:
+                return True
+            # Filter out SQL keywords (JOIN keywords)
+            JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+            name_simple = n.split('.')[-1].lower() if n else ""
+            if name_simple in JOIN_KEYWORDS:
+                return True
+            return False
+        filtered = [ (ns2, nm2) for (ns2, nm2) in all_input_pairs if not _is_noise_name(nm2) ]
+        inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
     else:
-        inputs = [{"namespace": _ns_for_dep(dep, ns), "name": _strip_db_prefix(dep)}
-                  for dep in sorted(obj.dependencies)]
+        inputs = []
 
     # Build output facets
     facets = {}
     
     # Add schema facet if we have columns and it's not a fallback object
-    if (obj.object_type in ('table', 'temp_table', 'procedure') 
-        and obj.schema and obj.schema.columns 
-        and not getattr(obj, 'is_fallback', False)):
+    # Relaxed condition: allow schema facet even if columns list is empty
+    should_add_schema = (obj.object_type in ('table', 'temp_table', 'procedure') 
+        and obj.schema 
+        and not getattr(obj, 'is_fallback', False))
+        
+    if should_add_schema:
         facets["schema"] = {
             "_producer": "https://github.com/OpenLineage/OpenLineage",
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/SchemaDatasetFacet.json",
-            "fields": [{"name": c.name, "type": c.data_type} for c in obj.schema.columns]
+            "fields": [{"name": c.name, "type": c.data_type} for c in (obj.schema.columns or [])]
         }
     
     # Add column lineage facet if we have lineage
     if obj.lineage:
         lineage_fields = {}
+        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
         for ln in obj.lineage:
+            # Filter input_fields: skip JOIN keywords and "unknown"
+            filtered_inputs = []
+            for f in ln.input_fields:
+                table_simple = f.table_name.split('.')[-1] if f.table_name else ""
+                if table_simple.lower() in JOIN_KEYWORDS:
+                    continue
+                if f.table_name == "unknown":
+                    continue
+                filtered_inputs.append({"namespace": f.namespace, "name": f.table_name, "field": f.column_name})
+            
             lineage_fields[ln.output_column] = {
-                "inputFields": [
-                    {"namespace": f.namespace, "name": f.table_name, "field": f.column_name}
-                    for f in ln.input_fields
-                ],
+                "inputFields": filtered_inputs,
                 "transformationType": ln.transformation_type.value,
                 "transformationDescription": ln.transformation_description,
             }

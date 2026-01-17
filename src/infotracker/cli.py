@@ -58,13 +58,23 @@ def extract(
     sql_dir: Optional[Path] = typer.Option(None, exists=True, file_okay=False),
     out_dir: Optional[Path] = typer.Option(None, file_okay=False),
     adapter: Optional[str] = typer.Option(None),
+    dbt: bool = typer.Option(False, "--dbt", help="Enable dbt mode (compiled models)"),
     catalog: Optional[Path] = typer.Option(None, exists=True),
     fail_on_warn: bool = typer.Option(False),
     include: list[str] = typer.Option([], "--include", help="Glob include pattern"),
     exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern"),
     encoding: str = typer.Option("auto", "--encoding", "-e", help="File encoding for SQL files. Supported: " + ", ".join(get_supported_encodings()), show_choices=True),
+    log_level: Optional[str] = typer.Option(None, "--log-level", help="Override log level: debug|info|warn|error"),
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    # Override log level if provided in extract command
+    if log_level:
+        cfg.log_level = log_level
+        level = getattr(logging, cfg.log_level.upper(), logging.INFO)
+        logging.basicConfig(level=level, force=True)
+    # dbt mode flag (overrides config)
+    if dbt:
+        cfg.dbt_mode = True
     
     # Validate encoding
     supported = get_supported_encodings()
@@ -98,9 +108,12 @@ def impact(
     selector: str = typer.Option(..., "-s", "--selector", help="[+]db.schema.object.column[+] - use + to indicate direction"),
     max_depth: Optional[int] = typer.Option(None, help="Traversal depth; 0 means unlimited (full lineage)"),
     out: Optional[Path] = typer.Option(None),
-    graph_dir: Path = typer.Option(..., "--graph-dir", exists=True, file_okay=False, help="Directory containing column_graph.json (required)"),
+    graph_dir: Optional[Path] = typer.Option(None, "--graph-dir", help="Directory containing column_graph.json"),
+    dbt: bool = typer.Option(False, "--dbt", help="dbt mode (for selector normalization)")
 ):
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    if dbt:
+        cfg.dbt_mode = True
     engine = Engine(cfg)
     # Default to 0 (unlimited) when not specified
     effective_depth = 0 if max_depth is None else max_depth
@@ -122,9 +135,12 @@ def diff(
     head: Optional[Path] = typer.Option(None, "--head", help="Directory containing head OpenLineage artifacts"),
     format: str = typer.Option("text", "--format", help="Output format: text|json"),
     threshold: Optional[str] = typer.Option(None, "--threshold", help="Severity threshold: NON_BREAKING|POTENTIALLY_BREAKING|BREAKING"),
+    dbt: bool = typer.Option(False, "--dbt", help="dbt mode (no direct effect, for consistency)")
 ):
     """Compare two sets of OpenLineage artifacts for breaking changes."""
     cfg: RuntimeConfig = ctx.obj["cfg"]
+    if dbt:
+        cfg.dbt_mode = True
     engine = Engine(cfg)
     
     if not base or not head:
