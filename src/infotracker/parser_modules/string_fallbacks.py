@@ -72,7 +72,9 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
     logger.debug(f"_extract_insert_select_lineage_string: SQL (first 500 chars): {sql_content[:500]}")
     
     # Find ALL INSERT INTO ... SELECT patterns (using finditer instead of search)
-    pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
+    # NOTE: Do NOT treat END as a terminator, otherwise CASE ... END inside SELECT
+    # truncates the segment and breaks lineage extraction.
+    pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
     
     matches = list(re.finditer(pattern_with_terminator, s))
     logger.debug(f"_extract_insert_select_lineage_string: Found {len(matches)} INSERT INTO ... SELECT patterns")
@@ -179,53 +181,58 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
         # If no CTE found, use just SELECT
         if not select_sql:
             select_sql = "SELECT " + select_part
+
+        # Trim trailing SELECT @... statements (common in procedures) that are not part of INSERT...SELECT
+        try:
+            m_tail = re.search(r"(?is)\n\s*SELECT\s+@", select_sql)
+            if m_tail:
+                select_sql = select_sql[:m_tail.start()]
+        except Exception:
+            pass
         
         logger.debug(f"_extract_insert_select_lineage_string: About to parse SQL (first 300 chars): {select_sql[:300]}")
-        try:
-            parsed = sqlglot.parse(select_sql, read=self.dialect)
-            logger.debug(f"_extract_insert_select_lineage_string: Parsed result: {parsed is not None}, length: {len(parsed) if parsed else 0}")
-            # Handle both exp.Select and exp.With (WITH ... SELECT)
-            select_stmt = None
-            if parsed and len(parsed) > 0:
-                logger.debug(f"_extract_insert_select_lineage_string: Parsed statement type: {type(parsed[0]).__name__}")
-                if isinstance(parsed[0], exp.With) and hasattr(parsed[0], 'this'):
-                    select_stmt = parsed[0].this
-                    logger.debug(f"_extract_insert_select_lineage_string: Parsed as exp.With, has expressions: {hasattr(parsed[0], 'expressions')}")
+        def _process_parsed(parsed_statements):
+            select_stmt_local = None
+            if parsed_statements and len(parsed_statements) > 0:
+                logger.debug(f"_extract_insert_select_lineage_string: Parsed statement type: {type(parsed_statements[0]).__name__}")
+                if isinstance(parsed_statements[0], exp.With) and hasattr(parsed_statements[0], 'this'):
+                    select_stmt_local = parsed_statements[0].this
+                    logger.debug(f"_extract_insert_select_lineage_string: Parsed as exp.With, has expressions: {hasattr(parsed_statements[0], 'expressions')}")
                     # Process CTEs from exp.With - CTEs are in exp.With, not in exp.Select
                     # We need to manually extract CTEs from exp.With and register them
-                    if hasattr(parsed[0], 'expressions'):
-                        logger.debug(f"_extract_insert_select_lineage_string: Processing {len(parsed[0].expressions)} CTEs from exp.With")
-                        for cte in parsed[0].expressions:
+                    if hasattr(parsed_statements[0], 'expressions'):
+                        logger.debug(f"_extract_insert_select_lineage_string: Processing {len(parsed_statements[0].expressions)} CTEs from exp.With")
+                        for cte in parsed_statements[0].expressions:
                             if hasattr(cte, 'alias') and hasattr(cte, 'this'):
-                                cte_name = str(cte.alias)
-                                cte_columns = []
+                                cte_name_local = str(cte.alias)
+                                cte_columns_local = []
                                 if isinstance(cte.this, exp.Select):
                                     for proj in cte.this.expressions:
-                                        col_name = None
+                                        col_name_local = None
                                         if isinstance(proj, exp.Alias):
-                                            col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
-                                            if not col_name and hasattr(proj, 'alias_or_name'):
-                                                col_name = str(proj.alias_or_name)
+                                            col_name_local = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                            if not col_name_local and hasattr(proj, 'alias_or_name'):
+                                                col_name_local = str(proj.alias_or_name)
                                         elif isinstance(proj, exp.Column):
-                                            col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
-                                        if col_name:
-                                            cte_columns.append(col_name)
+                                            col_name_local = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                        if col_name_local:
+                                            cte_columns_local.append(col_name_local)
                                 # Register CTE
                                 if isinstance(cte.this, exp.Select):
-                                    self.cte_registry[cte_name] = {
-                                        'columns': cte_columns,
+                                    self.cte_registry[cte_name_local] = {
+                                        'columns': cte_columns_local,
                                         'definition': cte.this
                                     }
                                 else:
-                                    self.cte_registry[cte_name] = cte_columns
+                                    self.cte_registry[cte_name_local] = cte_columns_local
                     logger.debug(f"_extract_insert_select_lineage_string: Processed CTEs from exp.With, cte_registry keys: {list(self.cte_registry.keys())}")
-                elif isinstance(parsed[0], exp.Select):
-                    select_stmt = parsed[0]
+                elif isinstance(parsed_statements[0], exp.Select):
+                    select_stmt_local = parsed_statements[0]
                     # Process CTEs if present
-                    with_clause = select_stmt.args.get('with')
+                    with_clause = select_stmt_local.args.get('with')
                     logger.debug(f"_extract_insert_select_lineage_string: exp.Select has with clause: {with_clause is not None}")
                     if with_clause:
-                        self._process_ctes(select_stmt)
+                        self._process_ctes(select_stmt_local)
                         logger.debug(f"_extract_insert_select_lineage_string: Processed CTEs from SELECT WITH, cte_registry keys: {list(self.cte_registry.keys())}")
                     else:
                         # If SELECT doesn't have with clause but we combined CTE with SELECT,
@@ -244,51 +251,57 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                                         if hasattr(cte, 'alias') and hasattr(cte, 'this'):
                                             parsed_cte_name = str(cte.alias)
                                             if parsed_cte_name.lower() == cte_name.lower():
-                                                cte_columns = []
+                                                cte_columns_local = []
                                                 if isinstance(cte.this, exp.Select):
                                                     for proj in cte.this.expressions:
-                                                        col_name = None
+                                                        col_name_local = None
                                                         if isinstance(proj, exp.Alias):
-                                                            col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
-                                                            if not col_name and hasattr(proj, 'alias_or_name'):
-                                                                col_name = str(proj.alias_or_name)
+                                                            col_name_local = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                                            if not col_name_local and hasattr(proj, 'alias_or_name'):
+                                                                col_name_local = str(proj.alias_or_name)
                                                         elif isinstance(proj, exp.Column):
-                                                            col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
-                                                        if col_name:
-                                                            cte_columns.append(col_name)
+                                                            col_name_local = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                                        if col_name_local:
+                                                            cte_columns_local.append(col_name_local)
                                                 # Register CTE
                                                 if isinstance(cte.this, exp.Select):
                                                     self.cte_registry[cte_name] = {
-                                                        'columns': cte_columns,
+                                                        'columns': cte_columns_local,
                                                         'definition': cte.this
                                                     }
                                                 else:
-                                                    self.cte_registry[cte_name] = cte_columns
-                                                logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} with {len(cte_columns)} columns")
+                                                    self.cte_registry[cte_name] = cte_columns_local
+                                                logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} with {len(cte_columns_local)} columns")
                                                 break
                                 elif isinstance(cte_parsed, exp.Select):
                                     # If CTE was parsed as SELECT, try to extract columns from it
-                                    cte_columns = []
+                                    cte_columns_local = []
                                     for proj in cte_parsed.expressions:
-                                        col_name = None
+                                        col_name_local = None
                                         if isinstance(proj, exp.Alias):
-                                            col_name = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
-                                            if not col_name and hasattr(proj, 'alias_or_name'):
-                                                col_name = str(proj.alias_or_name)
+                                            col_name_local = str(proj.alias) if hasattr(proj, 'alias') and proj.alias else None
+                                            if not col_name_local and hasattr(proj, 'alias_or_name'):
+                                                col_name_local = str(proj.alias_or_name)
                                         elif isinstance(proj, exp.Column):
-                                            col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
-                                        if col_name:
-                                            cte_columns.append(col_name)
+                                            col_name_local = str(proj.this) if hasattr(proj, 'this') else str(proj)
+                                        if col_name_local:
+                                            cte_columns_local.append(col_name_local)
                                     # Register CTE
                                     self.cte_registry[cte_name] = {
-                                        'columns': cte_columns,
+                                        'columns': cte_columns_local,
                                         'definition': cte_parsed
                                     }
-                                    logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} (parsed as SELECT) with {len(cte_columns)} columns")
+                                    logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} (parsed as SELECT) with {len(cte_columns_local)} columns")
                                 logger.debug(f"_extract_insert_select_lineage_string: CTE registry keys after manual parsing: {list(self.cte_registry.keys())}")
                             except Exception as e:
                                 import traceback
                                 logger.debug(f"_extract_insert_select_lineage_string: Failed to parse CTE manually: {e}, traceback: {traceback.format_exc()}")
+            return select_stmt_local
+
+        try:
+            parsed = sqlglot.parse(select_sql, read=self.dialect)
+            logger.debug(f"_extract_insert_select_lineage_string: Parsed result: {parsed is not None}, length: {len(parsed) if parsed else 0}")
+            select_stmt = _process_parsed(parsed)
             if select_stmt:
                 logger.debug(f"_extract_insert_select_lineage_string: Successfully parsed SELECT, extracting lineage")
                 lineage, _out_cols = self._extract_column_lineage(select_stmt, object_name)
@@ -301,8 +314,29 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                 dependencies.update(self._extract_basic_dependencies(select_sql))
                 break
         except Exception as parse_error:
-            logger.debug(f"_extract_insert_select_lineage_string: Exception parsing SELECT: {parse_error}, using basic dependencies")
-            dependencies.update(self._extract_basic_dependencies(select_sql))
+            logger.debug(f"_extract_insert_select_lineage_string: Exception parsing SELECT: {parse_error}, retrying with sanitized SQL")
+            try:
+                # Retry with bracket stripping and simple CASE normalization
+                select_sql_sanitized = re.sub(r"[\[\]]", "", select_sql)
+                select_sql_sanitized = re.sub(
+                    r"(?i)\bCASE\s+([A-Za-z0-9_.]+)\s+WHEN\s+",
+                    r"CASE WHEN \1 = ",
+                    select_sql_sanitized,
+                )
+                parsed_retry = sqlglot.parse(select_sql_sanitized, read=self.dialect)
+                logger.debug(f"_extract_insert_select_lineage_string: Retry parsed result length: {len(parsed_retry) if parsed_retry else 0}")
+                select_stmt = _process_parsed(parsed_retry)
+                if select_stmt:
+                    logger.debug("_extract_insert_select_lineage_string: Retry parsed SELECT, extracting lineage")
+                    lineage, _out_cols = self._extract_column_lineage(select_stmt, object_name)
+                    deps = self._extract_dependencies(select_stmt)
+                    dependencies.update(deps)
+                else:
+                    logger.debug("_extract_insert_select_lineage_string: Retry failed to parse SELECT, using basic dependencies")
+                    dependencies.update(self._extract_basic_dependencies(select_sql))
+            except Exception as retry_error:
+                logger.debug(f"_extract_insert_select_lineage_string: Retry failed: {retry_error}, using basic dependencies")
+                dependencies.update(self._extract_basic_dependencies(select_sql))
             break
     
     logger.debug(f"_extract_insert_select_lineage_string: Returning {len(lineage)} columns, {len(dependencies)} dependencies")
