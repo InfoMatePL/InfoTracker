@@ -129,6 +129,43 @@ def test_leadtime_main_dependencies(leadtime_artifacts: Path):
         f"Expected lineage for at least 85 columns, got {len(col_lineage['fields'])}"
 
 
+def _load_temp_schema_fields(leadtime_artifacts: Path, needle: str) -> list[str]:
+    matches = [p for p in leadtime_artifacts.glob(f"*{needle}*.json") if "__temp__" in p.name]
+    assert matches, f"No temp artifact found for {needle}"
+    data = load_json(matches[0])
+    schema = (data.get("outputs", [{}])[0].get("facets", {}) or {}).get("schema", {})
+    return [f.get("name") for f in schema.get("fields", []) if f.get("name")]
+
+
+def test_leadtime_cte2_schema_columns(leadtime_artifacts: Path):
+    fields = _load_temp_schema_fields(leadtime_artifacts, "CTE2")
+    lowered = {f.lower() for f in fields}
+    expected = {
+        "snapshotdate",
+        "key_offer",
+        "offernumber",
+        "sourcesystem",
+        "contractinformation",
+    }
+    assert expected.issubset(lowered), f"Missing expected CTE2 columns: {expected - lowered}"
+    assert "cte" not in lowered, "CTE2 schema should not include table alias 'CTE'"
+    assert "offer" not in lowered, "CTE2 schema should not include table alias 'offer'"
+
+
+def test_leadtime_step4_schema_columns(leadtime_artifacts: Path):
+    fields = _load_temp_schema_fields(leadtime_artifacts, "LeadTime_STEP4")
+    lowered = {f.lower() for f in fields}
+    expected = {
+        "isttoslarealized",
+        "istty2slarealized",
+        "isttagrslarealized",
+        "isttassetslarealized",
+        "ise2eslarealized",
+    }
+    assert expected.issubset(lowered), f"Missing expected LeadTime_STEP4 columns: {expected - lowered}"
+    assert "*" not in lowered, "LeadTime_STEP4 schema should not include wildcard '*'"
+
+
 def test_leadtime_minimum_table_count(leadtime_artifacts: Path):
     """Test that procedure output has correct lineage."""
     main_json = leadtime_artifacts / "StoredProcedure.dbo.update_stage_mis_LeadTime.json"
@@ -212,6 +249,26 @@ def test_leadtime_output_column_count(leadtime_artifacts: Path):
 # ============================================================================
 # Column lineage tests
 # ============================================================================
+
+
+def test_leadtime_step4_temp_column_mapping(leadtime_artifacts: Path):
+    """Temp->temp lineage should map concrete column names instead of '*' where possible."""
+    temp_json = leadtime_artifacts / "StoredProcedure.dbo.update_stage_mis_LeadTime__temp__EDW_CORE.dbo.hashLeadTime_STEP4.json"
+    data = load_json(temp_json)
+
+    output = data["outputs"][0]
+    col_lineage = output["facets"]["columnLineage"]["fields"]
+    assert "ContractNumber" in col_lineage, "Expected ContractNumber lineage in LeadTime_STEP4"
+
+    contract_lineage = col_lineage["ContractNumber"]
+    temp_inputs = [
+        inp for inp in contract_lineage["inputFields"]
+        if "#LeadTime_STEP3" in inp["name"]
+    ]
+    assert temp_inputs, "Expected LeadTime_STEP3 to be a temp input for ContractNumber"
+    assert any(inp["field"] == "ContractNumber" for inp in temp_inputs), (
+        "Expected temp input field to map to ContractNumber (not '*')"
+    )
 
 
 def test_leadtime_column_graph_structure(leadtime_artifacts: Path):
