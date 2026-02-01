@@ -130,6 +130,11 @@ def _normalize_tsql(self, text: str) -> str:
         t = re.sub(r"[\u200E\u200F\u202A-\u202E\u2066-\u2069]", "", t)
     except Exception:
         pass
+    try:
+        # Remove SUB (0x1A) control characters that can break sqlglot tokenization
+        t = t.replace("\x1a", " ")
+    except Exception:
+        pass
     t = re.sub(r"^\s*SET\s+(ANSI_NULLS|QUOTED_IDENTIFIER)\s+(ON|OFF)\s*;?\s*$", "", t, flags=re.I|re.M)
     t = re.sub(r"^\s*GO\s*;?\s*$", "", t, flags=re.I|re.M)
     t = re.sub(r"\s+COLLATE\s+[A-Za-z0-9_]+", "", t, flags=re.I)

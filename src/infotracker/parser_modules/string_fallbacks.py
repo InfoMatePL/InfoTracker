@@ -74,7 +74,11 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
     # Find ALL INSERT INTO ... SELECT patterns (using finditer instead of search)
     # NOTE: Do NOT treat END as a terminator, otherwise CASE ... END inside SELECT
     # truncates the segment and breaks lineage extraction.
-    pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
+    pattern_with_terminator = (
+        r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)'
+        r'(?:;(?=\s*(?:$|--|/\*|SELECT|SET|DECLARE|IF|BEGIN|END|COMMIT|ROLLBACK|RETURN|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT))'
+        r'|(?=\b(?:COMMIT|ROLLBACK|RETURN|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
+    )
     
     matches = list(re.finditer(pattern_with_terminator, s))
     logger.debug(f"_extract_insert_select_lineage_string: Found {len(matches)} INSERT INTO ... SELECT patterns")
