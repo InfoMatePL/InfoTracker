@@ -386,7 +386,18 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
 
     # Collect all SELECT INTO outputs
     for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
-        obj = _to_obj(m.group(1))
+        table_token = (m.group(1) or "").strip().rstrip(';')
+        # Register temp tables so later parsing can resolve them canonically
+        if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            try:
+                temp_name = self._extract_temp_name(table_token)
+                temp_key = f"#{temp_name.lstrip('#')}"
+                self.temp_registry.setdefault(temp_key, [])
+                self.temp_sources.setdefault(temp_key, set())
+            except Exception:
+                pass
+            continue
+        obj = _to_obj(table_token)
         if obj:
             # Try to extract lineage for SELECT INTO (use a wide window to keep long FROM/JOIN blocks intact)
             try:
@@ -403,9 +414,16 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
             outputs.append(obj)
     # Collect all INSERT INTO outputs (non-temp tables)
     for m in re.finditer(r'(?is)\bINSERT\s+INTO\s+([^\s,()\r\n;]+)', s):
-        table_token = m.group(1).strip().rstrip(';')
-        # Skip temp tables
+        table_token = (m.group(1) or "").strip().rstrip(';')
+        # Register temp tables so later parsing can resolve them canonically
         if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            try:
+                temp_name = self._extract_temp_name(table_token)
+                temp_key = f"#{temp_name.lstrip('#')}"
+                self.temp_registry.setdefault(temp_key, [])
+                self.temp_sources.setdefault(temp_key, set())
+            except Exception:
+                pass
             continue
         obj = _to_obj(table_token)
         if obj:
