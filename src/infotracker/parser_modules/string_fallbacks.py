@@ -385,8 +385,9 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
         return ObjectInfo(name=full_name, object_type="table", schema=TableSchema(namespace=ns, name=full_name, columns=[]), lineage=[], dependencies=set())
 
     # Collect all SELECT INTO outputs
-    for m in re.finditer(r'(?is)\bSELECT\s+.*?\bINTO\s+([^\s,()\r\n;]+)', s):
-        table_token = (m.group(1) or "").strip().rstrip(';')
+    for m in re.finditer(r'(?is)\bSELECT\s+(.*?)\bINTO\s+([^\s,()\r\n;]+)', s):
+        select_list = (m.group(1) or "").strip()
+        table_token = (m.group(2) or "").strip().rstrip(';')
         # Register temp tables so later parsing can resolve them canonically
         if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
             try:
@@ -394,6 +395,121 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                 temp_key = f"#{temp_name.lstrip('#')}"
                 self.temp_registry.setdefault(temp_key, [])
                 self.temp_sources.setdefault(temp_key, set())
+                # Best-effort deps/lineage for temp SELECT INTO (helps inputs for temp artifacts)
+                try:
+                    window_start = max(0, m.start() - 5000)
+                    window_end = min(len(s), m.end() + 20000)
+                    select_into_sql = s[window_start:window_end]
+                    lineage, deps = self._extract_insert_select_lineage_string(select_into_sql, temp_key)
+                    deps = deps or set()
+                    temp_part = temp_key.lstrip('#')
+                    if deps and all((f"#{temp_part}" in d) or ('tempdb' in d.lower()) for d in deps):
+                        deps = set()
+                    if not deps:
+                        deps = self._extract_basic_dependencies(select_into_sql)
+                        if deps:
+                            cte_names = set()
+                            for cte_match in re.finditer(r'(?is)\bWITH\s+([A-Za-z0-9_]+)\s+AS\b', select_into_sql):
+                                cte_names.add(cte_match.group(1).lower())
+                            for cte_match in re.finditer(r'(?is),\s*([A-Za-z0-9_]+)\s+AS\b', select_into_sql):
+                                cte_names.add(cte_match.group(1).lower())
+                            deps = {
+                                d for d in deps
+                                if '#' not in d
+                                and 'tempdb' not in str(d).lower()
+                                and d.split('.')[-1].lower() not in cte_names
+                            }
+                    if deps:
+                        existing = self.temp_sources.get(temp_key, set())
+                        existing.update(deps)
+                        self.temp_sources[temp_key] = existing
+                    use_lineage = bool(lineage)
+                    if use_lineage:
+                        temp_part = temp_key.lstrip('#')
+                        has_refs = False
+                        non_self_ref = False
+                        for lin in lineage:
+                            for ref in lin.input_fields or []:
+                                has_refs = True
+                                if not ref.table_name:
+                                    continue
+                                if f"#{temp_part}" not in ref.table_name and ref.table_name != temp_key:
+                                    non_self_ref = True
+                        has_any_inputs = any(lin.input_fields for lin in lineage)
+                        if (has_refs and not non_self_ref) or (deps and not has_any_inputs):
+                            use_lineage = False
+                    if use_lineage:
+                        col_map = self.temp_lineage.get(temp_key, {})
+                        for lin in lineage:
+                            out_col = lin.output_column
+                            if not out_col:
+                                continue
+                            refs = lin.input_fields or []
+                            merged = {(r.namespace, r.table_name, r.column_name) for r in col_map.get(out_col, [])}
+                            merged.update({(r.namespace, r.table_name, r.column_name) for r in refs})
+                            col_map[out_col] = [ColumnReference(namespace=a, table_name=b, column_name=c) for (a, b, c) in sorted(merged)]
+                        self.temp_lineage[temp_key] = col_map
+                        if not self.temp_registry.get(temp_key):
+                            self.temp_registry[temp_key] = [lin.output_column for lin in lineage if lin.output_column]
+                    if not use_lineage and deps:
+                        try:
+                            select_list_local = select_list
+                            try:
+                                def _find_statement_start(sql_text: str, end_idx: int) -> int:
+                                    in_str = False
+                                    last_semi = -1
+                                    i = 0
+                                    while i < end_idx:
+                                        ch = sql_text[i]
+                                        if ch == "'":
+                                            if in_str and i + 1 < len(sql_text) and sql_text[i + 1] == "'":
+                                                i += 2
+                                                continue
+                                            in_str = not in_str
+                                        elif ch == ';' and not in_str:
+                                            last_semi = i
+                                        i += 1
+                                    return last_semi + 1
+
+                                into_token = f"into {table_token.lower()}"
+                                into_pos = s.lower().find(into_token, m.start())
+                                if into_pos != -1:
+                                    stmt_start = _find_statement_start(s, into_pos)
+                                    select_pos = s.lower().rfind("select", stmt_start, into_pos)
+                                    if select_pos != -1:
+                                        select_list_local = s[select_pos + len("select"):into_pos]
+                            except Exception:
+                                select_list_local = select_list
+
+                            select_sql = f"SELECT {select_list_local} FROM dummy"
+                            basic_cols = self._extract_basic_select_columns(select_sql)
+                            if basic_cols:
+                                if not self.temp_registry.get(temp_key):
+                                    self.temp_registry[temp_key] = [col.name for col in basic_cols if col.name]
+                                col_map = self.temp_lineage.get(temp_key, {})
+                                for col in basic_cols:
+                                    out_col = col.name
+                                    if not out_col:
+                                        continue
+                                    merged = {(r.namespace, r.table_name, r.column_name) for r in col_map.get(out_col, [])}
+                                    temp_part = temp_key.lstrip('#')
+                                    for dep in sorted(deps):
+                                        if f"#{temp_part}" in dep or 'tempdb' in dep.lower():
+                                            continue
+                                        ns, nm = self._ns_and_name(dep, obj_type_hint="table")
+                                        merged.add((ns, nm, out_col))
+                                    col_map[out_col] = [
+                                        ColumnReference(namespace=a, table_name=b, column_name=c)
+                                        for (a, b, c) in sorted(merged)
+                                    ]
+                                if col_map:
+                                    self.temp_lineage[temp_key] = col_map
+                        except Exception as e:
+                            logger.debug(
+                                f"_extract_materialized_output_from_procedure_string: Failed basic lineage fallback for temp {temp_key}: {e}"
+                            )
+                except Exception as e:
+                    logger.debug(f"_extract_materialized_output_from_procedure_string: Failed to extract lineage for SELECT INTO temp {temp_key}: {e}")
             except Exception:
                 pass
             continue
@@ -621,26 +737,104 @@ def _extract_basic_select_columns(self, select_sql: str) -> List[ColumnSchema]:
     """Basic extraction of column names from a SELECT (string parsing)."""
     output_columns: List[ColumnSchema] = []
 
+    def _split_select_list(select_list: str) -> List[str]:
+        parts: List[str] = []
+        buf: List[str] = []
+        depth = 0
+        in_str = False
+        i = 0
+        while i < len(select_list):
+            ch = select_list[i]
+            if ch == "'":
+                if in_str and i + 1 < len(select_list) and select_list[i + 1] == "'":
+                    buf.append(ch)
+                    buf.append(select_list[i + 1])
+                    i += 2
+                    continue
+                in_str = not in_str
+                buf.append(ch)
+                i += 1
+                continue
+            if not in_str:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')' and depth > 0:
+                    depth -= 1
+                elif ch == ',' and depth == 0:
+                    part = "".join(buf).strip()
+                    if part:
+                        parts.append(part)
+                    buf = []
+                    i += 1
+                    continue
+            buf.append(ch)
+            i += 1
+        tail = "".join(buf).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _split_alias_top_level(col_expr: str) -> tuple[str, Optional[str]]:
+        depth = 0
+        in_str = False
+        last_as = -1
+        i = 0
+        while i <= len(col_expr) - 4:
+            ch = col_expr[i]
+            if ch == "'":
+                if in_str and i + 1 < len(col_expr) and col_expr[i + 1] == "'":
+                    i += 2
+                    continue
+                in_str = not in_str
+                i += 1
+                continue
+            if not in_str:
+                if ch == '(':
+                    depth += 1
+                elif ch == ')' and depth > 0:
+                    depth -= 1
+                elif depth == 0 and col_expr[i:i + 4].upper() == ' AS ':
+                    last_as = i
+            i += 1
+        if last_as != -1:
+            left = col_expr[:last_as].strip()
+            right = col_expr[last_as + 4:].strip().strip("[]\"'")
+            return left, right
+        return col_expr, None
+
     match = re.search(r'SELECT\s+(.*?)\s+FROM', select_sql, re.IGNORECASE | re.DOTALL)
     if not match:
         return output_columns
 
     select_list = match.group(1)
-    columns = [col.strip() for col in select_list.split(',')]
+    columns = _split_select_list(select_list)
     for i, col in enumerate(columns):
-        if ' AS ' in col.upper():
-            col_name = col.split(' AS ')[-1].strip()
-        elif ' ' in col and not any(func in col.upper() for func in ['SUM', 'COUNT', 'MAX', 'MIN', 'AVG', 'CAST', 'CASE']):
-            parts = col.strip().split()
+        col_expr, col_alias = _split_alias_top_level(col)
+        upper_col = col_expr.upper()
+        if col_alias:
+            col_name = col_alias
+        elif ' ' in col_expr and not re.search(r'\b(SUM|COUNT|MAX|MIN|AVG)\s*\(', upper_col) and not re.search(r'\b(CAST|CASE)\b', upper_col):
+            parts = col_expr.strip().split()
             col_name = parts[-1]
+            if len(parts) >= 2:
+                type_pat = r'^(varbinary|varchar|nvarchar|char|nchar|binary|int|bigint|smallint|tinyint|decimal|numeric|float|real|date|datetime2?|smalldatetime|bit)\b'
+                if re.match(type_pat, parts[1], re.I):
+                    col_name = parts[0]
         else:
             # Derive a stable name by stripping expression tails if no alias
             try:
                 from .select_lineage import _strip_expr_tail
-                col_name = _strip_expr_tail(col)
+                col_name = _strip_expr_tail(col_expr)
             except Exception:
-                col_name = col.split('.')[-1] if '.' in col else col
+                col_name = col_expr.split('.')[-1] if '.' in col_expr else col_expr
                 col_name = re.sub(r'[^\w]', '', col_name)
+
+        if col_name:
+            clean = col_name.strip()
+            if re.match(r"^'?(n?varchar|varbinary|char|nchar)\b", clean, re.I):
+                col_name = ""
+            elif re.search(r"\bcase\b|\bcoalesce\b", clean, re.I) and ' ' in clean:
+                col_name = ""
 
         if col_name:
             output_columns.append(ColumnSchema(
@@ -680,7 +874,7 @@ def _parse_column_expression(self, col_expr: str, table_aliases: Dict[str, str])
         if len(parts) > 1:
             col_expr = ' '.join(parts[:-1]).strip()
 
-    if any(func in col_expr.upper() for func in ['SUM(', 'COUNT(', 'MAX(', 'MIN(', 'AVG(']):
+    if re.search(r'\b(SUM|COUNT|MAX|MIN|AVG)\s*\(', col_expr.upper()):
         transformation_type = TransformationType.AGGREGATION
     elif 'CASE' in col_expr.upper():
         transformation_type = TransformationType.CONDITIONAL
@@ -716,7 +910,45 @@ def _extract_basic_lineage_from_select(self, select_sql: str, output_columns: Li
         if not select_match:
             return lineage
         select_list = select_match.group(1)
-        column_expressions = [col.strip() for col in select_list.split(',')]
+        # Reuse the same top-level split logic as _extract_basic_select_columns
+        def _split_select_list(select_list: str) -> List[str]:
+            parts: List[str] = []
+            buf: List[str] = []
+            depth = 0
+            in_str = False
+            i = 0
+            while i < len(select_list):
+                ch = select_list[i]
+                if ch == "'":
+                    if in_str and i + 1 < len(select_list) and select_list[i + 1] == "'":
+                        buf.append(ch)
+                        buf.append(select_list[i + 1])
+                        i += 2
+                        continue
+                    in_str = not in_str
+                    buf.append(ch)
+                    i += 1
+                    continue
+                if not in_str:
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')' and depth > 0:
+                        depth -= 1
+                    elif ch == ',' and depth == 0:
+                        part = "".join(buf).strip()
+                        if part:
+                            parts.append(part)
+                        buf = []
+                        i += 1
+                        continue
+                buf.append(ch)
+                i += 1
+            tail = "".join(buf).strip()
+            if tail:
+                parts.append(tail)
+            return parts
+
+        column_expressions = _split_select_list(select_list)
         for output_col, col_expr in zip(output_columns, column_expressions):
             source_table, source_column, transformation_type = _parse_column_expression(self, col_expr, table_aliases)
             if source_table and source_column:
@@ -1048,6 +1280,15 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
     m_target = re.search(r'(?is)MERGE\s+INTO\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', cleaned)
     if not m_target:
         return lineage, output_columns, dependencies, None
+    # Work on the MERGE statement slice to avoid cross-statement matches (e.g., OUTPUT in proc params)
+    merge_sql = cleaned[m_target.start():]
+    try:
+        tail = merge_sql[1:]
+        boundary = re.search(r'(?im)^\s*(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|BEGIN|END|GO)\b', tail)
+        if boundary:
+            merge_sql = merge_sql[:boundary.start() + 1]
+    except Exception:
+        pass
     target_raw = self._normalize_table_ident(m_target.group(1))
     tgt_alias = (m_target.group(2) or m_target.group(3) or '').strip() or None
     parts = target_raw.split('.')
@@ -1059,7 +1300,7 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
         target_table = f"dbo.{target_raw}"
 
     # Source
-    m_using = re.search(r'(?is)USING\s+([^\s\(,;#]+|#\w+)(?:\s+AS\s+(\w+)|\s+(\w+))?', cleaned)
+    m_using = re.search(r'(?is)USING\s+([^\s\(,;#]+|#\w+)(?:\s+AS\s+(\w+)|\s+(\w+))?', merge_sql)
     source_name: Optional[str] = None
     src_alias: Optional[str] = None
     if m_using:
@@ -1082,7 +1323,7 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
 
     # Parse SET assignments and build lineage
     assign_exprs: List[tuple[str, str]] = []
-    m_when = re.search(r'(?is)WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+(.*?)\s*(?:WHEN\s+|OUTPUT\s+|;|$)', cleaned)
+    m_when = re.search(r'(?is)WHEN\s+MATCHED\s+THEN\s+UPDATE\s+SET\s+(.*?)\s*(?:WHEN\s+|OUTPUT\s+|;|$)', merge_sql)
     if m_when:
         set_block = m_when.group(1)
         parts = re.split(r',(?![^\(]*\))', set_block)
@@ -1110,7 +1351,7 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
                 assign_exprs.append((l_col, right))
 
     # OUTPUT clause
-    m_output = re.search(r'(?is)OUTPUT\s+(.*?)\s+INTO\s+([^\s,;]+)', cleaned)
+    m_output = re.search(r'(?is)OUTPUT\s+(.*?)\s+INTO\s+([^\s,;]+)', merge_sql)
     if m_output:
         out_exprs = m_output.group(1)
         out_target = self._normalize_table_ident(m_output.group(2))

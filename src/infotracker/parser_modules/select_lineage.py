@@ -1220,7 +1220,8 @@ def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple
             if "HASHBYTES(" in s or "MD5(" in s:
                 out_name = "hash_expr"
             elif isinstance(proj, exp.Coalesce):
-                out_name = "coalesce_expr"
+                col = proj.find(exp.Column)
+                out_name = (col.name if col else "calc_expr")
             elif isinstance(proj, (exp.Trim, exp.Upper, exp.Lower)):
                 col = proj.find(exp.Column)
                 out_name = (col.name if col else "text_expr")

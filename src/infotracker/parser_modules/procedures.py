@@ -163,6 +163,26 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                         best_output = cand
                         break
         
+        selected_from_merge = False
+        # If we only selected a temp output but the procedure MERGEs into a persistent table,
+        # prefer the MERGE target as the primary output (temp remains registered via temp_registry).
+        if best_output.object_type == "temp_table" or (best_output.name and "#" in best_output.name):
+            try:
+                m_lineage, m_cols, m_deps, m_target = self._extract_merge_lineage_string(sql_content, procedure_name)
+            except Exception:
+                m_lineage, m_cols, m_deps, m_target = ([], [], set(), None)
+            if m_target and not m_target.startswith("#") and "tempdb" not in m_target.lower():
+                ns_tgt, nm_tgt = self._ns_and_name(m_target, obj_type_hint="table")
+                schema = TableSchema(namespace=ns_tgt, name=nm_tgt, columns=m_cols)
+                best_output = ObjectInfo(
+                    name=nm_tgt,
+                    object_type="table",
+                    schema=schema,
+                    lineage=m_lineage,
+                    dependencies=m_deps,
+                )
+                selected_from_merge = True
+
         materialized_output = best_output
         logger.debug(f"Selected primary output: {materialized_output.name} (lineage count: {len(materialized_output.lineage)})")
         # Ensure materialized output uses the correct database from USE statement
@@ -185,7 +205,7 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
         # If lineage was already extracted in _extract_materialized_output_from_procedure_string and has input_fields, use it
         # Otherwise, try to extract lineage again
         has_valid_lineage = materialized_output.lineage and any(lin.input_fields for lin in materialized_output.lineage)
-        if not has_valid_lineage:
+        if not has_valid_lineage and not selected_from_merge:
             try:
                 ins_lineage, ins_deps = self._extract_insert_select_lineage_string(sql_content, target_table_name)
                 if ins_deps:
@@ -250,14 +270,15 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
             materialized_output.schema.name = name_key
         else:
             # Fallback: columns from INSERT INTO column list
-            cols = self._extract_insert_into_columns(sql_content)
-            if cols:
-                materialized_output.schema = TableSchema(
-                    namespace=ns,
-                    name=name_key,
-                    columns=[ColumnSchema(name=c, data_type="unknown", nullable=True, ordinal=i)
-                             for i, c in enumerate(cols)]
-                )
+            if not selected_from_merge:
+                cols = self._extract_insert_into_columns(sql_content)
+                if cols:
+                    materialized_output.schema = TableSchema(
+                        namespace=ns,
+                        name=name_key,
+                        columns=[ColumnSchema(name=c, data_type="unknown", nullable=True, ordinal=i)
+                                 for i, c in enumerate(cols)]
+                    )
 
         # Supplement temp lineage/deps using lightweight segment parsing when AST walk wasn't possible
         try:
@@ -2919,6 +2940,25 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         result_output = best_match_output or last_persistent_output
         
     logger.debug(f"Selected primary output: {result_output.name if result_output else 'None'} (lineage count: {len(result_output.lineage) if result_output else 0})")
+
+    # If we only selected a temp output (or nothing) but the procedure MERGEs into a persistent table,
+    # prefer the MERGE target as the primary output.
+    if (not result_output) or result_output.object_type == "temp_table" or (result_output.name and "#" in result_output.name):
+        try:
+            m_lineage, m_cols, m_deps, m_target = self._extract_merge_lineage_string(full_sql, procedure_name)
+        except Exception:
+            m_lineage, m_cols, m_deps, m_target = ([], [], set(), None)
+        if m_target and not m_target.startswith("#") and "tempdb" not in m_target.lower():
+            ns_tgt, nm_tgt = self._ns_and_name(m_target, obj_type_hint="table")
+            schema = TableSchema(namespace=ns_tgt, name=nm_tgt, columns=m_cols)
+            result_output = ObjectInfo(
+                name=nm_tgt,
+                object_type="table",
+                schema=schema,
+                lineage=m_lineage,
+                dependencies=m_deps,
+            )
+            logger.debug(f"_parse_procedure_body_statements: Promoted MERGE target as primary output: {nm_tgt}")
     
     # If we found persistent outputs, merge lineage from UPDATE if it targets the same table
     if result_output:
