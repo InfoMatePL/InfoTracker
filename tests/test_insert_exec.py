@@ -100,3 +100,23 @@ class TestInsertExecParsing:
         for lineage_item in obj_info.lineage:
             desc = _canon_exec_desc(lineage_item.transformation_description)
             assert "#results" in desc and "EXEC dbo.ComplexProcedure" in desc
+
+    def test_insert_exec_populates_temp_sources_for_temp_registry(self):
+        sql = """
+        CREATE PROCEDURE dbo.test_insert_exec_temp
+        AS
+        BEGIN
+            INSERT INTO #result_temp
+            EXEC dbo.GetCustomerData @param1 = 1
+        END
+        """
+
+        self.parser.parse_sql_file(sql, object_hint="dbo.test_insert_exec_temp")
+
+        temp_sources = self.parser.temp_sources.get("#result_temp", set())
+        assert temp_sources, "Expected temp_sources for #result_temp to be populated"
+        assert any(src.lower().endswith("dbo.getcustomerdata") for src in temp_sources)
+
+        temp_lineage = self.parser.temp_lineage.get("#result_temp", {})
+        assert "output_col_1" in temp_lineage, "Expected fallback lineage for INSERT EXEC temp"
+        assert any((ref.column_name or "") == "*" for ref in temp_lineage["output_col_1"])
