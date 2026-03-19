@@ -59,6 +59,14 @@ def _canonical_temp_name(self, name: str) -> str:
         # Version is used internally but not in final object names
         if '@' in n:
             n = n.split('@')[0]
+        # Sanitize temp token aggressively to avoid malformed names like
+        # "#missingPartition.NULL,..." leaking into graph artifacts.
+        try:
+            clean_temp = self._extract_temp_name(n)
+            if clean_temp:
+                n = f"#{str(clean_temp).lstrip('#')}"
+        except Exception:
+            pass
         seg = n
         # Prefer current_database from USE statement, then _ctx_db, then default
         # This ensures temp tables use the correct database (e.g., EDW_CORE instead of INFOTRACKERDW)

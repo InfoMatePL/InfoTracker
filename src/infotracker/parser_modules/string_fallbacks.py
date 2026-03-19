@@ -402,6 +402,27 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                     select_into_sql = s[window_start:window_end]
                     lineage, deps = self._extract_insert_select_lineage_string(select_into_sql, temp_key)
                     deps = deps or set()
+                    # For simple SELECT * INTO #temp FROM <base>, keep a direct source hint
+                    # so we can build minimal incoming lineage if SQL parser returns empty lineage.
+                    direct_source_dep = None
+                    try:
+                        stmt_end = s.find(';', m.start())
+                        if stmt_end == -1:
+                            stmt_end = min(len(s), m.start() + 4000)
+                        stmt_sql = s[m.start():stmt_end]
+                        from_match = re.search(
+                            rf'(?is)\bSELECT\s+.*?\bINTO\s+{re.escape(table_token)}\s+FROM\s+([^\s,;()]+(?:\.[^\s,;()]+)*)',
+                            stmt_sql,
+                        )
+                        if from_match:
+                            source_tok = self._normalize_table_ident(from_match.group(1))
+                            if source_tok and '#' not in source_tok and 'tempdb' not in source_tok.lower():
+                                direct_source_dep = self._get_full_table_name(source_tok)
+                    except Exception:
+                        direct_source_dep = None
+
+                    if direct_source_dep and not deps:
+                        deps = {direct_source_dep}
                     temp_part = temp_key.lstrip('#')
                     if deps and all((f"#{temp_part}" in d) or ('tempdb' in d.lower()) for d in deps):
                         deps = set()
@@ -504,6 +525,25 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                                     ]
                                 if col_map:
                                     self.temp_lineage[temp_key] = col_map
+                            elif deps and '*' in (select_list_local or ''):
+                                # Minimal fallback for SELECT * INTO when we cannot infer real columns.
+                                # This keeps dataset-level incoming edges for temp tables.
+                                if not self.temp_registry.get(temp_key):
+                                    self.temp_registry[temp_key] = ["output_col_1"]
+                                col_map = self.temp_lineage.get(temp_key, {})
+                                merged = {(r.namespace, r.table_name, r.column_name) for r in col_map.get("output_col_1", [])}
+                                temp_part = temp_key.lstrip('#')
+                                for dep in sorted(deps):
+                                    if f"#{temp_part}" in dep or 'tempdb' in dep.lower():
+                                        continue
+                                    ns, nm = self._ns_and_name(dep, obj_type_hint="table")
+                                    merged.add((ns, nm, "*"))
+                                if merged:
+                                    col_map["output_col_1"] = [
+                                        ColumnReference(namespace=a, table_name=b, column_name=c)
+                                        for (a, b, c) in sorted(merged)
+                                    ]
+                                    self.temp_lineage[temp_key] = col_map
                         except Exception as e:
                             logger.debug(
                                 f"_extract_materialized_output_from_procedure_string: Failed basic lineage fallback for temp {temp_key}: {e}"
@@ -538,6 +578,34 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                 temp_key = f"#{temp_name.lstrip('#')}"
                 self.temp_registry.setdefault(temp_key, [])
                 self.temp_sources.setdefault(temp_key, set())
+
+                # Best-effort bridge for INSERT INTO #temp EXEC proc
+                # This preserves incoming lineage for temp datasets created from procedure execution.
+                stmt_end = s.find(';', m.start())
+                if stmt_end == -1:
+                    stmt_end = min(len(s), m.start() + 4000)
+                stmt_sql = s[m.start():stmt_end]
+                exec_match = re.search(r'(?is)\bINSERT\s+INTO\s+[#\w.\[\]]+\s+EXEC\s+([^\s(;]+)', stmt_sql)
+                if exec_match:
+                    proc_name = self._clean_proc_name(exec_match.group(1))
+                    proc_full = self._get_full_table_name(proc_name)
+                    if proc_full:
+                        existing = self.temp_sources.get(temp_key, set())
+                        existing.add(proc_full)
+                        self.temp_sources[temp_key] = existing
+
+                        ns_p, nm_p = self._ns_and_name(proc_full)
+                        col_map = self.temp_lineage.get(temp_key, {})
+                        refs = col_map.get("output_col_1", [])
+                        ref_tuples = {(r.namespace, r.table_name, r.column_name) for r in refs}
+                        ref_tuples.add((ns_p, nm_p, "*"))
+                        col_map["output_col_1"] = [
+                            ColumnReference(namespace=a, table_name=b, column_name=c)
+                            for (a, b, c) in sorted(ref_tuples)
+                        ]
+                        self.temp_lineage[temp_key] = col_map
+                        if not self.temp_registry.get(temp_key):
+                            self.temp_registry[temp_key] = ["output_col_1"]
             except Exception:
                 pass
             continue
@@ -1088,6 +1156,12 @@ def _extract_output_into_lineage_string(self, sql_content: str) -> tuple[List[Co
     s = self._strip_sql_comments(self._normalize_tsql(sql_content))
     def _st(name: str) -> str:
         name = self._normalize_table_ident(name)
+        if name and ('#' in name or 'tempdb..#' in name.lower()):
+            try:
+                temp_name = self._extract_temp_name(name)
+                return f"dbo.#{str(temp_name).lstrip('#')}"
+            except Exception:
+                pass
         parts = name.split('.')
         if len(parts) >= 3:
             return f"{parts[-2]}.{parts[-1]}"
@@ -1355,6 +1429,11 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
     if m_output:
         out_exprs = m_output.group(1)
         out_target = self._normalize_table_ident(m_output.group(2))
+        if out_target and ('#' in out_target or 'tempdb..#' in out_target.lower()):
+            try:
+                out_target = f"dbo.#{str(self._extract_temp_name(out_target)).lstrip('#')}"
+            except Exception:
+                pass
         exprs = re.split(r',(?![^\(]*\))', out_exprs)
         cols = []
         for e in exprs:

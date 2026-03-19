@@ -95,6 +95,11 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
                 temp_part = parts[temp_idx]
                 # Remove square brackets if present
                 temp_part = temp_part.strip('[]')
+                # Sanitize malformed temp suffixes (e.g. #tmp.NULL,...)
+                try:
+                    temp_part = f"#{str(self._extract_temp_name(temp_part)).lstrip('#')}"
+                except Exception:
+                    pass
                 if not temp_part.startswith('#'):
                     temp_part = f"#{temp_part.lstrip('#')}"
                 
@@ -121,6 +126,10 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
         # Simple case: #temp (no context or parsing failed)
         db = self.current_database or self.default_database or "InfoTrackerDW"
         clean_temp = canonical.strip('[]')
+        try:
+            clean_temp = f"#{str(self._extract_temp_name(clean_temp)).lstrip('#')}"
+        except Exception:
+            pass
         if not clean_temp.startswith('#'):
             clean_temp = f"#{clean_temp.lstrip('#')}"
         return f"mssql://localhost/{db.upper()}", f"dbo.{clean_temp}"
