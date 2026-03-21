@@ -354,10 +354,7 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
     """
     logger.debug(f"_extract_materialized_output_from_procedure_string: Called")
     outputs: List[ObjectInfo] = []
-    s = self._normalize_tsql(sql_content)
-    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
-    lines = s.splitlines()
-    s = "\n".join(line for line in lines if not line.lstrip().startswith('--'))
+    s = self._strip_sql_comments(self._normalize_tsql(sql_content))
 
     def _to_obj(table_token: str) -> Optional[ObjectInfo]:
         tok = (table_token or "").strip().rstrip(';')
@@ -492,11 +489,41 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
                                         i += 1
                                     return last_semi + 1
 
+                                def _find_outer_select(sql_text: str, start_idx: int, end_idx: int) -> int:
+                                    in_str = False
+                                    paren_depth = 0
+                                    i = start_idx
+                                    last_outer_select = -1
+                                    while i < end_idx:
+                                        ch = sql_text[i]
+                                        if ch == "'":
+                                            if in_str and i + 1 < len(sql_text) and sql_text[i + 1] == "'":
+                                                i += 2
+                                                continue
+                                            in_str = not in_str
+                                            i += 1
+                                            continue
+                                        if not in_str:
+                                            if ch == '(':
+                                                paren_depth += 1
+                                            elif ch == ')' and paren_depth > 0:
+                                                paren_depth -= 1
+                                            elif paren_depth == 0 and sql_text[i:i + 6].lower() == "select":
+                                                prev_ok = i == 0 or not (sql_text[i - 1].isalnum() or sql_text[i - 1] == '_')
+                                                next_idx = i + 6
+                                                next_ok = next_idx >= len(sql_text) or not (
+                                                    sql_text[next_idx].isalnum() or sql_text[next_idx] == '_'
+                                                )
+                                                if prev_ok and next_ok:
+                                                    last_outer_select = i
+                                        i += 1
+                                    return last_outer_select
+
                                 into_token = f"into {table_token.lower()}"
                                 into_pos = s.lower().find(into_token, m.start())
                                 if into_pos != -1:
                                     stmt_start = _find_statement_start(s, into_pos)
-                                    select_pos = s.lower().rfind("select", stmt_start, into_pos)
+                                    select_pos = _find_outer_select(s, stmt_start, into_pos)
                                     if select_pos != -1:
                                         select_list_local = s[select_pos + len("select"):into_pos]
                             except Exception:

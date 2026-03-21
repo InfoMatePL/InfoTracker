@@ -6,7 +6,7 @@ import logging
 import sqlglot
 from sqlglot import exp  # type: ignore
 
-from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage
+from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage, ColumnReference
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
     try:
         # Use the same preprocessing pipeline as the main parser so sqlglot can handle T-SQL procs
         normalized = self._normalize_tsql(sql_content)
-        preprocessed = self._preprocess_sql(normalized)
+        preprocessed = self._strip_sql_comments(self._preprocess_sql(normalized))
         stmts = sqlglot.parse(preprocessed, read=self.dialect) or []
         logger.debug(f"_parse_procedure_body_statements: Parsed {len(stmts)} statements")
         for i, st in enumerate(stmts):
@@ -282,7 +282,7 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
 
         # Supplement temp lineage/deps using lightweight segment parsing when AST walk wasn't possible
         try:
-            src_text = sql_content
+            src_text = self._strip_sql_comments(sql_content)
             seg_sql = self._preprocess_sql(self._normalize_tsql(src_text))
             import re as _re
             # SELECT ... INTO #temp ... segments
@@ -821,6 +821,9 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     """
     logger.debug(f"_parse_procedure_body_statements: Called with object_hint={object_hint}")
     from ..openlineage_utils import sanitize_name
+
+    body_sql = self._strip_sql_comments(body_sql or "")
+    full_sql = self._strip_sql_comments(full_sql or "")
     
     procedure_name = self._extract_procedure_name(full_sql) or object_hint or "unknown_procedure"
     
@@ -958,7 +961,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                         logger.debug(f"_parse_procedure_body_statements: Traceback: {traceback.format_exc()}")
     
     # Preprocess body (remove DECLARE, SET, etc.)
-    preprocessed_body = self._preprocess_sql(body_sql)
+    preprocessed_body = self._strip_sql_comments(self._preprocess_sql(body_sql))
     logger.debug(f"_parse_procedure_body_statements: preprocessed_body length={len(preprocessed_body)}")
     # Check if SELECT INTO is in preprocessed_body
     if 'INTO #' in preprocessed_body or 'INTO #asefl_temp' in preprocessed_body:
@@ -978,6 +981,157 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
             temp_tables_found.append(temp_name)
     if temp_tables_found:
         logger.debug(f"_parse_procedure_body_statements: Found temp tables: {temp_tables_found}")
+
+    # Best-effort fallback for pattern: CREATE TABLE #temp (...) + INSERT INTO #temp SELECT ...
+    # This helps keep dataset-level incoming edges for temp tables in unsupported procedure bodies.
+    try:
+        import re as _re_fallback
+        scan_sql = preprocessed_body or body_sql or ""
+
+        def _split_top_level_commas(text: str) -> list[str]:
+            parts: list[str] = []
+            current: list[str] = []
+            depth = 0
+            in_str = False
+            i = 0
+            while i < len(text):
+                ch = text[i]
+                if ch == "'":
+                    if in_str and i + 1 < len(text) and text[i + 1] == "'":
+                        current.append(ch)
+                        current.append(text[i + 1])
+                        i += 2
+                        continue
+                    in_str = not in_str
+                    current.append(ch)
+                    i += 1
+                    continue
+                if not in_str:
+                    if ch == '(':
+                        depth += 1
+                    elif ch == ')' and depth > 0:
+                        depth -= 1
+                    elif ch == ',' and depth == 0:
+                        seg = ''.join(current).strip()
+                        if seg:
+                            parts.append(seg)
+                        current = []
+                        i += 1
+                        continue
+                current.append(ch)
+                i += 1
+            tail = ''.join(current).strip()
+            if tail:
+                parts.append(tail)
+            return parts
+
+        # 1) Register columns from CREATE TABLE #temp (...)
+        for m_create in _re_fallback.finditer(r'(?is)\bCREATE\s+TABLE\s+(#\w+)\s*\((.*?)\)\s*;', scan_sql):
+            tkey = (m_create.group(1) or '').strip()
+            cols_block = m_create.group(2) or ''
+            if not tkey:
+                continue
+            col_names: list[str] = []
+            for col_def in _split_top_level_commas(cols_block):
+                c = (col_def or '').strip()
+                if not c:
+                    continue
+                first = c.split()[0].strip('[]')
+                if not first:
+                    continue
+                if first.upper() in {"CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "INDEX", "KEY"}:
+                    continue
+                if first.lower() not in {x.lower() for x in col_names}:
+                    col_names.append(first)
+            if col_names:
+                existing_cols = list(self.temp_registry.get(tkey, []) or [])
+                should_replace = (
+                    not existing_cols
+                    or len(col_names) > len(existing_cols)
+                )
+                if should_replace:
+                    self.temp_registry[tkey] = col_names
+
+        # 2) Add deps/lineage from INSERT INTO #temp SELECT ...
+        for m_ins in _re_fallback.finditer(r'(?is)\bINSERT\s+INTO\s+(#\w+)\s*(\((.*?)\))?\s*SELECT\s+(.*?)(?=\bFROM\b)', scan_sql):
+            tkey = (m_ins.group(1) or '').strip()
+            insert_cols_raw = (m_ins.group(3) or '').strip()
+            select_list = (m_ins.group(4) or '').strip()
+            if not tkey:
+                continue
+
+            # Build a statement window for dependency extraction (include FROM/JOIN section)
+            seg_start = m_ins.start()
+            seg_end = len(scan_sql)
+            m_end = _re_fallback.search(r'(?is)(;|\bINSERT\s+INTO\b|\bCREATE\s+TABLE\b|\bUPDATE\b|\bDELETE\b|\bMERGE\b|\bEND\b|\bGO\b)', scan_sql[m_ins.end():])
+            if m_end:
+                seg_end = m_ins.end() + m_end.start()
+            stmt_sql = scan_sql[seg_start:seg_end]
+
+            deps = self._extract_basic_dependencies(stmt_sql) or set()
+            deps = {d for d in deps if '#' not in str(d) and 'tempdb' not in str(d).lower()}
+            if not deps:
+                for m_dep in _re_fallback.finditer(r'(?is)\b(?:FROM|JOIN)\s+([\[\]\w\.]+)', stmt_sql):
+                    dep_tok = (m_dep.group(1) or '').strip().rstrip(',;')
+                    if not dep_tok:
+                        continue
+                    dep_clean = dep_tok.replace('[', '').replace(']', '')
+                    dep_l = dep_clean.lower()
+                    if '#' in dep_clean or 'tempdb' in dep_l:
+                        continue
+                    deps.add(dep_clean)
+            if deps:
+                existing = self.temp_sources.get(tkey, set())
+                existing.update(deps)
+                self.temp_sources[tkey] = existing
+
+            if not deps:
+                continue
+
+            col_map = self.temp_lineage.get(tkey, {}) or {}
+
+            select_cols = [c.name for c in self._extract_basic_select_columns(f"SELECT {select_list} FROM dummy") if c.name]
+
+            target_cols: list[str] = []
+            if insert_cols_raw:
+                for c in _split_top_level_commas(insert_cols_raw):
+                    name = (c or '').strip().strip('[]')
+                    if name:
+                        target_cols.append(name)
+            else:
+                target_cols = list(self.temp_registry.get(tkey, []) or [])
+                if target_cols and select_cols and len(target_cols) > len(select_cols):
+                    target_cols = target_cols[-len(select_cols):]
+
+            if not target_cols:
+                target_cols = ["output_col_1"]
+                if tkey not in self.temp_registry:
+                    self.temp_registry[tkey] = target_cols
+
+            if select_cols:
+                if len(select_cols) < len(target_cols):
+                    select_cols.extend([select_cols[-1]] * (len(target_cols) - len(select_cols)))
+                elif len(select_cols) > len(target_cols):
+                    select_cols = select_cols[:len(target_cols)]
+            else:
+                select_cols = ['*'] * len(target_cols)
+
+            for out_col, src_col in zip(target_cols, select_cols):
+                if out_col in col_map and col_map.get(out_col):
+                    continue
+                merged = {(r.namespace, r.table_name, r.column_name) for r in col_map.get(out_col, [])}
+                for dep in sorted(deps):
+                    ns_dep, nm_dep = self._ns_and_name(dep, obj_type_hint="table")
+                    merged.add((ns_dep, nm_dep, src_col or '*'))
+                col_map[out_col] = [
+                    ColumnReference(namespace=a, table_name=b, column_name=c)
+                    for (a, b, c) in sorted(merged)
+                ]
+
+            if col_map:
+                self.temp_lineage[tkey] = col_map
+    except Exception:
+        pass
     
     # Initialize outputs and inputs before parsing
     all_outputs = []
