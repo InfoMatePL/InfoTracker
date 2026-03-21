@@ -302,6 +302,106 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                                 logger.debug(f"_extract_insert_select_lineage_string: Failed to parse CTE manually: {e}, traceback: {traceback.format_exc()}")
             return select_stmt_local
 
+        def _add_join_only_temp_refs(select_stmt_local: exp.Select, lin_items: List[ColumnLineage]) -> None:
+            if not select_stmt_local or not lin_items:
+                return
+
+            target_lin = None
+            for lin in lin_items:
+                if lin.output_column and str(lin.output_column) != "*":
+                    target_lin = lin
+                    break
+            if target_lin is None:
+                target_lin = lin_items[0]
+
+            lineage_table_names = {
+                str(ref.table_name).lower()
+                for lin in (lin_items or [])
+                for ref in (lin.input_fields or [])
+                if ref and ref.table_name
+            }
+
+            existing_ref_keys = {
+                (str(ref.namespace), str(ref.table_name).lower(), str(ref.column_name).lower())
+                for ref in (target_lin.input_fields or [])
+                if ref and ref.table_name
+            }
+
+            for join in select_stmt_local.find_all(exp.Join):
+                join_table = getattr(join, 'this', None)
+                if not isinstance(join_table, exp.Table):
+                    continue
+
+                join_name = self._get_table_name(join_table)
+                if not join_name:
+                    continue
+
+                join_is_temporary = False
+                try:
+                    join_ident = getattr(join_table, 'this', None)
+                    if join_ident is not None and hasattr(join_ident, 'args'):
+                        join_is_temporary = bool(join_ident.args.get('temporary'))
+                except Exception:
+                    join_is_temporary = False
+
+                if join_is_temporary and '#' not in join_name and 'tempdb' not in join_name.lower():
+                    join_name = f"#{join_name.split('.')[-1]}"
+
+                join_name_l = str(join_name).lower()
+                if '#' not in join_name_l and 'tempdb' not in join_name_l and not join_is_temporary:
+                    continue
+
+                ns_j, nm_j = self._ns_and_name(join_name, obj_type_hint="temp_table")
+                if str(nm_j).lower() in lineage_table_names:
+                    continue
+
+                on_expr = join.args.get('on') if hasattr(join, 'args') else None
+                if on_expr is None:
+                    continue
+
+                alias_candidates = set()
+                def _add_alias_candidate(value):
+                    if not value:
+                        return
+                    token = str(value).strip('[]').lower()
+                    if not token:
+                        return
+                    alias_candidates.add(token)
+                    if token.startswith('#'):
+                        alias_candidates.add(token.lstrip('#'))
+                try:
+                    join_alias = getattr(join_table, 'alias', None)
+                    if join_alias:
+                        _add_alias_candidate(join_alias)
+                except Exception:
+                    pass
+                try:
+                    join_simple = getattr(join_table, 'name', None)
+                    if join_simple:
+                        _add_alias_candidate(join_simple)
+                except Exception:
+                    pass
+
+                has_on_reference = False
+                for col in on_expr.find_all(exp.Column):
+                    tbl = str(getattr(col, 'table', '') or '').strip('[]').lower()
+                    if alias_candidates and tbl and tbl in alias_candidates:
+                        has_on_reference = True
+                        break
+
+                if not has_on_reference:
+                    continue
+
+                ref_key = (str(ns_j), str(nm_j).lower(), '*')
+                if ref_key in existing_ref_keys:
+                    continue
+
+                target_lin.input_fields.append(
+                    ColumnReference(namespace=ns_j, table_name=nm_j, column_name="*")
+                )
+                existing_ref_keys.add(ref_key)
+                lineage_table_names.add(str(nm_j).lower())
+
         try:
             parsed = sqlglot.parse(select_sql, read=self.dialect)
             logger.debug(f"_extract_insert_select_lineage_string: Parsed result: {parsed is not None}, length: {len(parsed) if parsed else 0}")
@@ -309,6 +409,7 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
             if select_stmt:
                 logger.debug(f"_extract_insert_select_lineage_string: Successfully parsed SELECT, extracting lineage")
                 lineage, _out_cols = self._extract_column_lineage(select_stmt, object_name)
+                _add_join_only_temp_refs(select_stmt, lineage)
                 deps = self._extract_dependencies(select_stmt)
                 dependencies.update(deps)
                 logger.debug(f"_extract_insert_select_lineage_string: Extracted {len(lineage)} columns, {len(deps)} dependencies")
@@ -333,6 +434,7 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                 if select_stmt:
                     logger.debug("_extract_insert_select_lineage_string: Retry parsed SELECT, extracting lineage")
                     lineage, _out_cols = self._extract_column_lineage(select_stmt, object_name)
+                    _add_join_only_temp_refs(select_stmt, lineage)
                     deps = self._extract_dependencies(select_stmt)
                     dependencies.update(deps)
                 else:

@@ -546,6 +546,111 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
             if dep_bases:
                 final_dependencies.update(dep_bases)
 
+    # Preserve join-only temp dependencies in lineage for SELECT INTO temp targets.
+    # This handles cases where a joined temp table contributes only to ON predicates
+    # and would otherwise have no outgoing edges in column_graph.
+    try:
+        raw_target_str = str(raw_target) if raw_target is not None else ""
+        is_temp_target = bool(raw_target_str.startswith('#') or 'tempdb..#' in raw_target_str)
+        if is_temp_target and isinstance(select_stmt, exp.Select) and lineage:
+            lineage_table_names = {
+                str(ref.table_name).lower()
+                for lin in (lineage or [])
+                for ref in (lin.input_fields or [])
+                if ref and ref.table_name
+            }
+
+            target_lineage = None
+            for lin in lineage:
+                if lin.output_column and str(lin.output_column) != "*":
+                    target_lineage = lin
+                    break
+            if target_lineage is None and lineage:
+                target_lineage = lineage[0]
+
+            existing_ref_keys = {
+                (str(ref.namespace), str(ref.table_name).lower(), str(ref.column_name).lower())
+                for ref in (target_lineage.input_fields or [])
+            } if target_lineage else set()
+
+            for join in select_stmt.find_all(exp.Join):
+                join_table = getattr(join, 'this', None)
+                if not isinstance(join_table, exp.Table):
+                    continue
+
+                join_name = self._get_table_name(join_table)
+                if not join_name:
+                    continue
+
+                join_is_temporary = False
+                try:
+                    join_ident = getattr(join_table, 'this', None)
+                    if join_ident is not None and hasattr(join_ident, 'args'):
+                        join_is_temporary = bool(join_ident.args.get('temporary'))
+                except Exception:
+                    join_is_temporary = False
+
+                if join_is_temporary and '#' not in join_name and 'tempdb' not in join_name.lower():
+                    join_simple = join_name.split('.')[-1]
+                    join_name = f"#{join_simple}"
+
+                join_name_l = str(join_name).lower()
+                if '#' not in join_name_l and 'tempdb' not in join_name_l and not join_is_temporary:
+                    continue
+
+                ns_j, nm_j = self._ns_and_name(join_name, obj_type_hint="temp_table")
+                if str(nm_j).lower() in lineage_table_names:
+                    continue
+
+                on_expr = join.args.get('on') if hasattr(join, 'args') else None
+                if on_expr is None:
+                    continue
+
+                alias_candidates = set()
+                def _add_alias_candidate(value):
+                    if not value:
+                        return
+                    token = str(value).strip('[]').lower()
+                    if not token:
+                        return
+                    alias_candidates.add(token)
+                    if token.startswith('#'):
+                        alias_candidates.add(token.lstrip('#'))
+                try:
+                    join_alias = getattr(join_table, 'alias', None)
+                    if join_alias:
+                        _add_alias_candidate(join_alias)
+                except Exception:
+                    pass
+                try:
+                    join_simple_name = getattr(join_table, 'name', None)
+                    if join_simple_name:
+                        _add_alias_candidate(join_simple_name)
+                except Exception:
+                    pass
+
+                has_on_reference = False
+                for col in on_expr.find_all(exp.Column):
+                    tbl = str(getattr(col, 'table', '') or '').strip('[]').lower()
+                    if alias_candidates and tbl and tbl in alias_candidates:
+                        has_on_reference = True
+                        break
+
+                if not has_on_reference or not target_lineage:
+                    continue
+
+                ref_key = (str(ns_j), str(nm_j).lower(), '*')
+                if ref_key in existing_ref_keys:
+                    continue
+
+                target_lineage.input_fields.append(
+                    ColumnReference(namespace=ns_j, table_name=nm_j, column_name="*")
+                )
+                existing_ref_keys.add(ref_key)
+                lineage_table_names.add(str(nm_j).lower())
+    except Exception:
+        pass
+
     if raw_target and (raw_target.startswith('#') or 'tempdb..#' in str(raw_target)):
         simple_key = self._extract_temp_name(raw_target if '#' in raw_target else '#' + raw_target)
         if not simple_key.startswith('#'):
