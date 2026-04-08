@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from collections import deque
 from typing import Dict, List, Optional, Set, Any
 from enum import Enum
+import re
 
 
 class TransformationType(Enum):
@@ -350,6 +351,24 @@ class ColumnGraph:
         """
         if cte_data is None:
             cte_data = {}
+
+        def _sanitize_graph_column_name(table_name: str, column_name: str) -> str:
+            name = str(column_name or "")
+            if not table_name or '#' not in str(table_name):
+                return name
+
+            cleaned = re.sub(r'/\*.*?\*/', '', name, flags=re.S)
+            cleaned = re.sub(r'--.*?$', '', cleaned, flags=re.M).strip().strip('[]')
+            if not cleaned:
+                return "calc_expr"
+
+            if '.' in cleaned:
+                cleaned = cleaned.split('.')[-1].strip().strip('[]')
+
+            if '(' in cleaned or ')' in cleaned:
+                cleaned = re.sub(r"[^\w#]+", "_", cleaned).strip('_')
+
+            return cleaned or "calc_expr"
         
         # NOTE: CTE expansion was attempted but cte_data is always empty
         # CTE are registered locally in SelectLineageExtractor and don't propagate to engine/models
@@ -426,19 +445,21 @@ class ColumnGraph:
             
             # Add nodes for all columns, even if they don't have edges
             for col in obj.schema.columns or []:
+                out_col_name = _sanitize_graph_column_name(output_table, col.name)
                 output_column = ColumnNode(
                     namespace=output_namespace,
                     table_name=output_table,
-                    column_name=col.name
+                    column_name=out_col_name
                 )
                 self.add_node(output_column)
             
             for lineage in obj.lineage:
+                out_col_name = _sanitize_graph_column_name(output_table, lineage.output_column)
                 # Create output column node
                 output_column = ColumnNode(
                     namespace=output_namespace,
                     table_name=output_table,
-                    column_name=lineage.output_column
+                    column_name=out_col_name
                 )
                 
                 # Create edges for each input field
@@ -452,6 +473,7 @@ class ColumnGraph:
                     
                     in_ns = input_field.namespace
                     in_tbl = input_field.table_name
+                    in_col = _sanitize_graph_column_name(in_tbl, input_field.column_name)
                     # Normalize inputs similarly
                     try:
                         in_db = in_ns.rsplit('/', 1)[1] if in_ns else None
@@ -568,7 +590,7 @@ class ColumnGraph:
                                             base_column = ColumnNode(
                                                 namespace=in_ns,
                                                 table_name=f"dbo.{base_tbl_name}" if '.' not in base_tbl_name else base_tbl_name,
-                                                column_name=input_field.column_name
+                                                column_name=in_col
                                             )
                                             
                                             edge = ColumnEdge(
@@ -642,7 +664,7 @@ class ColumnGraph:
                     input_column = ColumnNode(
                         namespace=in_ns,
                         table_name=in_tbl,
-                        column_name=input_field.column_name
+                        column_name=in_col
                     )
                     
                     edge = ColumnEdge(
