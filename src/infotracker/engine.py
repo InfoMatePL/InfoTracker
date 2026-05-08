@@ -282,6 +282,7 @@ class Engine:
         global_saved_temp_lineage: Dict[str, Dict[str, List[ColumnReference]]] = {}
         global_saved_temp_sources: Dict[str, Set[str]] = {}
         global_saved_temp_registry: Dict[str, List[str]] = {}
+        global_cte_lineage_objects: List[ObjectInfo] = []
         # NEW: Store temp registries PER SQL FILE (not per owner) to avoid cross-contamination
         file_temp_registries: Dict[Path, Dict[str, Any]] = {}  # sql_path -> {lineage, sources, registry, owner}
         # Store CTE registry from ALL procedures for column graph expansion (similar to temp_lineage)
@@ -333,6 +334,13 @@ class Engine:
                     
                     # Parse the file - this will re-detect USE statement and set current_database
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                    if getattr(parser, "cte_lineage_objects", None):
+                        known_ctes = {getattr(o.schema, "name", "").lower() for o in global_cte_lineage_objects}
+                        for cte_obj in parser.cte_lineage_objects:
+                            cte_name = getattr(getattr(cte_obj, "schema", None), "name", "").lower()
+                            if cte_name and cte_name not in known_ctes:
+                                global_cte_lineage_objects.append(cte_obj)
+                                known_ctes.add(cte_name)
                     
                     # NOTE: CTE registry saving attempted here but cte_registry is empty after parse
                     # CTE are registered locally in SelectLineageExtractor and don't propagate back to parser
@@ -985,6 +993,17 @@ class Engine:
                                         if deps:
                                             from .lineage import _ns_for_dep, _strip_db_prefix
                                             for dep in sorted(deps):
+                                                # Avoid self-like temp dependencies in source stubs.
+                                                # Example: scoped temp output should not list unscoped same-temp as input.
+                                                try:
+                                                    if '#' in normalized_s:
+                                                        out_temp = normalized_s.split('#')[-1].lower()
+                                                        dep_norm = str(dep).lower()
+                                                        dep_tail = dep_norm.split('#')[-1] if '#' in dep_norm else dep_norm.split('.')[-1]
+                                                        if dep_tail == out_temp:
+                                                            continue
+                                                except Exception:
+                                                    pass
                                                 dep_ns = _ns_for_dep(dep, ns_in or "mssql://localhost/InfoTrackerDW")
                                                 dep_name = _strip_db_prefix(dep)
                                                 src_inputs.append({"namespace": dep_ns, "name": dep_name})
@@ -1053,6 +1072,10 @@ class Engine:
 
         # OPTIMIZATION: Clear SQL text cache after Phase 3 to free memory
         del sql_text_cache
+
+        # Include virtual CTE objects in graph build (not emitted as OL files)
+        if global_cte_lineage_objects:
+            resolved_objects.extend(global_cte_lineage_objects)
 
         # 4) Build column graph from resolved objects (second pass)
         if resolved_objects:

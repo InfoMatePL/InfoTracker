@@ -70,6 +70,69 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
     
     logger.debug(f"_extract_insert_select_lineage_string: Looking for INSERT INTO target={target_simple}, object_name={object_name}")
     logger.debug(f"_extract_insert_select_lineage_string: SQL (first 500 chars): {sql_content[:500]}")
+
+    def _matches_target(table_simple: str, target_simple: str) -> bool:
+        return (
+            table_simple == target_simple
+            or target_simple.endswith("_" + table_simple)
+            or target_simple.endswith(table_simple)
+            or (table_simple in target_simple and len(table_simple) > 5)
+            or (
+                len(table_simple) > 5
+                and len(target_simple) > 5
+                and (table_simple[-5:] in target_simple or target_simple[-5:] in table_simple)
+            )
+        )
+
+    # First try a robust AST path - this handles `WITH cte1 AS (...), cte2 AS (...) INSERT INTO ... SELECT ... UNION ALL ...`
+    try:
+        ast_input = re.sub(r"^\s*;+\s*", "", s)
+        ast_statements = sqlglot.parse(ast_input, read=self.dialect) or []
+    except Exception:
+        ast_statements = []
+
+    for stmt in ast_statements:
+        insert_nodes = [stmt] if isinstance(stmt, exp.Insert) else list(stmt.find_all(exp.Insert))
+        for ins in insert_nodes:
+            try:
+                insert_target = self._get_table_name(ins.this) if getattr(ins, "this", None) else ""
+            except Exception:
+                insert_target = ""
+            table_simple = insert_target.split(".")[-1].lower().strip("[]")
+
+            if table_simple.startswith("#") and not target_simple.startswith("#"):
+                normalized_temp = table_simple.lstrip("#")
+                if target_simple == normalized_temp or target_simple.endswith(normalized_temp):
+                    table_simple = normalized_temp
+                else:
+                    continue
+
+            if not _matches_target(table_simple, target_simple):
+                continue
+
+            # Register all CTEs attached to the INSERT statement (if present)
+            try:
+                self._process_ctes(ins)
+            except Exception:
+                pass
+
+            select_stmt = ins.args.get("expression")
+            if isinstance(select_stmt, exp.Subquery):
+                select_stmt = select_stmt.this
+            if not isinstance(select_stmt, (exp.Select, exp.Union)):
+                continue
+
+            logger.debug("_extract_insert_select_lineage_string: Matched target via AST Insert path")
+            try:
+                lineage, _out_cols = self._extract_column_lineage(select_stmt, object_name)
+                deps = self._extract_dependencies(select_stmt)
+                dependencies.update(deps)
+                return lineage, dependencies
+            except Exception as parse_error:
+                logger.debug(
+                    "_extract_insert_select_lineage_string: AST Insert path failed: %s",
+                    parse_error,
+                )
     
     # Find ALL INSERT INTO ... SELECT patterns (using finditer instead of search)
     pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
@@ -121,19 +184,45 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
         # Since we now use raw_target (actual table name from SQL), exact match should work in most cases
         # Also handle cases where target_simple might be missing parts (e.g., "update_asefl_accountbalance_bv" vs "accountbalance_lnk_bv")
         # or where table names differ slightly (e.g., "AccountBalance_LNK_BV" vs "AccountBalance_BV")
-        matches_target = (table_simple == target_simple or 
-                         target_simple.endswith('_' + table_simple) or
-                         target_simple.endswith(table_simple) or
-                         # Check if table_simple is contained in target_simple (for cases like "update_asefl_accountbalance_bv" containing "accountbalance_lnk_bv")
-                         (table_simple in target_simple and len(table_simple) > 5) or
-                         # Check if they share a common suffix (for cases like "accountbalance_lnk_bv" vs "accountbalance_bv")
-                         (len(table_simple) > 5 and len(target_simple) > 5 and 
-                          (table_simple[-5:] in target_simple or target_simple[-5:] in table_simple)))
+        matches_target = _matches_target(table_simple, target_simple)
         if not matches_target:
             logger.debug(f"_extract_insert_select_lineage_string: Table {table_simple} doesn't match target {target_simple}, skipping")
             continue
         
         logger.debug(f"_extract_insert_select_lineage_string: Found matching INSERT INTO {table_simple}, extracting lineage from SELECT (first 200 chars): {select_part[:200]}")
+
+        # Robust fallback path: parse full WITH...INSERT statement around this match.
+        # This preserves multi-CTE blocks and UNION chains better than manual string stitching.
+        statement_sql = None
+        try:
+            insert_pos_stmt = match.start()
+            stmt_end = match.end()
+            with_matches_stmt = list(re.finditer(r'(?is)(?:^|;)\s*WITH\s+\w+\s+AS\s*\(', s[:insert_pos_stmt]))
+            if with_matches_stmt:
+                statement_start = with_matches_stmt[-1].start()
+            else:
+                statement_start = insert_pos_stmt
+            statement_sql = s[statement_start:stmt_end].strip().rstrip(";")
+            statement_sql = re.sub(r"^\s*;+\s*", "", statement_sql)
+            parsed_stmt = sqlglot.parse_one(statement_sql, read=self.dialect) if statement_sql else None
+            if isinstance(parsed_stmt, exp.Insert):
+                try:
+                    self._process_ctes(parsed_stmt)
+                except Exception:
+                    pass
+                stmt_select = parsed_stmt.args.get("expression")
+                if isinstance(stmt_select, exp.Subquery):
+                    stmt_select = stmt_select.this
+                if isinstance(stmt_select, (exp.Select, exp.Union)):
+                    lineage, _out_cols = self._extract_column_lineage(stmt_select, object_name)
+                    deps = self._extract_dependencies(stmt_select)
+                    dependencies.update(deps)
+                    logger.debug("_extract_insert_select_lineage_string: Extracted lineage via full statement parse")
+                    break
+        except Exception as parse_error:
+            logger.debug("_extract_insert_select_lineage_string: full statement parse failed: %s", parse_error)
+        if lineage:
+            break
         
         # Found matching INSERT - extract lineage from SELECT
         # Check if there's a WITH clause before this specific INSERT (CTE defined before INSERT INTO)

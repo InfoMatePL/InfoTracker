@@ -6,7 +6,7 @@ import logging
 import sqlglot
 from sqlglot import expressions as exp
 
-from ..models import ColumnReference, ColumnSchema, ColumnLineage, TransformationType
+from ..models import ColumnReference, ColumnSchema, ColumnLineage, TransformationType, ObjectInfo, TableSchema
 import re
 
 logger = logging.getLogger(__name__)
@@ -75,8 +75,10 @@ def _build_alias_maps(self, select_exp: exp.Select):
                     # Already has #, check if it's in temp_registry
                     if simple in self.temp_registry:
                         temp_seg = simple
-                elif f"#{simple}" in self.temp_registry:
-                    temp_seg = f"#{simple}"
+                    else:
+                        temp_seg = _match_temp_segment(self, simple)
+                else:
+                    temp_seg = _match_temp_segment(self, simple)
                 
                 if temp_seg:
                     # Use canonical format with procedure context: schema.object#temp
@@ -123,15 +125,18 @@ def _build_alias_maps(self, select_exp: exp.Select):
     try:
         # Find the main FROM clause of this SELECT (not nested SELECTs)
         from_source = None
-        
-        # Note: sqlglot uses 'from_' (not 'from') to avoid Python keyword collision
-        if hasattr(select_exp, 'args') and 'from_' in select_exp.args:
-            from_expr = select_exp.args['from_']
-            if hasattr(from_expr, 'this') and isinstance(from_expr.this, exp.Table):
-                from_table = from_expr.this
-                from_table_name = from_table.name
+
+        # sqlglot changed arg naming across versions; support both.
+        from_expr = None
+        if hasattr(select_exp, "args"):
+            from_expr = select_exp.args.get("from_") or select_exp.args.get("from")
+
+        if from_expr and hasattr(from_expr, "this"):
+            from_this = from_expr.this
+            if isinstance(from_this, exp.Table):
+                from_table_name = from_this.name
                 # Check if FROM table has an alias
-                from_alias = getattr(from_table, "alias", None) or from_table.args.get("alias")
+                from_alias = getattr(from_this, "alias", None) or from_this.args.get("alias")
                 if from_alias:
                     from_alias_str = from_alias.name.lower() if hasattr(from_alias, "name") else str(from_alias).lower()
                     # Use the alias as the source
@@ -142,8 +147,12 @@ def _build_alias_maps(self, select_exp: exp.Select):
                     from_table_lower = from_table_name.lower()
                     if from_table_lower in alias_map:
                         from_source = alias_map[from_table_lower]
-        
-        # Set alias_map[''] to the FROM source if found, otherwise fall back to single table logic
+
+        # Persist the explicit top-level FROM source for unqualified-column resolution.
+        if from_source:
+            alias_map["__main_from__"] = from_source
+
+        # Set alias_map[''] to the FROM source if found, otherwise fall back to single-table logic.
         if from_source and '' not in alias_map:
             alias_map[''] = from_source
         elif len(set(base_fqns)) == 1 and '' not in alias_map:
@@ -152,6 +161,121 @@ def _build_alias_maps(self, select_exp: exp.Select):
         pass
 
     return alias_map, derived_cols
+
+
+def _cte_node_name(self, cte_name: str) -> str:
+    """Build a stable virtual CTE node name like 'dbo.<procedure>$<cte>'."""
+    schema = getattr(self, "_ctx_schema", None) or self.default_schema or "dbo"
+    owner = getattr(self, "_ctx_obj", None) or "procedure"
+    try:
+        owner = self._normalize_table_name_for_output(owner)
+    except Exception:
+        owner = str(owner)
+    owner = str(owner).split(".")[-1]
+    cte_simple = str(cte_name).split(".")[-1]
+    return f"{schema}.{owner}${cte_simple}"
+
+
+def _match_temp_segment(self, raw_name: str) -> Optional[str]:
+    """Resolve temp segment from temp_registry in case-insensitive way."""
+    target = (raw_name or "").split("@")[0].lstrip("#").lower()
+    if not target:
+        return None
+    for key in getattr(self, "temp_registry", {}).keys():
+        base = str(key).split("@")[0]
+        if base.lstrip("#").lower() == target:
+            return base if base.startswith("#") else f"#{base}"
+    return None
+
+
+def _scoped_temp_ref(self, temp_seg: str) -> Tuple[str, str]:
+    """Build canonical namespace/table for local temp scoped to current procedure."""
+    temp_name = str(temp_seg or "").split("@")[0].lstrip("#")
+    ctx_db = getattr(self, "_ctx_db", None) or self.current_database or self.default_database or "InfoTrackerDW"
+    ctx_obj = getattr(self, "_ctx_obj", None) or "procedure"
+    try:
+        proc_norm = self._normalize_table_name_for_output(ctx_obj)
+    except Exception:
+        proc_norm = str(ctx_obj)
+    proc_simple = str(proc_norm).split(".")[-1]
+    return f"mssql://localhost/{str(ctx_db).upper()}", f"dbo.{proc_simple}#{temp_name}"
+
+
+def _register_cte_lineage_object(self, cte_name: str, cte_def: exp.Select, cte_columns: List[str]) -> None:
+    """Create a virtual ObjectInfo for CTE so it appears as an intermediate graph node."""
+    if not isinstance(cte_def, exp.Select):
+        return
+    if not hasattr(self, "cte_lineage_objects"):
+        return
+
+    node_name = _cte_node_name(self, cte_name)
+    try:
+        cte_lineage, cte_output_columns = self._extract_column_lineage(cte_def, node_name)
+    except Exception:
+        cte_lineage, cte_output_columns = [], []
+
+    # Normalize temp references in CTE lineage to canonical procedure-scoped names.
+    for ln in cte_lineage:
+        for ref in (ln.input_fields or []):
+            tname = getattr(ref, "table_name", None)
+            if not tname:
+                continue
+            simple = str(tname).split(".")[-1]
+            temp_seg = _match_temp_segment(self, simple)
+            if temp_seg:
+                try:
+                    ns_temp, nm_temp = _scoped_temp_ref(self, temp_seg)
+                    ref.namespace = ns_temp
+                    ref.table_name = nm_temp
+                except Exception:
+                    pass
+
+    if not cte_output_columns:
+        cte_output_columns = [
+            ColumnSchema(name=c, data_type="unknown", nullable=True, ordinal=i)
+            for i, c in enumerate(cte_columns or [])
+        ]
+
+    try:
+        deps = self._extract_dependencies(cte_def) or set()
+    except Exception:
+        deps = set()
+    # Normalize temp dependencies to canonical procedure-scoped names.
+    deps_norm: Set[str] = set()
+    for dep in deps:
+        d = str(dep or "")
+        d_simple = d.split(".")[-1] if "." in d else d
+        temp_seg = _match_temp_segment(self, d_simple)
+        if temp_seg:
+            try:
+                _, nm_temp = self._ns_and_name(temp_seg, obj_type_hint="temp_table")
+                deps_norm.add(nm_temp)
+                continue
+            except Exception:
+                pass
+        deps_norm.add(d)
+    deps = deps_norm
+
+    ns = self._canonical_namespace(
+        self.current_database or self.default_database or "InfoTrackerDW"
+    )
+    cte_obj = ObjectInfo(
+        name=node_name,
+        object_type="cte",
+        schema=TableSchema(namespace=ns, name=node_name, columns=cte_output_columns),
+        lineage=cte_lineage,
+        dependencies=deps,
+    )
+
+    # Deduplicate per parse by schema name, but always keep the latest version.
+    replaced = False
+    for idx, existing_obj in enumerate(self.cte_lineage_objects):
+        if getattr(getattr(existing_obj, "schema", None), "name", "").lower() == node_name.lower():
+            self.cte_lineage_objects[idx] = cte_obj
+            replaced = True
+            break
+    if not replaced:
+        self.cte_lineage_objects.append(cte_obj)
 
 
 def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
@@ -168,7 +292,10 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     if not table_fqn:
         # Try to find table by column name if no table qualifier
         # This handles unqualified columns when there's only one table
-        if not qual and '' in alias_map:
+        if not qual and '__main_from__' in alias_map:
+            table_fqn = alias_map['__main_from__']
+            logger.debug(f"_append_column_ref: Using alias_map['__main_from__'] = {table_fqn} for unqualified column {col_exp.name}")
+        elif not qual and '' in alias_map:
             table_fqn = alias_map['']
             logger.debug(f"_append_column_ref: Using alias_map[''] = {table_fqn} for unqualified column {col_exp.name}")
         else:
@@ -308,6 +435,30 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 pass
     
     if is_cte:
+        use_cte_nodes = getattr(self, "_use_cte_nodes", True)
+        if use_cte_nodes:
+            cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
+            if qual and qual.lower() in cte_registry_lower:
+                cte_key = cte_registry_lower[qual.lower()]
+            elif table_fqn and table_fqn.lower() in cte_registry_lower:
+                cte_key = cte_registry_lower[table_fqn.lower()]
+            else:
+                cte_key = cte_registry_lower.get(cte_name_simple.lower(), cte_name_simple)
+
+            cte_info = self.cte_registry.get(cte_key, {})
+            node_name = (
+                cte_info.get("node_name")
+                if isinstance(cte_info, dict)
+                else _cte_node_name(self, cte_key)
+            )
+            ns = self._canonical_namespace(
+                self.current_database or self.default_database or "InfoTrackerDW"
+            )
+            out_list.append(
+                ColumnReference(namespace=ns, table_name=node_name, column_name=col_exp.name)
+            )
+            return
+
         # Try to find CTE definition and extract sources from it
         # Find the actual CTE name (case-insensitive match)
         cte_name = None
@@ -610,12 +761,12 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
             # Check if tbl already starts with # (from _split_fqn)
             if str(tbl).startswith('#'):
                 temp_seg = tbl
-            elif f"#{tbl}" in self.temp_registry:
-                temp_seg = f"#{tbl}"
+            else:
+                temp_seg = _match_temp_segment(self, str(tbl))
         logger.debug(f"_append_column_ref: temp_seg={temp_seg}, temp_registry keys={list(self.temp_registry.keys())[:5] if hasattr(self, 'temp_registry') else 'N/A'}")
         if temp_seg:
             # Use _ns_and_name to get proper format with procedure context: schema.object#temp
-            ns_temp, table_name = self._ns_and_name(temp_seg, obj_type_hint="temp_table")
+            ns_temp, table_name = _scoped_temp_ref(self, temp_seg)
             logger.debug(f"_append_column_ref: temp_seg={temp_seg}, ns_temp={ns_temp}, table_name={table_name}")
             # Check if we should use direct reference (for INSERT INTO) or expanded lineage
             use_direct_ref = getattr(self, '_use_direct_temp_ref', False)
@@ -1470,7 +1621,7 @@ def _resolve_table_from_alias(self, alias: Optional[str], context: exp.Select) -
     return alias
 
 
-def _process_ctes(self, select_stmt: exp.Select) -> exp.Select:
+def _process_ctes(self, select_stmt: exp.Expression) -> exp.Expression:
     # FIX: Use .ctes property instead of args.get('with') which was ALWAYS None
     # sqlglot stores WITH in args['with_'] (with underscore) and provides .ctes property
     if hasattr(select_stmt, 'ctes') and select_stmt.ctes:
@@ -1533,10 +1684,13 @@ def _process_ctes(self, select_stmt: exp.Select) -> exp.Select:
                 # Store both columns and the CTE definition (exp.Select) for later use
                 # We use a dict to store both pieces of information
                 if isinstance(cte.this, exp.Select):
+                    cte_node_name = _cte_node_name(self, cte_name)
                     self.cte_registry[cte_name] = {
                         'columns': cte_columns,
-                        'definition': cte.this
+                        'definition': cte.this,
+                        'node_name': cte_node_name,
                     }
+                    _register_cte_lineage_object(self, cte_name, cte.this, cte_columns)
                 else:
                     # Fallback: if not a Select, just store columns
                     self.cte_registry[cte_name] = cte_columns

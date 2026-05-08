@@ -28,7 +28,9 @@ class SqlParser:
     def __init__(self, dialect: str = "tsql", registry=None):
         self.dialect = dialect
         self.schema_registry = SchemaRegistry()
-        self.cte_registry: Dict[str, List[str]] = {}  # CTE name -> column list
+        self.cte_registry: Dict[str, Any] = {}  # CTE name -> metadata/column list
+        # Materialized virtual CTE objects for graph-building (procedure$cte style)
+        self.cte_lineage_objects: List[ObjectInfo] = []
         self.temp_registry: Dict[str, List[str]] = {}  # Temp table name -> column list
         # Track temp table sources (base deps) and per-column lineage
         self.temp_sources: Dict[str, Set[str]] = {}  # "#tmp" -> base deps (schema.table)
@@ -306,6 +308,7 @@ class SqlParser:
         # NOTE: cte_registry is NOT cleared here (like temp_lineage) - it needs to persist for column graph expansion
         # CTE are saved in engine.py after parsing and used in models.py for expansion (similar to temp tables)
         # self.cte_registry.clear()  # DO NOT CLEAR - needed for column graph expansion in engine/models
+        self.cte_lineage_objects.clear()
         self.temp_registry.clear()
         self.temp_sources.clear()
         self.temp_lineage.clear()

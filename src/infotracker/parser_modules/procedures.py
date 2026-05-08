@@ -556,6 +556,57 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
         except Exception:
             pass
 
+        # Canonicalize temp names in both dependencies and column-level input refs.
+        try:
+            def _canon_temp_name(raw: str) -> Optional[str]:
+                s = str(raw or "")
+                if "#" in s:
+                    simple = s.split("#", 1)[1].split("@", 1)[0]
+                else:
+                    simple = s.split('.')[-1].split('@')[0].lstrip('#')
+                if not simple:
+                    return None
+                matched = None
+                for key in (self.temp_registry or {}).keys():
+                    base = str(key).split('@')[0].lstrip('#')
+                    if base.lower() == simple.lower():
+                        matched = f"#{base}"
+                        break
+                if not matched:
+                    return None
+                try:
+                    _, nm = self._ns_and_name(matched, obj_type_hint="temp_table")
+                    return nm
+                except Exception:
+                    return None
+
+            deps_norm = set()
+            for dep in set(materialized_output.dependencies or []):
+                cdep = _canon_temp_name(dep)
+                deps_norm.add(cdep or dep)
+            materialized_output.dependencies = deps_norm
+
+            for ln in (materialized_output.lineage or []):
+                for ref in (ln.input_fields or []):
+                    ctbl = _canon_temp_name(getattr(ref, "table_name", None))
+                    if ctbl:
+                        ref.table_name = ctbl
+
+            # Keep CTE virtual nodes in sync with canonical temp identity too.
+            for cte_obj in getattr(self, "cte_lineage_objects", []) or []:
+                cdeps = set()
+                for dep in set(getattr(cte_obj, "dependencies", set()) or set()):
+                    cdep = _canon_temp_name(dep)
+                    cdeps.add(cdep or dep)
+                cte_obj.dependencies = cdeps
+                for ln in (getattr(cte_obj, "lineage", []) or []):
+                    for ref in (ln.input_fields or []):
+                        ctbl = _canon_temp_name(getattr(ref, "table_name", None))
+                        if ctbl:
+                            ref.table_name = ctbl
+        except Exception:
+            pass
+
         # Learn from procedure CREATE only if raw name had explicit DB
         try:
             m = re.search(r'(?is)\bCREATE\s+(?:PROC|PROCEDURE)\s+([^\s(]+)', sql_content)

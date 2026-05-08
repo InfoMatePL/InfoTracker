@@ -26,15 +26,18 @@ def _ns_for_dep(dep: str, default_ns: str) -> str:
     """
     d = _dequote(dep or "")
     dl = d.lower()
-    # Check for temp tables: #temp or DB.dbo.PROC#temp format
+    # Check for temp tables: #temp or scoped canonical names (dbo.proc#temp / DB.dbo.proc#temp)
     if dl.startswith("tempdb..#") or dl.startswith("#") or "#" in d:
-        # For canonical temp names (DB.dbo.PROC#temp), extract DB
+        # For canonical temp names with explicit DB (DB.dbo.PROC#temp), extract DB
         if "#" in d and "." in d:
             parts = d.split(".")
             if len(parts) >= 3:
                 db = parts[0]
                 return f"mssql://localhost/{db.upper()}"
-        # For simple temp names (#temp), use tempdb
+            # Scoped temp without explicit DB (dbo.PROC#temp) should stay in caller DB namespace
+            if len(parts) == 2 and not d.startswith("#"):
+                return default_ns or "mssql://localhost/InfoTrackerDW"
+        # For simple raw temp names (#temp), use tempdb
         return "mssql://localhost/tempdb"
     parts = d.split(".")
     db = parts[0] if len(parts) >= 3 else None
@@ -145,7 +148,11 @@ class OpenLineageGenerator:
             else:
                 parts = d.split('.')
                 db = parts[0] if len(parts) >= 3 else None
-                namespace = f"mssql://localhost/{db}" if db else self.namespace
+                # Scoped temp without explicit DB (dbo.proc#temp) should keep object/default namespace
+                if '#' in d and len(parts) == 2 and not d.startswith('#'):
+                    namespace = self.namespace
+                else:
+                    namespace = f"mssql://localhost/{db}" if db else self.namespace
                 # Preserve DB for temp canonical names (contain '#')
                 if '#' in d:
                     name = d
