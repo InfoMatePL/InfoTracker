@@ -11,6 +11,13 @@ from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage
 logger = logging.getLogger(__name__)
 
 
+def _procedure_output_looks_like_table_variable(obj: ObjectInfo) -> bool:
+    """True if materialized name looks like a T-SQL table variable (e.g. dbo.@ChangeLog)."""
+    name = getattr(obj.schema, "name", None) or obj.name or ""
+    name = re.sub(r"\[([^\]]+)\]", r"\1", str(name))
+    return "@" in name
+
+
 def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
     """Parse CREATE PROCEDURE using string-based approach (extracted)."""
     logger.debug(f"_parse_procedure_string: Called with object_hint={object_hint}")
@@ -118,6 +125,7 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
 
     # 1) Check if procedure materializes (SELECT INTO / INSERT INTO ... SELECT / TRUNCATE)
     materialized_outputs = self._extract_materialized_output_from_procedure_string(sql_content)
+    materialized_outputs = [o for o in materialized_outputs if not _procedure_output_looks_like_table_variable(o)]
     if materialized_outputs:
         # Log how many outputs were found
         logger.debug(f"Found {len(materialized_outputs)} materialized output(s) for procedure {procedure_name}")
@@ -680,11 +688,15 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
         self._ctx_db, self._ctx_obj = prev_ctx_db, prev_ctx_obj
         return out_obj
 
-    # 2c) DML with OUTPUT INTO
+    # 2c) DML with OUTPUT INTO (skip table variables — not the procedure's durable primary output)
     try:
         o_lineage, o_cols, o_deps, o_target = self._extract_output_into_lineage_string(sql_content)
     except Exception:
         o_lineage, o_cols, o_deps, o_target = ([], [], set(), None)
+    if o_target:
+        _ot = re.sub(r"\[([^\]]+)\]", r"\1", str(o_target)).strip()
+        if _ot.startswith("@") or _ot.split(".")[-1].startswith("@"):
+            o_target = None
     if o_target:
         ns_out, nm_out = self._ns_and_name(o_target, obj_type_hint="table")
         schema = TableSchema(namespace=ns_out, name=nm_out, columns=o_cols)

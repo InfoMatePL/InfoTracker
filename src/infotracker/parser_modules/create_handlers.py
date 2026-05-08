@@ -12,6 +12,15 @@ from ..models import TableSchema, ColumnSchema, ObjectInfo, ColumnLineage, Trans
 logger = logging.getLogger(__name__)
 
 
+def _procedure_materialization_is_table_variable(obj: ObjectInfo) -> bool:
+    """True for T-SQL table variables (OUTPUT INTO @x / spurious INSERT into @x), not durable tables."""
+    raw = getattr(obj.schema, "name", None) or obj.name or ""
+    raw = re.sub(r"\[([^\]]+)\]", r"\1", str(raw)).strip()
+    if raw.startswith("@"):
+        return True
+    return raw.split(".")[-1].startswith("@")
+
+
 def _parse_create_statement(self, statement: exp.Create, object_hint: Optional[str] = None) -> ObjectInfo:
     if statement.kind == "TABLE":
         return _parse_create_table(self, statement, object_hint)
@@ -509,7 +518,6 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
     fails, preserving previous behavior.
     """
     logger.debug(f"[DIAG] _extract_procedure_outputs: Starting AST walk")
-    logger.warning(f"XXX _extract_procedure_outputs called")
     outputs: List[ObjectInfo] = []
 
     # First try AST walk to find SELECT ... INTO and INSERT ... (SELECT|EXEC)
@@ -530,7 +538,6 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
                 select_into_nodes.append(node)
         
         logger.debug(f"[DIAG] Found {len(with_nodes)} WITH nodes and {len(select_into_nodes)} SELECT INTO nodes")
-        logger.warning(f"XXX DIAGNOSTIC: Found {len(with_nodes)} WITH nodes and {len(select_into_nodes)} SELECT INTO nodes")
         
         # Try to match WITH nodes with SELECT INTO nodes
         # Strategy: if a WITH node's .this is a SELECT INTO, they're already linked
@@ -592,6 +599,10 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
                     # Get the target table name for tracking
                     raw_target = self._get_table_name(node.this, None) if hasattr(node, 'this') else None
                     if raw_target:
+                        rt_norm = re.sub(r"\[([^\]]+)\]", r"\1", str(raw_target)).strip()
+                        if rt_norm.startswith("@") or rt_norm.split(".")[-1].startswith("@"):
+                            continue
+                    if raw_target:
                         found_inserts.add(raw_target.lower().strip('[]'))
                     if self._is_insert_exec(node):
                         obj = self._parse_insert_exec(node)
@@ -618,6 +629,8 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
         select_into_matches = re.findall(select_into_pattern, sql_text, flags=re.IGNORECASE | re.DOTALL)
         for table_match in select_into_matches:
             table_name = table_match.strip()
+            if table_name.startswith('@') or table_name.split('.')[-1].startswith('@'):
+                continue
             # Skip temp tables in fallback
             if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
                 normalized_name = self._normalize_table_name_for_output(table_name)
@@ -645,6 +658,8 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
             raw_table_name = match.group(1).strip()
             # Remove square brackets but preserve the structure
             table_name = re.sub(r'\[([^\]]+)\]', r'\1', raw_table_name)
+            if table_name.startswith('@') or table_name.split('.')[-1].startswith('@'):
+                continue
             # Skip temp tables in fallback
             if not table_name.startswith('#') and 'tempdb' not in table_name.lower():
                 # Check if this INSERT was already found by AST walk
@@ -718,6 +733,7 @@ def _extract_procedure_outputs(self, statement: exp.Create) -> List[ObjectInfo]:
     except Exception:
         pass
 
+    outputs = [o for o in outputs if not _procedure_materialization_is_table_variable(o)]
     return outputs
 
 

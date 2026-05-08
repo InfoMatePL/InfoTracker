@@ -414,6 +414,10 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
         tok = (table_token or "").strip().rstrip(';')
         if tok.startswith('#') or tok.lower().startswith('tempdb..#'):
             return None
+        # Table variables (@t) are not durable procedure outputs
+        tok_unbr = re.sub(r'\[([^\]]+)\]', r'\1', tok)
+        if tok_unbr.startswith('@'):
+            return None
         norm = self._normalize_table_ident(tok)
         full_name = self._get_full_table_name(norm)
         try:
@@ -457,6 +461,10 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
         table_token = m.group(1).strip().rstrip(';')
         # Skip temp tables
         if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            continue
+        # Skip OUTPUT ... INTO @Var false positives (MERGE/INSERT can contain INTO @table_variable)
+        _ins_simple = re.sub(r'\[([^\]]+)\]', r'\1', table_token).strip()
+        if _ins_simple.startswith('@'):
             continue
         obj = _to_obj(table_token)
         if obj:
@@ -503,6 +511,8 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
         table_token = m.group(1).strip().rstrip(';')
         # Skip temp tables
         if table_token.startswith('#') or table_token.lower().startswith('tempdb..#'):
+            continue
+        if re.sub(r'\[([^\]]+)\]', r'\1', table_token).strip().startswith('@'):
             continue
         obj = _to_obj(table_token)
         if obj:
@@ -1069,6 +1079,32 @@ def _extract_tvf_lineage_string(self, sql_text: str, function_name: str) -> tupl
     return lineage, output_columns, dependencies
 
 
+def _merge_using_subquery_and_alias(cleaned: str) -> tuple[Optional[str], Optional[str]]:
+    """If MERGE uses ``USING (subquery) AS alias``, return subquery body and alias name."""
+    m = re.search(r'(?is)\bUSING\s*\(', cleaned)
+    if not m:
+        return None, None
+    idx_open = m.end() - 1
+    if idx_open >= len(cleaned) or cleaned[idx_open] != "(":
+        return None, None
+    i = idx_open + 1
+    depth = 1
+    while i < len(cleaned):
+        ch = cleaned[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                subq = cleaned[idx_open + 1 : i].strip()
+                tail = cleaned[i + 1 : i + 160]
+                ma = re.match(r"\s*AS\s+(\w+)", tail, re.I)
+                alias = ma.group(1) if ma else None
+                return subq, alias
+        i += 1
+    return None, None
+
+
 def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema], Set[str], Optional[str]]:
     """Parse MERGE INTO ... USING ... and try to build lineage (string-based)."""
     lineage: List[ColumnLineage] = []
@@ -1077,8 +1113,8 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
     target_table: Optional[str] = None
 
     cleaned = self._strip_sql_comments(sql_content)
-    # Target
-    m_target = re.search(r'(?is)MERGE\s+INTO\s+([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', cleaned)
+    # Target (T-SQL allows MERGE dbo.T AS x without INTO)
+    m_target = re.search(r'(?is)\bMERGE\s+(?:INTO\s+)?([^\s\(,;]+)(?:\s+AS\s+(\w+)|\s+(\w+))?', cleaned)
     if not m_target:
         return lineage, output_columns, dependencies, None
     target_raw = self._normalize_table_ident(m_target.group(1))
@@ -1099,6 +1135,35 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
         src = m_using.group(1).strip()
         source_name = self._normalize_table_ident(src)
         src_alias = (m_using.group(2) or m_using.group(3) or '').strip() or None
+
+    # USING (SELECT ... FROM base) AS alias — no single-table token from the simple pattern
+    if not source_name:
+        subq_body, sub_alias = _merge_using_subquery_and_alias(cleaned)
+        if subq_body:
+            if sub_alias:
+                src_alias = sub_alias
+            try:
+                inner_deps = self._extract_basic_dependencies(subq_body)
+                tgt_suffix = (target_table.split(".")[-1] if target_table else "").lower()
+                for d in inner_deps:
+                    ds = str(d).split(".")[-1].lower()
+                    if tgt_suffix and ds == tgt_suffix:
+                        continue
+                    if str(d).lstrip().startswith("@"):
+                        continue
+                    dependencies.add(d)
+                candidates = [
+                    d
+                    for d in inner_deps
+                    if str(d).split(".")[-1].lower() != tgt_suffix
+                    and not str(d).lstrip().startswith("@")
+                ]
+                if candidates:
+                    source_name = sorted(candidates, key=lambda x: (len(str(x)), str(x)))[0]
+                elif inner_deps:
+                    source_name = sorted(inner_deps, key=lambda x: (len(str(x)), str(x)))[0]
+            except Exception:
+                logger.debug("_extract_merge_lineage_string: USING subquery dep extraction failed", exc_info=True)
 
     # Map temp -> base if created earlier in the body
     temp_to_base: Dict[str, str] = {}
@@ -1129,24 +1194,27 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
                 continue
             left = mm.group(1).strip()
             right = mm.group(2).strip()
-            # Left can be alias.col or schema.table.col
+            # Left can be alias.col, schema.table.col, or bare column (MERGE UPDATE SET)
             mleft = re.search(r'(?is)(?:\w+\.|\[[^\]]+\]\.)?([\w\[\]]+)\.(\w+)$', left)
-            if not mleft:
-                continue
-            l_alias_or_tbl = mleft.group(1).strip('[]')
-            l_col = mleft.group(2)
-            # If left refers to target alias, keep only the column part
-            if tgt_alias and l_alias_or_tbl.lower() == tgt_alias.lower():
-                assign_exprs.append((l_col, right))
+            if mleft:
+                l_alias_or_tbl = mleft.group(1).strip('[]')
+                l_col = mleft.group(2)
+                if tgt_alias and l_alias_or_tbl.lower() == tgt_alias.lower():
+                    assign_exprs.append((l_col, right))
+                else:
+                    assign_exprs.append((l_col, right))
             else:
-                # Alternatively treat as target schema/table.col
-                assign_exprs.append((l_col, right))
+                mu = re.match(r'(?is)^([\w\[\]]+)$', re.sub(r"\s+", " ", left).strip())
+                if mu:
+                    assign_exprs.append((mu.group(1).strip('[]'), right))
 
-    # OUTPUT clause
+    # OUTPUT clause — never replace MERGE target with OUTPUT ... INTO sink (e.g. @ChangeLog).
     m_output = re.search(r'(?is)OUTPUT\s+(.*?)\s+INTO\s+([^\s,;]+)', cleaned)
     if m_output:
         out_exprs = m_output.group(1)
-        out_target = self._normalize_table_ident(m_output.group(2))
+        out_target_raw = m_output.group(2).strip()
+        out_target = self._normalize_table_ident(out_target_raw)
+        out_simple = re.sub(r'\[([^\]]+)\]', r'\1', out_target).strip()
         exprs = re.split(r',(?![^\(]*\))', out_exprs)
         cols = []
         for e in exprs:
@@ -1167,14 +1235,10 @@ def _extract_merge_lineage_string(self, sql_content: str, procedure_name: str) -
             seen.add(lc)
             out.append(c)
         cols = out
-        output_columns = [ColumnSchema(name=c, data_type=None, nullable=True, ordinal=i) for i, c in enumerate(cols)]
-        tp = out_target.split('.')
-        if len(tp) >= 3:
-            target_table = f"{tp[-2]}.{tp[-1]}"
-        elif len(tp) == 2:
-            target_table = out_target
-        else:
-            target_table = f"dbo.{out_target}"
+        # Only attach OUTPUT column list to merge-target schema when sink is a real table
+        if not out_simple.startswith('@'):
+            output_columns = [ColumnSchema(name=c, data_type=None, nullable=True, ordinal=i) for i, c in enumerate(cols)]
+        # else: leave output_columns empty; real column list comes from DDL / other paths
 
     # Dependencies (expand temp sources to underlying base tables if known)
     if source_name:
