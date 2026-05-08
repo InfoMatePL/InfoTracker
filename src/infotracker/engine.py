@@ -580,27 +580,6 @@ class Engine:
                             else:
                                 all_refs_empty = True
 
-                            # Some columns have lineage refs but others do not (e.g. spurious alias filter left one column).
-                            # Do not trigger the regex "first FROM only" fallback for this — enrich per-column below via deps.
-                            lineage_incomplete = False
-                            if col_map and schema.columns:
-                                cols_with_refs = 0
-                                for sch_col in schema.columns:
-                                    if not sch_col or not sch_col.name:
-                                        continue
-                                    cn = sch_col.name
-                                    refs_here = col_map.get(cn)
-                                    if refs_here is None:
-                                        for k, v in col_map.items():
-                                            if k and str(k).lower() == str(cn).lower():
-                                                refs_here = v
-                                                break
-                                    if refs_here:
-                                        cols_with_refs += 1
-                                lineage_incomplete = cols_with_refs < len(
-                                    [c for c in (schema.columns or []) if c and c.name]
-                                )
-
                             prefixed_key_sources = f"{owner}::{tmp}"
                             deps = set(
                                 global_saved_temp_sources.get(prefixed_key_sources, set())
@@ -710,26 +689,10 @@ class Engine:
                                             if from_table_simple.lower() in JOIN_KEYWORDS:
                                                 logger.debug(f"Phase 3: Skipping JOIN keyword '{from_table}' in fallback lineage for {tmp}")
                                                 break
-                                            # Table-level fallback only: do not assign each output col name to the first FROM table.
-                                            ns_from, nm_from = parser._ns_and_name(from_table, obj_type_hint="table")
-                                            for col in schema.columns:
-                                                ref = ColumnReference(
-                                                    namespace=ns_from,
-                                                    table_name=nm_from,
-                                                    column_name="*",
-                                                )
-                                                lin_list.append(
-                                                    ColumnLineage(
-                                                        output_column=col.name,
-                                                        input_fields=[ref],
-                                                        transformation_type=TransformationType.UNKNOWN,
-                                                        transformation_description=(
-                                                            f"COARSE_TABLE_LEVEL: regex fallback from {nm_from} (* only; "
-                                                            f"no per-column mapping)"
-                                                        ),
-                                                    )
-                                                )
-                                            logger.debug(f"Phase 3: Created fallback lineage for {tmp} from pattern: {nm_from}: {len(lin_list)} columns")
+                                            # Do not synthesize per-column or table-* lineage (misleading cartesian).
+                                            logger.debug(
+                                                f"Phase 3: Regex matched FROM {from_table} for {tmp} but skipping synthetic lineage"
+                                            )
                                             break
                                 except Exception as e:
                                     logger.debug(f"Phase 3: Failed to create fallback lineage for {tmp}: {e}")
@@ -846,47 +809,7 @@ class Engine:
                                 if normalized_refs:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=normalized_refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
                                 else:
-                                    synthetic = []
-                                    if deps and lineage_incomplete:
-                                        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
-                                        for dep in sorted(deps):
-                                            if not dep or dep.startswith('@') or '#' in dep:
-                                                continue
-                                            dep_simple = dep.split('.')[-1] if '.' in dep else dep
-                                            if dep_simple.lower() in JOIN_KEYWORDS:
-                                                continue
-                                            try:
-                                                ns_d, nm_d = parser._ns_and_name(dep, obj_type_hint="table")
-                                                synthetic.append(
-                                                    ColumnReference(
-                                                        namespace=ns_d,
-                                                        table_name=nm_d,
-                                                        column_name="*",
-                                                    )
-                                                )
-                                            except Exception:
-                                                tbl = dep if '.' in dep else f"dbo.{dep}"
-                                                synthetic.append(
-                                                    ColumnReference(
-                                                        namespace=schema.namespace,
-                                                        table_name=tbl,
-                                                        column_name="*",
-                                                    )
-                                                )
-                                    if synthetic:
-                                        lin_list.append(
-                                            ColumnLineage(
-                                                output_column=col.name,
-                                                input_fields=synthetic,
-                                                transformation_type=TransformationType.UNKNOWN,
-                                                transformation_description=(
-                                                    "COARSE_TABLE_LEVEL: sparse temp column lineage; "
-                                                    "deps linked as * only (no invented source column names)"
-                                                ),
-                                            )
-                                        )
-                                    else:
-                                        lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
+                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
 
                             # One lineage row per output column; prefer entries with more input_fields (fallback + col_map dedupe).
                             # On equal counts, prefer parser-derived "from temp source select" over regex fallback "from <table>".

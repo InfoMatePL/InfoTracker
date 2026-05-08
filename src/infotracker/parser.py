@@ -28,7 +28,10 @@ class SqlParser:
     def __init__(self, dialect: str = "tsql", registry=None):
         self.dialect = dialect
         self.schema_registry = SchemaRegistry()
-        self.cte_registry: Dict[str, Any] = {}  # CTE name -> metadata/column list
+        self.cte_registry: Dict[str, Any] = {}  # scoped CTE key (dbo.<proc>$<cte>) -> metadata/column list
+        # Map simple CTE alias (lowercase) -> scoped key for current procedure / parse
+        self.cte_simple_alias: Dict[str, str] = {}
+        self._parse_object_hint: Optional[str] = None  # file/object hint for CTE scope when _ctx_obj not set yet
         # Materialized virtual CTE objects for graph-building (procedure$cte style)
         self.cte_lineage_objects: List[ObjectInfo] = []
         self.temp_registry: Dict[str, List[str]] = {}  # Temp table name -> column list
@@ -233,6 +236,63 @@ class SqlParser:
         """Enable/disable dbt mode (compiled SELECT-only models)."""
         self.dbt_mode = bool(enabled)
         return self
+
+    def _cte_scoped_key(self, simple_cte_name: str) -> str:
+        """Canonical registry / graph node key: dbo.<procedure>$<cte> (same as virtual CTE object name)."""
+        schema = getattr(self, "_ctx_schema", None) or self.default_schema or "dbo"
+        owner = (
+            getattr(self, "_ctx_obj", None)
+            or getattr(self, "_parse_object_hint", None)
+            or "procedure"
+        )
+        try:
+            owner = self._normalize_table_name_for_output(owner)
+        except Exception:
+            owner = str(owner)
+        owner = str(owner).split(".")[-1]
+        cte_simple = str(simple_cte_name).split(".")[-1]
+        return f"{schema}.{owner}${cte_simple}"
+
+    def _cte_registry_resolve_key(self, name: Optional[str]) -> Optional[str]:
+        """Resolve a table ref or simple alias to cte_registry dict key, if it is a known CTE."""
+        if not name:
+            return None
+        if name in self.cte_registry:
+            return name
+        simple = str(name).split(".")[-1]
+        sk = self.cte_simple_alias.get(simple.lower())
+        if sk and sk in self.cte_registry:
+            return sk
+        lower_map = {k.lower(): k for k in self.cte_registry.keys()}
+        lk = lower_map.get(str(name).lower()) or lower_map.get(simple.lower())
+        return lk
+
+    def _cte_registry_store(self, simple_name: str, payload: Any) -> str:
+        """Store CTE under scoped key and register simple-name alias for lookups."""
+        scoped = self._cte_scoped_key(simple_name)
+        if isinstance(payload, list):
+            payload = {"columns": payload}
+        elif not isinstance(payload, dict):
+            payload = {"columns": []}
+        else:
+            payload = dict(payload)
+        payload.setdefault("node_name", scoped)
+        payload["simple_name"] = simple_name
+        self.cte_simple_alias[str(simple_name).lower()] = scoped
+        self.cte_registry[scoped] = payload
+        return scoped
+
+    def _is_known_cte_ref(self, table_name: Optional[str]) -> bool:
+        return self._cte_registry_resolve_key(table_name) is not None
+
+    def _cte_simple_name(self, ref: Optional[str]) -> str:
+        """Simple CTE alias for matching sqlglot WITH aliases (not the scoped registry key)."""
+        if not ref:
+            return ""
+        sk = self._cte_registry_resolve_key(ref) or (ref if ref in self.cte_registry else None)
+        if sk and isinstance(self.cte_registry.get(sk), dict):
+            return str(self.cte_registry[sk].get("simple_name") or ref.split("$")[-1])
+        return ref.split("$")[-1] if "$" in str(ref) else str(ref)
     
     def _extract_database_from_use_statement(self, content: str) -> Optional[str]:
         """Extract database name from USE statement at the beginning of file."""
@@ -270,13 +330,18 @@ class SqlParser:
     def _find_last_select_string_fallback(self, sql_content: str) -> str | None:
         from .parser_modules import string_fallbacks as _sf
         return _sf._find_last_select_string_fallback(self, sql_content)
+
+    def _parse_select_into_temp_statements_from_string(self, sql_content: str, object_hint: Optional[str] = None) -> None:
+        from .parser_modules import string_fallbacks as _sf
+        return _sf._parse_select_into_temp_statements_from_string(self, sql_content, object_hint)
     
     def parse_sql_file(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
         """Parse a SQL file and extract object information."""
         from .openlineage_utils import sanitize_name
         
         logger.debug(f"parse_sql_file: Called with object_hint={object_hint}")
-        
+        self._parse_object_hint = object_hint or self._current_file
+
         # Track current file for log context. If engine pre-set _current_file (real file path), keep it.
         prev_file = self._current_file
         if not self._current_file:
@@ -304,10 +369,10 @@ class SqlParser:
         except Exception:
             pass
         
-        # Reset registries for each file to avoid contamination
-        # NOTE: cte_registry is NOT cleared here (like temp_lineage) - it needs to persist for column graph expansion
-        # CTE are saved in engine.py after parsing and used in models.py for expansion (similar to temp tables)
-        # self.cte_registry.clear()  # DO NOT CLEAR - needed for column graph expansion in engine/models
+        # Reset registries for each file to avoid contamination (symmetric with temp_*)
+        # Scoped CTE keys are merged into engine.global_saved_cte_registry after each parse in Phase 3.
+        self.cte_registry.clear()
+        self.cte_simple_alias.clear()
         self.cte_lineage_objects.clear()
         self.temp_registry.clear()
         self.temp_sources.clear()
@@ -962,9 +1027,14 @@ class SqlParser:
             
             return expanded_cols
         
-        # 2. Check cte_registry
-        if simple_name in self.cte_registry:
-            return self.cte_registry[simple_name]
+        # 2. Check cte_registry (scoped keys; resolve simple alias)
+        _cte_k = self._cte_registry_resolve_key(simple_name)
+        if _cte_k:
+            _cte_ent = self.cte_registry.get(_cte_k)
+            if isinstance(_cte_ent, dict) and "columns" in _cte_ent:
+                return _cte_ent["columns"]
+            if isinstance(_cte_ent, list):
+                return _cte_ent
         
         # 3. Check schema_registry
         namespace = self._get_namespace_for_table(table_name)

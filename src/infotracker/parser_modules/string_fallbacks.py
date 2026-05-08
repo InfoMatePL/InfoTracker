@@ -6,8 +6,114 @@ import sqlglot
 from sqlglot import expressions as exp
 from typing import List, Set, Optional, Dict
 from ..models import ColumnLineage, ColumnSchema, ColumnReference, TransformationType, ObjectInfo, TableSchema
+from .select_lineage import _register_cte_lineage_object
 
 logger = logging.getLogger(__name__)
+
+
+def _advance_past_sql_string_literal(sql: str, i: int, quote: str) -> int:
+    """Skip a SQL string starting at i (first char inside quotes). Supports '' escape in T-SQL."""
+    n = len(sql)
+    while i < n:
+        if sql[i] == quote:
+            if quote == "'" and i + 1 < n and sql[i + 1] == "'":
+                i += 2
+                continue
+            return i + 1
+        i += 1
+    return n
+
+
+def _scan_tsql_select_statement_end(sql: str, select_keyword_start: int) -> int:
+    """End index (exclusive) of the SELECT statement starting at select_keyword_start.
+
+    Handles nested parentheses; at depth 0 terminates on ``;`` or on a following T-SQL
+    statement such as ``SELECT @v = @@ROWCOUNT`` / ``COMMIT`` without requiring a semicolon
+    after ``FROM #temp``.
+    """
+    n = len(sql)
+    m = re.match(r"(?is)\s*SELECT\b", sql[select_keyword_start : select_keyword_start + 32])
+    if not m:
+        return n
+    i = select_keyword_start + m.end()
+    depth = 0
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            i = _advance_past_sql_string_literal(sql, i + 1, "'")
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            nl = sql.find("\n", i + 2)
+            i = nl + 1 if nl != -1 else n
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            ce = sql.find("*/", i + 2)
+            i = ce + 2 if ce != -1 else n
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0:
+            if c == ";":
+                return i + 1
+            if c.isspace():
+                rest = sql[i:].lstrip()
+                if not rest:
+                    return n
+                if re.match(r"(?is)SELECT\s+@\w+\s*=", rest):
+                    return i
+                if re.match(r"(?is)SELECT\s+[\[\]\w.]+\s*=", rest):
+                    return i
+                if re.match(r"(?is)(COMMIT|ROLLBACK)\b", rest):
+                    return i
+                if re.match(r"(?is)SET\s+@", rest):
+                    return i
+                if re.match(r"(?is)EXEC\s+", rest):
+                    return i
+                if re.match(r"(?is)GO\b", rest):
+                    return i
+        i += 1
+    return n
+
+
+def _parse_select_into_temp_statements_from_string(self, sql_content: str, object_hint: Optional[str] = None) -> None:
+    """Parse each SELECT … INTO #temp slice so temp_lineage/temp_sources are populated.
+
+    Used when CREATE PROCEDURE fails sqlglot batch parse (e.g. ``SELECT @x = @@ROWCOUNT`` after INSERT)
+    but individual SELECT INTO chunks still parse.
+    """
+    s = self._strip_sql_comments(self._normalize_tsql(sql_content))
+    lines = s.splitlines()
+    s = "\n".join(line for line in lines if not line.lstrip().startswith("--"))
+    n = len(s)
+    i = 0
+    while i < n:
+        m = re.search(r"(?is)\bSELECT\b", s[i:])
+        if not m:
+            break
+        sel_start = i + m.start()
+        sel_end = _scan_tsql_select_statement_end(s, sel_start)
+        chunk = s[sel_start:sel_end]
+        if re.search(r"(?is)\bINTO\s+#\w+", chunk):
+            try:
+                stmts = sqlglot.parse(chunk.strip(), read=self.dialect) or []
+                for stmt in stmts:
+                    if isinstance(stmt, exp.Select) and self._is_select_into(stmt):
+                        self._parse_select_into(stmt, object_hint)
+            except Exception as e:
+                logger.debug("_parse_select_into_temp_statements_from_string: chunk parse failed: %s", e)
+        i = sel_end
+
+
+def _slice_insert_into_select_sql(full_sql: str, insert_match_start: int) -> str:
+    """Slice INSERT INTO ... SELECT ... from full_sql starting at insert_match_start."""
+    sel_m = re.search(r"(?is)\bSELECT\b", full_sql[insert_match_start:])
+    if not sel_m:
+        return full_sql[insert_match_start:]
+    sel_abs = insert_match_start + sel_m.start()
+    end = _scan_tsql_select_statement_end(full_sql, sel_abs)
+    return full_sql[insert_match_start:end]
 
 
 def _find_last_select_string(self, sql_content: str, dialect: str = "tsql") -> str | None:
@@ -135,7 +241,12 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                 )
     
     # Find ALL INSERT INTO ... SELECT patterns (using finditer instead of search)
-    pattern_with_terminator = r'(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)|$)'
+    # Terminate before a new assignment-SELECT (e.g. SELECT @rc = @@ROWCOUNT) even without ';'
+    pattern_with_terminator = (
+        r"(?is)INSERT\s+INTO\s+([^\s(]+)(?:\s*\([^)]*\))?\s+(?:OUTPUT[^;]*?)?\s*SELECT\b"
+        r"(.*?)(?:;|(?=\b(?:COMMIT|ROLLBACK|RETURN|END|GO|CREATE|ALTER|MERGE|UPDATE|DELETE|INSERT)\b)"
+        r"|(?=\bSELECT\s+(?:@\w+|[\[\]\w.]+\s*=))|$)"
+    )
     
     matches = list(re.finditer(pattern_with_terminator, s))
     logger.debug(f"_extract_insert_select_lineage_string: Found {len(matches)} INSERT INTO ... SELECT patterns")
@@ -196,7 +307,8 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
         statement_sql = None
         try:
             insert_pos_stmt = match.start()
-            stmt_end = match.end()
+            insert_slice = _slice_insert_into_select_sql(s, insert_pos_stmt)
+            stmt_end = insert_pos_stmt + len(insert_slice)
             with_matches_stmt = list(re.finditer(r'(?is)(?:^|;)\s*WITH\s+\w+\s+AS\s*\(', s[:insert_pos_stmt]))
             if with_matches_stmt:
                 statement_start = with_matches_stmt[-1].start()
@@ -299,14 +411,14 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                                             col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
                                         if col_name:
                                             cte_columns.append(col_name)
-                                # Register CTE
                                 if isinstance(cte.this, exp.Select):
-                                    self.cte_registry[cte_name] = {
-                                        'columns': cte_columns,
-                                        'definition': cte.this
-                                    }
+                                    self._cte_registry_store(
+                                        cte_name,
+                                        {"columns": cte_columns, "definition": cte.this},
+                                    )
+                                    _register_cte_lineage_object(self, cte_name, cte.this, cte_columns)
                                 else:
-                                    self.cte_registry[cte_name] = cte_columns
+                                    self._cte_registry_store(cte_name, {"columns": cte_columns})
                     logger.debug(f"_extract_insert_select_lineage_string: Processed CTEs from exp.With, cte_registry keys: {list(self.cte_registry.keys())}")
                 elif isinstance(parsed[0], exp.Select):
                     select_stmt = parsed[0]
@@ -345,14 +457,14 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                                                             col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
                                                         if col_name:
                                                             cte_columns.append(col_name)
-                                                # Register CTE
                                                 if isinstance(cte.this, exp.Select):
-                                                    self.cte_registry[cte_name] = {
-                                                        'columns': cte_columns,
-                                                        'definition': cte.this
-                                                    }
+                                                    self._cte_registry_store(
+                                                        cte_name,
+                                                        {"columns": cte_columns, "definition": cte.this},
+                                                    )
+                                                    _register_cte_lineage_object(self, cte_name, cte.this, cte_columns)
                                                 else:
-                                                    self.cte_registry[cte_name] = cte_columns
+                                                    self._cte_registry_store(cte_name, {"columns": cte_columns})
                                                 logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} with {len(cte_columns)} columns")
                                                 break
                                 elif isinstance(cte_parsed, exp.Select):
@@ -368,11 +480,11 @@ def _extract_insert_select_lineage_string(self, sql_content: str, object_name: s
                                             col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
                                         if col_name:
                                             cte_columns.append(col_name)
-                                    # Register CTE
-                                    self.cte_registry[cte_name] = {
-                                        'columns': cte_columns,
-                                        'definition': cte_parsed
-                                    }
+                                    self._cte_registry_store(
+                                        cte_name,
+                                        {"columns": cte_columns, "definition": cte_parsed},
+                                    )
+                                    _register_cte_lineage_object(self, cte_name, cte_parsed, cte_columns)
                                     logger.debug(f"_extract_insert_select_lineage_string: Registered CTE {cte_name} (parsed as SELECT) with {len(cte_columns)} columns")
                                 logger.debug(f"_extract_insert_select_lineage_string: CTE registry keys after manual parsing: {list(self.cte_registry.keys())}")
                             except Exception as e:
@@ -470,12 +582,8 @@ def _extract_materialized_output_from_procedure_string(self, sql_content: str) -
         if obj:
             # Try to extract lineage for INSERT INTO
             try:
-                # Extract the full INSERT INTO ... SELECT statement
                 insert_start = m.start()
-                insert_end = s.find(';', insert_start)
-                if insert_end == -1:
-                    insert_end = len(s)
-                insert_sql = s[insert_start:insert_end]
+                insert_sql = _slice_insert_into_select_sql(s, insert_start)
                 # Use the actual table name from SQL, not the normalized one
                 table_name_from_sql = table_token.strip().strip('[]')
                 # Remove square brackets properly

@@ -657,35 +657,7 @@ class ColumnGraph:
                                     
                                     self.add_edge(edge)
                                 # Also keep the direct temp->output edge for continuity
-                        elif (not temp_lineage or not temp_lineage.input_fields) and getattr(
-                            temp_obj, "dependencies", None
-                        ):
-                            # Table-level links only: never attach the downstream/PIT column name to every
-                            # dependency (cartesian false lineage). Use source.* → target column with UNKNOWN.
-                            JOIN_KEYWORDS = {"left", "right", "inner", "outer", "cross", "full", "join"}
-                            for dep in sorted(temp_obj.dependencies):
-                                if not dep or dep.startswith("@") or "#" in dep or dep == "unknown":
-                                    continue
-                                dep_tail = dep.split(".")[-1] if "." in dep else dep
-                                if str(dep_tail).lower() in JOIN_KEYWORDS:
-                                    continue
-                                base_tbl = dep if "." in dep else f"dbo.{dep}"
-                                base_column = ColumnNode(
-                                    namespace=in_ns,
-                                    table_name=base_tbl,
-                                    column_name="*",
-                                )
-                                self.add_edge(
-                                    ColumnEdge(
-                                        from_column=base_column,
-                                        to_column=output_column,
-                                        transformation_type=TransformationType.UNKNOWN,
-                                        transformation_description=(
-                                            "COARSE_TABLE_LEVEL: temp lacks column lineage for this field; "
-                                            "upstream table linked at * only (no invented source column name)"
-                                        ),
-                                    )
-                                )
+                        # No fallback when temp column lineage is missing: do not multiply deps × downstream columns.
 
                     # Normalize DB prefix AFTER temp_name_map lookup
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):

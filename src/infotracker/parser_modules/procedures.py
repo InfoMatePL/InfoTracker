@@ -7,6 +7,7 @@ import sqlglot
 from sqlglot import exp  # type: ignore
 
 from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage
+from .select_lineage import _register_cte_lineage_object
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,12 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
     self._ctx_db = inferred_db or self.current_database or self.default_database
     self._ctx_obj = self._normalize_table_name_for_output(procedure_name)
     logger.debug(f"_parse_procedure_string: Set context at start: _ctx_db={self._ctx_db}, _ctx_obj={self._ctx_obj}, procedure_name={procedure_name}")
+
+    # Register SELECT … INTO #temp even when full procedure fails sqlglot (unterminated batch / SELECT @var = @@ROWCOUNT).
+    try:
+        self._parse_select_into_temp_statements_from_string(sql_content, object_hint)
+    except Exception:
+        pass
 
     # --- Prescan AST for temp materializations to register temp lineage early ---
     try:
@@ -988,11 +995,11 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                     col_name = str(proj.this) if hasattr(proj, 'this') else str(proj)
                                 if col_name:
                                     cte_columns.append(col_name)
-                            # Register CTE
-                            self.cte_registry[cte_name] = {
-                                'columns': cte_columns,
-                                'definition': parsed_cte
-                            }
+                            self._cte_registry_store(
+                                cte_name,
+                                {"columns": cte_columns, "definition": parsed_cte},
+                            )
+                            _register_cte_lineage_object(self, cte_name, parsed_cte, cte_columns)
                             logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} (as SELECT), cte_registry now has: {list(self.cte_registry.keys())}")
                     except Exception as e:
                         logger.debug(f"_parse_procedure_body_statements: Failed to parse CTE {cte_name}: {e}")
@@ -2636,11 +2643,11 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                                             try:
                                                                 temp_select = sqlglot.parse_one(f"SELECT * FROM {temp_table_name}", read=self.dialect)
                                                                 if isinstance(temp_select, exp.Select):
-                                                                    # Store the CTE definition in registry
-                                                                    self.cte_registry[cte_name] = {
-                                                                        'columns': [],
-                                                                        'definition': temp_select
-                                                                    }
+                                                                    self._cte_registry_store(
+                                                                        cte_name,
+                                                                        {"columns": [], "definition": temp_select},
+                                                                    )
+                                                                    _register_cte_lineage_object(self, cte_name, temp_select, [])
                                                                     logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} with temp table {temp_table_name} dependency, cte_registry keys: {list(self.cte_registry.keys())}")
                                                             except Exception as reg_error:
                                                                 logger.debug(f"_parse_procedure_body_statements: Failed to register CTE: {reg_error}")
@@ -2666,11 +2673,11 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                                                         # Create a simple SELECT statement that references the temp table
                                                         temp_select = sqlglot.parse_one(f"SELECT * FROM {from_table}", read=self.dialect)
                                                         if isinstance(temp_select, exp.Select):
-                                                            # Store the CTE definition in registry
-                                                            self.cte_registry[cte_name] = {
-                                                                'columns': [],
-                                                                'definition': temp_select
-                                                            }
+                                                            self._cte_registry_store(
+                                                                cte_name,
+                                                                {"columns": [], "definition": temp_select},
+                                                            )
+                                                            _register_cte_lineage_object(self, cte_name, temp_select, [])
                                                             logger.debug(f"_parse_procedure_body_statements: Registered CTE {cte_name} with temp table {from_table} dependency")
                                                     except Exception as reg_error:
                                                         logger.debug(f"_parse_procedure_body_statements: Failed to register CTE: {reg_error}")

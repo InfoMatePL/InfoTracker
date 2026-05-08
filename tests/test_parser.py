@@ -402,8 +402,8 @@ LEFT JOIN dbo.document_sat_s_vdesk_history s1 ON hub.hk_h_document = s1.hk_h_doc
                         f"spurious {ref.table_name}.{ref.column_name} for {pit_name}"
                     )
 
-    def test_column_graph_coarse_temp_expand_links_star_not_pit_column_names(self):
-        """When temp column lineage is empty, expand deps as table.* only (no cartesian source.PITCol)."""
+    def test_column_graph_sparse_temp_lineage_does_not_multiply_deps_to_pit_columns(self):
+        """Missing temp column lineage must not create upstream edges from every dependency × every PIT column."""
         from infotracker.models import (
             ColumnGraph,
             ColumnNode,
@@ -462,16 +462,61 @@ LEFT JOIN dbo.document_sat_s_vdesk_history s1 ON hub.hk_h_document = s1.hk_h_doc
         graph.build_from_object_lineage([temp_obj, pit_obj])
         pit_node = ColumnNode(namespace=ns, table_name="dbo.Document_PIT", column_name="DocumentId")
         upstream = graph.get_upstream(pit_node, max_depth=0)
-        bogus_sat = [
+        assert not [
             e
             for e in upstream
             if "sat" in e.from_column.table_name.lower()
             and e.from_column.column_name.lower() == "documentid"
         ]
-        assert not bogus_sat
-        star_sat = [
-            e
-            for e in upstream
-            if "sat" in e.from_column.table_name.lower() and e.from_column.column_name == "*"
-        ]
-        assert star_sat
+        assert not [e for e in upstream if "sat" in e.from_column.table_name.lower()]
+        assert any("#" in e.from_column.table_name for e in upstream)
+
+    def test_update_document_pit_sql_select_into_lineage(self):
+        """Regression: procedure body unparsable as one batch must still fill #PIT temp_lineage from SELECT INTO slice."""
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        sql_path = repo_root / "input" / "StoredProcedure.dbo.update_Document_PIT.sql"
+        if not sql_path.is_file():
+            pytest.skip(f"missing fixture {sql_path}")
+        sql = sql_path.read_text(encoding="utf-8", errors="replace")
+        p = SqlParser()
+        p.parse_sql_file(sql, "update_Document_PIT")
+        pit_map = p.temp_lineage.get("#PIT") or p.temp_lineage.get("#PIT@1") or {}
+        assert pit_map, "expected #PIT temp lineage"
+
+        def refs(col: str):
+            r = pit_map.get(col)
+            if r is None:
+                for k, v in pit_map.items():
+                    if k.lower() == col.lower():
+                        return [(x.table_name, x.column_name) for x in v]
+                return []
+            return [(x.table_name, x.column_name) for x in r]
+
+        assert refs("SnapshotDate") == []
+        assert ("dbo.Document_hub", "hk_h_Document") in refs("Key_Document")
+        assert ("dbo.Document_hub", "DocumentId") in refs("DocumentId")
+        assert ("dbo.Document_hub", "DV_Tenant_ID") in refs("DV_Tenant_ID")
+        assert ("dbo.Document_hub", "DV_record_source") in refs("SourceSystem")
+        assert ("dbo.Document_hub", "DV_Load_Date") in refs("DV_Load_Date")
+        assert ("dbo.Document_sat_S_vdesk_history", "hk_h_Document") in refs("Key_Document_vdesk")
+        assert ("dbo.Document_sat_S_vdesk_history", "DV_Load_Date") in refs("DV_Load_Date_Document_vdesk")
+        assert ("dbo.Document_sat_S_vdeskefa_history", "hk_h_Document") in refs("Key_Document_vdeskefa")
+        fk_refs = refs("FK_DocumentTypeId")
+        assert ("dbo.Document_sat_S_vdesk_history", "FK_DocumentTypeId") in fk_refs
+        assert ("dbo.Document_sat_S_vdeskefa_history", "FK_DocumentTypeId") in fk_refs
+        kdt = refs("Key_DocumentType")
+        assert ("dbo.DocumentType_BV", "Key_DocumentType") in kdt
+        assert ("dbo.Document_sat_S_vdesk_history", "FK_DocumentTypeId") in kdt
+        ml = refs("MaxLoadDate")
+        tables = {t for t, _ in ml}
+        assert any("Document_sat_S_vdesk_history".lower() in t.lower() for t in tables)
+        assert any("Document_Contract_sate_current".lower() in t.lower() for t in tables)
+        assert all(c.lower() != "maxloaddate" for _, c in ml)
+        assert ("dbo.Document_Contract_lnk", "ContractNUmber") in refs("ContractNUmber")
+        kc = refs("Key_Contract")
+        assert any("document_contract_lnk" in t.lower() and c.lower() == "hk_h_contract" for t, c in kc)
+        assert any("contract_hub" in t.lower() and "hk_h_contract" in c.lower() for t, c in kc)
+        for t, c in refs("DocumentId"):
+            assert not ("sat" in t.lower() and c.lower() == "documentid")

@@ -556,13 +556,17 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                         ver = self._temp_current(temp_seg)
                                         colname = col_exp.name
                                         if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
-                                            out_list.extend(self.temp_lineage[ver][colname])
-                                            logger.debug(f"_append_column_ref: Using temp_lineage from CTE: {len(self.temp_lineage[ver][colname])} refs")
-                                            return
+                                            _r = self.temp_lineage[ver][colname]
+                                            if _r:
+                                                out_list.extend(_r)
+                                                logger.debug(f"_append_column_ref: Using temp_lineage from CTE: {len(_r)} refs")
+                                                return
                                         if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
-                                            out_list.extend(self.temp_lineage[temp_seg][colname])
-                                            logger.debug(f"_append_column_ref: Using temp_lineage from CTE: {len(self.temp_lineage[temp_seg][colname])} refs")
-                                            return
+                                            _r2 = self.temp_lineage[temp_seg][colname]
+                                            if _r2:
+                                                out_list.extend(_r2)
+                                                logger.debug(f"_append_column_ref: Using temp_lineage from CTE: {len(_r2)} refs")
+                                                return
                                         # Fallback: add direct reference
                                         ref = ColumnReference(namespace=ns_temp, table_name=table_name, column_name=col_exp.name)
                                         out_list.append(ref)
@@ -675,15 +679,19 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                             ver = self._temp_current(temp_seg)
                             colname = col_exp.name
                             if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
-                                out_list.extend(self.temp_lineage[ver][colname])
-                                logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(self.temp_lineage[ver][colname])} refs")
-                                temp_lineage_used = True
-                                return
+                                _r3 = self.temp_lineage[ver][colname]
+                                if _r3:
+                                    out_list.extend(_r3)
+                                    logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(_r3)} refs")
+                                    temp_lineage_used = True
+                                    return
                             if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
-                                out_list.extend(self.temp_lineage[temp_seg][colname])
-                                logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(self.temp_lineage[temp_seg][colname])} refs")
-                                temp_lineage_used = True
-                                return
+                                _r4 = self.temp_lineage[temp_seg][colname]
+                                if _r4:
+                                    out_list.extend(_r4)
+                                    logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(_r4)} refs")
+                                    temp_lineage_used = True
+                                    return
                             # Column not in temp_lineage - this temp table doesn't have this column
                             # Continue to check other dependencies or fall through to column-level expansion
                             logger.debug(f"_append_column_ref: Column {col_exp.name} not in temp_lineage for {temp_seg}, will try column-level expansion")
@@ -795,15 +803,21 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 ver = self._temp_current(temp_seg)
                 colname = col_exp.name
                 if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
-                    # Use references from temp_lineage (they contain base sources, not self-reference)
-                    out_list.extend(self.temp_lineage[ver][colname])
-                    logger.debug(f"_append_column_ref: Using temp_lineage[{ver}][{colname}]: {len(self.temp_lineage[ver][colname])} refs")
-                    return
+                    _tl_refs = self.temp_lineage[ver][colname]
+                    if _tl_refs:
+                        out_list.extend(_tl_refs)
+                        logger.debug(
+                            f"_append_column_ref: Using temp_lineage[{ver}][{colname}]: {len(_tl_refs)} refs"
+                        )
+                        return
                 if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
-                    # Use references from temp_lineage (they contain base sources, not self-reference)
-                    out_list.extend(self.temp_lineage[temp_seg][colname])
-                    logger.debug(f"_append_column_ref: Using temp_lineage[{temp_seg}][{colname}]: {len(self.temp_lineage[temp_seg][colname])} refs")
-                    return
+                    _tl_refs2 = self.temp_lineage[temp_seg][colname]
+                    if _tl_refs2:
+                        out_list.extend(_tl_refs2)
+                        logger.debug(
+                            f"_append_column_ref: Using temp_lineage[{temp_seg}][{colname}]: {len(_tl_refs2)} refs"
+                        )
+                        return
             # If no temp_lineage or use_direct_ref is True, add direct reference with new format
             ref = ColumnReference(namespace=ns_temp, table_name=table_name, column_name=col_exp.name)
             out_list.append(ref)
