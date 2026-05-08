@@ -710,16 +710,25 @@ class Engine:
                                             if from_table_simple.lower() in JOIN_KEYWORDS:
                                                 logger.debug(f"Phase 3: Skipping JOIN keyword '{from_table}' in fallback lineage for {tmp}")
                                                 break
-                                            # Create basic lineage for all columns
+                                            # Table-level fallback only: do not assign each output col name to the first FROM table.
                                             ns_from, nm_from = parser._ns_and_name(from_table, obj_type_hint="table")
                                             for col in schema.columns:
-                                                ref = ColumnReference(namespace=ns_from, table_name=nm_from, column_name=col.name)
-                                                lin_list.append(ColumnLineage(
-                                                    output_column=col.name,
-                                                    input_fields=[ref],
-                                                    transformation_type=TransformationType.IDENTITY,
-                                                    transformation_description=f"from {nm_from}"
-                                                ))
+                                                ref = ColumnReference(
+                                                    namespace=ns_from,
+                                                    table_name=nm_from,
+                                                    column_name="*",
+                                                )
+                                                lin_list.append(
+                                                    ColumnLineage(
+                                                        output_column=col.name,
+                                                        input_fields=[ref],
+                                                        transformation_type=TransformationType.UNKNOWN,
+                                                        transformation_description=(
+                                                            f"COARSE_TABLE_LEVEL: regex fallback from {nm_from} (* only; "
+                                                            f"no per-column mapping)"
+                                                        ),
+                                                    )
+                                                )
                                             logger.debug(f"Phase 3: Created fallback lineage for {tmp} from pattern: {nm_from}: {len(lin_list)} columns")
                                             break
                                 except Exception as e:
@@ -852,7 +861,7 @@ class Engine:
                                                     ColumnReference(
                                                         namespace=ns_d,
                                                         table_name=nm_d,
-                                                        column_name=col.name,
+                                                        column_name="*",
                                                     )
                                                 )
                                             except Exception:
@@ -861,7 +870,7 @@ class Engine:
                                                     ColumnReference(
                                                         namespace=schema.namespace,
                                                         table_name=tbl,
-                                                        column_name=col.name,
+                                                        column_name="*",
                                                     )
                                                 )
                                     if synthetic:
@@ -870,7 +879,10 @@ class Engine:
                                                 output_column=col.name,
                                                 input_fields=synthetic,
                                                 transformation_type=TransformationType.UNKNOWN,
-                                                transformation_description="synthetic from temp SELECT deps (sparse column lineage)",
+                                                transformation_description=(
+                                                    "COARSE_TABLE_LEVEL: sparse temp column lineage; "
+                                                    "deps linked as * only (no invented source column names)"
+                                                ),
                                             )
                                         )
                                     else:

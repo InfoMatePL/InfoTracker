@@ -660,7 +660,8 @@ class ColumnGraph:
                         elif (not temp_lineage or not temp_lineage.input_fields) and getattr(
                             temp_obj, "dependencies", None
                         ):
-                            # Sparse column lineage on temp — align column_graph upstream with OpenLineage inputs (coarse edges).
+                            # Table-level links only: never attach the downstream/PIT column name to every
+                            # dependency (cartesian false lineage). Use source.* → target column with UNKNOWN.
                             JOIN_KEYWORDS = {"left", "right", "inner", "outer", "cross", "full", "join"}
                             for dep in sorted(temp_obj.dependencies):
                                 if not dep or dep.startswith("@") or "#" in dep or dep == "unknown":
@@ -672,14 +673,17 @@ class ColumnGraph:
                                 base_column = ColumnNode(
                                     namespace=in_ns,
                                     table_name=base_tbl,
-                                    column_name=input_field.column_name,
+                                    column_name="*",
                                 )
                                 self.add_edge(
                                     ColumnEdge(
                                         from_column=base_column,
                                         to_column=output_column,
-                                        transformation_type=lineage.transformation_type,
-                                        transformation_description=lineage.transformation_description,
+                                        transformation_type=TransformationType.UNKNOWN,
+                                        transformation_description=(
+                                            "COARSE_TABLE_LEVEL: temp lacks column lineage for this field; "
+                                            "upstream table linked at * only (no invented source column name)"
+                                        ),
                                     )
                                 )
 

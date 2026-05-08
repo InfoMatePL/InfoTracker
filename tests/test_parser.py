@@ -380,3 +380,98 @@ INNER JOIN dbo.TableB b ON a.id = b.id;
         dep_blob = " ".join(d.lower() for d in (obj_info.dependencies or []))
         assert "tablea" in dep_blob
         assert "tableb" in dep_blob
+
+    def test_select_into_with_join_sat_lineage_no_false_sat_columns_for_hub_fields(self):
+        """Hub-only projections must not get lineage refs that reuse PIT output names on the sat table."""
+        sql = """
+SELECT
+    hub.hk_h_document AS Key_Document,
+    hub.documentid AS DocumentId
+INTO #pit
+FROM dbo.document_hub hub
+LEFT JOIN dbo.document_sat_s_vdesk_history s1 ON hub.hk_h_document = s1.hk_h_document
+"""
+        obj_info = self.parser.parse_sql_file(sql, "batch_pit_like")
+        by_col = {ln.output_column: ln for ln in obj_info.lineage}
+        for pit_name in ("DocumentId", "Key_Document"):
+            for ref in by_col[pit_name].input_fields:
+                tbl = (ref.table_name or "").lower()
+                col = (ref.column_name or "").lower()
+                if "sat" in tbl or "vdesk" in tbl:
+                    assert col != pit_name.lower(), (
+                        f"spurious {ref.table_name}.{ref.column_name} for {pit_name}"
+                    )
+
+    def test_column_graph_coarse_temp_expand_links_star_not_pit_column_names(self):
+        """When temp column lineage is empty, expand deps as table.* only (no cartesian source.PITCol)."""
+        from infotracker.models import (
+            ColumnGraph,
+            ColumnNode,
+            ColumnLineage,
+            ColumnReference,
+            ColumnSchema,
+            ObjectInfo,
+            TableSchema,
+            TransformationType,
+        )
+
+        ns = "mssql://localhost/TESTDB"
+        temp_obj = ObjectInfo(
+            name="dbo.proc#pit",
+            object_type="temp_table",
+            schema=TableSchema(
+                namespace=ns,
+                name="dbo.proc#pit",
+                columns=[ColumnSchema(name="DocumentId", data_type="int", nullable=True, ordinal=0)],
+            ),
+            lineage=[
+                ColumnLineage(
+                    output_column="DocumentId",
+                    input_fields=[],
+                    transformation_type=TransformationType.UNKNOWN,
+                    transformation_description="sparse",
+                )
+            ],
+            dependencies={"dbo.Document_hub", "dbo.Document_sat_S_vdesk_history"},
+        )
+        pit_obj = ObjectInfo(
+            name="dbo.Document_PIT",
+            object_type="table",
+            schema=TableSchema(
+                namespace=ns,
+                name="dbo.Document_PIT",
+                columns=[ColumnSchema(name="DocumentId", data_type="int", nullable=True, ordinal=0)],
+            ),
+            lineage=[
+                ColumnLineage(
+                    output_column="DocumentId",
+                    input_fields=[
+                        ColumnReference(
+                            namespace=ns,
+                            table_name="dbo.proc#pit",
+                            column_name="DocumentId",
+                        )
+                    ],
+                    transformation_type=TransformationType.IDENTITY,
+                    transformation_description="insert",
+                )
+            ],
+            dependencies=set(),
+        )
+        graph = ColumnGraph()
+        graph.build_from_object_lineage([temp_obj, pit_obj])
+        pit_node = ColumnNode(namespace=ns, table_name="dbo.Document_PIT", column_name="DocumentId")
+        upstream = graph.get_upstream(pit_node, max_depth=0)
+        bogus_sat = [
+            e
+            for e in upstream
+            if "sat" in e.from_column.table_name.lower()
+            and e.from_column.column_name.lower() == "documentid"
+        ]
+        assert not bogus_sat
+        star_sat = [
+            e
+            for e in upstream
+            if "sat" in e.from_column.table_name.lower() and e.from_column.column_name == "*"
+        ]
+        assert star_sat
