@@ -428,9 +428,19 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
     except Exception:
         pass
 
-    # Remove spurious columns that match table aliases/names (e.g., CTE alias split into columns)
+    # Remove spurious columns that match table aliases/names (e.g., CTE alias split into columns).
+    # Never drop a name that is an explicit top-level SELECT output alias (avoids wiping multi-column
+    # SELECT INTO #temp when table names appear in alias heuristics).
     try:
         if isinstance(select_stmt, exp.Select) and output_columns:
+            from ..parser_modules import select_lineage as _sl
+
+            projection_aliases: Set[str] = set()
+            for expr in select_stmt.expressions or []:
+                an = _sl._extract_column_alias(self, expr)
+                if an:
+                    projection_aliases.add(str(an).strip("[]").lower())
+
             alias_names = set()
             for tbl in select_stmt.find_all(exp.Table):
                 try:
@@ -467,10 +477,15 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
                     if not col or not col.name:
                         continue
                     name = str(col.name).strip("[]")
-                    if name.lower() in alias_names:
+                    nl = name.lower()
+                    if nl in projection_aliases:
+                        keep_cols.append(col)
+                        keep_names.add(nl)
+                        continue
+                    if nl in alias_names:
                         continue
                     keep_cols.append(col)
-                    keep_names.add(name.lower())
+                    keep_names.add(nl)
 
                 if keep_cols and len(keep_cols) < len(output_columns):
                     output_columns = keep_cols
@@ -495,45 +510,40 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
         # Check if this dependency is a CTE (should not be added as a dependency)
         # Only check if cte_registry exists and is not empty
         is_cte = False
+        _cte_key_resolved = None
         if hasattr(self, 'cte_registry') and self.cte_registry:
             dep_simple = d.split('.')[-1] if '.' in d else d
-            # Only treat as CTE if it's explicitly in cte_registry (case-insensitive)
-            cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
-            is_cte = dep_simple and dep_simple.lower() in cte_registry_lower
-        if is_cte:
+            _cte_key_resolved = self._cte_registry_resolve_key(dep_simple) or self._cte_registry_resolve_key(d)
+            is_cte = bool(_cte_key_resolved)
+        if is_cte and _cte_key_resolved:
             # This is a CTE - don't add it as a dependency, expand it to base sources instead
             dep_simple = d.split('.')[-1] if '.' in d else d
             logger.debug(f"_parse_select_into: Skipping CTE {dep_simple} from dependencies, will expand to base sources")
-            cte_name = cte_registry_lower.get(dep_simple.lower())
-            if cte_name:
-                cte_info = self.cte_registry.get(cte_name)
-                if cte_info:
-                    if isinstance(cte_info, dict) and 'definition' in cte_info:
-                        cte_def = cte_info['definition']
-                    elif isinstance(cte_info, exp.Select):
-                        cte_def = cte_info
-                    else:
-                        cte_def = None
-                    if cte_def and isinstance(cte_def, exp.Select):
-                        cte_deps = self._extract_dependencies(cte_def)
-                        # Add base sources from CTE (expand temp tables to their base sources, exclude CTEs)
-                        for cte_dep in cte_deps:
-                            cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
-                            is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in self.temp_registry)
-                            is_cte_dep_cte = cte_dep_simple and cte_dep_simple.lower() in cte_registry_lower
-                            if is_cte_dep_temp:
-                                # Expand temp table to its base sources
-                                temp_key = cte_dep_simple if cte_dep_simple.startswith('#') else f"#{cte_dep_simple}"
-                                temp_bases = self.temp_sources.get(temp_key, set())
-                                if temp_bases:
-                                    final_dependencies.update(temp_bases)
-                                    logger.debug(f"_parse_select_into: Expanded temp table {cte_dep} to base sources: {temp_bases}")
-                                else:
-                                    # If no base sources found, add temp table itself
-                                    final_dependencies.add(cte_dep)
-                            elif not is_cte_dep_cte:
+            cte_info = self.cte_registry.get(_cte_key_resolved)
+            if cte_info:
+                if isinstance(cte_info, dict) and 'definition' in cte_info:
+                    cte_def = cte_info['definition']
+                elif isinstance(cte_info, exp.Select):
+                    cte_def = cte_info
+                else:
+                    cte_def = None
+                if cte_def and isinstance(cte_def, exp.Select):
+                    cte_deps = self._extract_dependencies(cte_def)
+                    for cte_dep in cte_deps:
+                        cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
+                        is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in self.temp_registry)
+                        is_cte_dep_cte = bool(self._cte_registry_resolve_key(cte_dep_simple))
+                        if is_cte_dep_temp:
+                            temp_key = cte_dep_simple if cte_dep_simple.startswith('#') else f"#{cte_dep_simple}"
+                            temp_bases = self.temp_sources.get(temp_key, set())
+                            if temp_bases:
+                                final_dependencies.update(temp_bases)
+                                logger.debug(f"_parse_select_into: Expanded temp table {cte_dep} to base sources: {temp_bases}")
+                            else:
                                 final_dependencies.add(cte_dep)
-                                logger.debug(f"_parse_select_into: Added base source {cte_dep} from CTE {cte_name}")
+                        elif not is_cte_dep_cte:
+                            final_dependencies.add(cte_dep)
+                            logger.debug(f"_parse_select_into: Added base source {cte_dep} from CTE {_cte_key_resolved}")
             continue
         if not is_dep_temp:
             final_dependencies.add(d)

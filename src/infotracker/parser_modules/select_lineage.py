@@ -47,12 +47,15 @@ def _build_alias_maps(self, select_exp: exp.Select):
     # Process CTEs first to populate cte_registry
     self._process_ctes(select_exp)
     
-    # Add CTEs to alias_map so they can be resolved as sources
-    for cte_name, cte_columns in self.cte_registry.items():
-        # CTE name is used as both alias and table name
-        alias_map[cte_name.lower()] = cte_name
-        # Also add to base_fqns for unqualified column resolution
-        # Note: CTEs are not real tables, but we treat them as sources for lineage
+    # Add CTEs to alias_map so they can be resolved as sources (alias -> scoped node key)
+    for _scoped, cte_entry in self.cte_registry.items():
+        cte_simple = (
+            cte_entry.get("simple_name")
+            if isinstance(cte_entry, dict)
+            else (_scoped.split("$")[-1] if "$" in _scoped else _scoped)
+        )
+        if cte_simple:
+            alias_map[str(cte_simple).lower()] = _scoped
 
     base_fqns = []
     for t in select_exp.find_all(exp.Table):
@@ -90,8 +93,7 @@ def _build_alias_maps(self, select_exp: exp.Select):
             alias_map[alias] = fqn
         # Don't overwrite CTEs in alias_map - they were already added with simple CTE names
         table_name_lower = t.name.lower()
-        # Case-insensitive check: look for CTE with matching lowercase key
-        is_cte_name = any(cte_key.lower() == table_name_lower for cte_key in self.cte_registry.keys())
+        is_cte_name = self._cte_registry_resolve_key(table_name_lower) is not None
         if not is_cte_name:
             alias_map[table_name_lower] = fqn
         base_fqns.append(fqn)
@@ -147,6 +149,32 @@ def _build_alias_maps(self, select_exp: exp.Select):
                     from_table_lower = from_table_name.lower()
                     if from_table_lower in alias_map:
                         from_source = alias_map[from_table_lower]
+            elif isinstance(from_this, exp.Values):
+                # T-SQL: FROM (VALUES (a.col), ...) AS V(LoadDate) — Values + TableAlias, not exp.Table
+                talias = from_this.args.get("alias") or getattr(from_this, "alias", None)
+                if talias and getattr(talias, "this", None) is not None:
+                    from_alias_str = (
+                        talias.this.name.lower()
+                        if hasattr(talias.this, "name")
+                        else str(talias.this).lower()
+                    )
+                    synthetic = f"__values__.{from_alias_str}"
+                    alias_map[from_alias_str] = synthetic
+                    from_source = synthetic
+                    vcols = talias.args.get("columns") or []
+                    if len(vcols) == 1:
+                        cn = (
+                            str(vcols[0].name)
+                            if hasattr(vcols[0], "name")
+                            else str(vcols[0])
+                        ).lower()
+                        acc: List[exp.Column] = []
+                        for tup in from_this.expressions or []:
+                            cells = tup.expressions if isinstance(tup, exp.Tuple) else [tup]
+                            if cells:
+                                acc.extend(list(cells[0].find_all(exp.Column)))
+                        derived_cols[(from_alias_str, cn)] = acc
+                        derived_cols[("", cn)] = acc
 
         # Persist the explicit top-level FROM source for unqualified-column resolution.
         if from_source:
@@ -165,15 +193,7 @@ def _build_alias_maps(self, select_exp: exp.Select):
 
 def _cte_node_name(self, cte_name: str) -> str:
     """Build a stable virtual CTE node name like 'dbo.<procedure>$<cte>'."""
-    schema = getattr(self, "_ctx_schema", None) or self.default_schema or "dbo"
-    owner = getattr(self, "_ctx_obj", None) or "procedure"
-    try:
-        owner = self._normalize_table_name_for_output(owner)
-    except Exception:
-        owner = str(owner)
-    owner = str(owner).split(".")[-1]
-    cte_simple = str(cte_name).split(".")[-1]
-    return f"{schema}.{owner}${cte_simple}"
+    return self._cte_scoped_key(cte_name)
 
 
 def _match_temp_segment(self, raw_name: str) -> Optional[str]:
@@ -306,29 +326,27 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 # For INSERT INTO with CTE, the CTE might be the only source
                 for key, value in alias_map.items():
                     value_simple = value.split('.')[-1] if '.' in value else value
-                    # Check case-insensitive match with cte_registry
-                    cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
-                    if value in self.cte_registry or value_simple in self.cte_registry or value.lower() in cte_registry_lower or value_simple.lower() in cte_registry_lower:
-                        table_fqn = value
+                    _rk = self._cte_registry_resolve_key(value) or self._cte_registry_resolve_key(value_simple)
+                    if _rk:
+                        table_fqn = _rk
                         logger.debug(f"_append_column_ref: Found CTE {value} in alias_map for unqualified column {col_exp.name}")
                         break
                 if not table_fqn:
-                    # If still not found, check if any alias_map value (case-insensitive) matches a CTE
-                    cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
                     for key, value in alias_map.items():
-                        value_lower = value.lower()
-                        if value_lower in cte_registry_lower:
-                            table_fqn = value
+                        _rk = self._cte_registry_resolve_key(value) or self._cte_registry_resolve_key(
+                            value.split(".")[-1] if "." in value else value
+                        )
+                        if _rk:
+                            table_fqn = _rk
                             logger.debug(f"_append_column_ref: Found CTE {value} (case-insensitive) in alias_map for unqualified column {col_exp.name}")
                             break
                     if not table_fqn:
-                        # If still not found, check if there's a CTE value in alias_map and use it as default source
-                        # This handles cases like "SELECT col FROM CTE AS src" where col is unqualified
-                        cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
                         for key, value in alias_map.items():
-                            value_lower = value.lower()
-                            if value_lower in cte_registry_lower:
-                                table_fqn = value
+                            _rk = self._cte_registry_resolve_key(value) or self._cte_registry_resolve_key(
+                                value.split(".")[-1] if "." in value else value
+                            )
+                            if _rk:
+                                table_fqn = _rk
                                 logger.debug(f"_append_column_ref: Using CTE {value} from alias_map as default source for unqualified column {col_exp.name}")
                                 break
                         if not table_fqn:
@@ -377,8 +395,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                 main_from_values = []
                                 for v in non_empty_values:
                                     value_simple = v.split('.')[-1] if '.' in v else v
-                                    cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
-                                    if v in self.cte_registry or value_simple in self.cte_registry or v.lower() in cte_registry_lower or value_simple.lower() in cte_registry_lower:
+                                    if self._cte_registry_resolve_key(v) or self._cte_registry_resolve_key(value_simple):
                                         main_from_values.append(v)
                                 
                                 if len(main_from_values) == 1:
@@ -403,7 +420,11 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     # CTEs don't have direct table sources - their sources are in the CTE definition
     # Try to expand CTE to its sources
     cte_name_simple = table_fqn.split('.')[-1] if '.' in table_fqn else table_fqn
-    is_cte = (qual in self.cte_registry) or (table_fqn in self.cte_registry) or (cte_name_simple in self.cte_registry)
+    is_cte = bool(
+        self._cte_registry_resolve_key(qual)
+        or self._cte_registry_resolve_key(table_fqn)
+        or self._cte_registry_resolve_key(cte_name_simple)
+    )
     
     # Also check if the table name matches a CTE in the current SELECT statement's WITH clause
     # This handles cases where CTE is not in cte_registry (e.g., when SELECT INTO is parsed separately from WITH)
@@ -437,14 +458,12 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     if is_cte:
         use_cte_nodes = getattr(self, "_use_cte_nodes", True)
         if use_cte_nodes:
-            cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
-            if qual and qual.lower() in cte_registry_lower:
-                cte_key = cte_registry_lower[qual.lower()]
-            elif table_fqn and table_fqn.lower() in cte_registry_lower:
-                cte_key = cte_registry_lower[table_fqn.lower()]
-            else:
-                cte_key = cte_registry_lower.get(cte_name_simple.lower(), cte_name_simple)
-
+            cte_key = (
+                self._cte_registry_resolve_key(qual)
+                or self._cte_registry_resolve_key(table_fqn)
+                or self._cte_registry_resolve_key(cte_name_simple)
+                or cte_name_simple
+            )
             cte_info = self.cte_registry.get(cte_key, {})
             node_name = (
                 cte_info.get("node_name")
@@ -461,18 +480,16 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
 
         # Try to find CTE definition and extract sources from it
         # Find the actual CTE name (case-insensitive match)
-        cte_name = None
-        cte_registry_lower = {k.lower(): k for k in self.cte_registry.keys()}
-        if qual and qual.lower() in cte_registry_lower:
-            cte_name = cte_registry_lower[qual.lower()]
-        elif table_fqn and table_fqn.lower() in cte_registry_lower:
-            cte_name = cte_registry_lower[table_fqn.lower()]
-        else:
-            cte_name_simple = table_fqn.split('.')[-1] if '.' in table_fqn else table_fqn
-            cte_name = cte_registry_lower.get(cte_name_simple.lower(), cte_name_simple)
+        cte_name_simple = table_fqn.split('.')[-1] if '.' in table_fqn else table_fqn
+        cte_name = (
+            self._cte_registry_resolve_key(qual)
+            or self._cte_registry_resolve_key(table_fqn)
+            or self._cte_registry_resolve_key(cte_name_simple)
+            or cte_name_simple
+        )
         
         # If CTE not in registry, try to find it in WITH clause
-        if not cte_name or cte_name not in self.cte_registry:
+        if not self._cte_registry_resolve_key(cte_name):
             select_stmt = getattr(self, '_current_select_stmt', None)
             if select_stmt and isinstance(select_stmt, exp.Select):
                 with_clause = select_stmt.args.get('with')
@@ -484,7 +501,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                             logger.debug(f"_append_column_ref: Found CTE {cte_name} in WITH clause")
                             break
             # Also check parent statement (for SELECT INTO that's part of WITH statement)
-            if not cte_name or (cte_name not in self.cte_registry):
+            if not self._cte_registry_resolve_key(cte_name):
                 try:
                     parent = getattr(select_stmt, 'parent', None) if select_stmt else None
                     if isinstance(parent, exp.With):
@@ -512,7 +529,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 if with_clause and hasattr(with_clause, 'expressions'):
                     for cte in with_clause.expressions:
                         cte_alias = str(cte.alias) if hasattr(cte, 'alias') and cte.alias else None
-                        if hasattr(cte, 'alias') and str(cte.alias) == cte_name:
+                        if hasattr(cte, 'alias') and str(cte.alias).lower() == self._cte_simple_name(cte_name).lower():
                             # Found the CTE definition, extract its sources
                             if isinstance(cte.this, exp.Select):
                                 # Extract dependencies from CTE's SELECT
@@ -617,10 +634,11 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                             cte_found = True
                             break
             # If CTE not found in current SELECT, check if it's registered and try to find its source
-            if not cte_found and cte_name in self.cte_registry:
+            _cte_reg_key = self._cte_registry_resolve_key(cte_name)
+            if not cte_found and _cte_reg_key:
                 # CTE is registered but not in current SELECT - it might be defined before INSERT
                 # Get the CTE definition from cte_registry
-                cte_info = self.cte_registry[cte_name]
+                cte_info = self.cte_registry[_cte_reg_key]
                 # Handle both dict format (with 'definition' key) and legacy list format (just columns)
                 if isinstance(cte_info, dict) and 'definition' in cte_info:
                     cte_def = cte_info['definition']
@@ -684,13 +702,14 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                         # extract column-level lineage from CTE definition to find the correct source table(s)
                         
                         # Prevent infinite recursion: check if we're already expanding this CTE
-                        if cte_name in self._cte_expansion_stack:
+                        _cte_stack_id = _cte_reg_key
+                        if _cte_stack_id in self._cte_expansion_stack:
                             logger.debug(f"_append_column_ref: CTE {cte_name} already in expansion stack, skipping to avoid infinite recursion")
                             # Skip to fallback logic
                         else:
                             try:
                                 # Mark this CTE as being expanded
-                                self._cte_expansion_stack.add(cte_name)
+                                self._cte_expansion_stack.add(_cte_stack_id)
                                 logger.warning(f"DIAGNOSTIC_REG: Extracting lineage for CTE {cte_name}, col={col_exp.name}, cte_def={type(cte_def).__name__}")
                                 cte_lineage, _cte_schema = self._extract_column_lineage(cte_def, cte_name)
                                 logger.warning(f"DIAGNOSTIC_REG: Extracted {len(cte_lineage)} columns from CTE {cte_name}")
@@ -712,7 +731,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                         logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} (from registry) column lineage: {input_ref}")
                                     if out_list:
                                         # Clean up expansion stack before returning
-                                        self._cte_expansion_stack.discard(cte_name)
+                                        self._cte_expansion_stack.discard(_cte_stack_id)
                                         return
                                 else:
                                     logger.debug(f"_append_column_ref: No lineage found for column {col_exp.name} in CTE {cte_name} (from registry), falling back to all dependencies")
@@ -723,7 +742,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                 logger.debug(f"_append_column_ref: Failed to extract CTE lineage from registry: {e}, falling back to all dependencies")
                             finally:
                                 # Always remove from stack after processing
-                                self._cte_expansion_stack.discard(cte_name)
+                                self._cte_expansion_stack.discard(_cte_stack_id)
                         
                         # Fallback: if lineage extraction failed, add column to all dependencies (old behavior)
                         for dep in cte_deps:
@@ -825,15 +844,40 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
 
 def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derived_cols: dict):
     inputs = []
+    outer_stmt = getattr(self, "_current_select_stmt", None)
+
+    def _smallest_select_containing(root: Optional[exp.Select], col: exp.Column) -> Optional[exp.Select]:
+        """Innermost SELECT whose subtree contains this column (fixes VALUES / MAX(LoadDate) subqueries)."""
+        if root is None:
+            return None
+
+        def _cols_of(s: exp.Select):
+            return s.find_all(exp.Column)
+
+        candidates = [s for s in root.find_all(exp.Select) if col in _cols_of(s)]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda s: sum(1 for _ in s.walk()))
+
     for col in expr.find_all(exp.Column):
+        enc = _smallest_select_containing(outer_stmt, col)
+        eff_map = alias_map
+        eff_derived = derived_cols
+        if enc is not None and enc is not outer_stmt:
+            try:
+                eff_map, eff_derived = _build_alias_maps(self, enc)
+            except Exception:
+                eff_map, eff_derived = alias_map, derived_cols
+
         qual = (col.table or "").lower()
         key = (qual, col.name.lower())
-        base_cols = derived_cols.get(key)
+        base_cols = eff_derived.get(key)
         if base_cols:
+            # VALUES row cells reference outer SELECT aliases (e.g. Document_hub.col); resolve with outer alias_map.
             for b in base_cols:
                 _append_column_ref(self, inputs, b, alias_map)
             continue
-        _append_column_ref(self, inputs, col, alias_map)
+        _append_column_ref(self, inputs, col, eff_map)
     return inputs
 
 
@@ -1360,7 +1404,7 @@ def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple
                 # Remove leading/trailing invalid characters
                 out_name = str(out_name).strip('[]').strip()
                 # If name is empty or invalid after cleanup, try to get from inner expression
-                if not out_name or len(out_name) < 2 or out_name in [')', '(', 'INSERT', 'SELECT']:
+                if not out_name or out_name in [')', '(', 'INSERT', 'SELECT']:
                     if hasattr(proj, 'this') and isinstance(proj.this, exp.Column):
                         out_name = proj.this.name or "calc_expr"
                     else:
@@ -1391,13 +1435,13 @@ def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple
                         parts = out_name.split('.')
                         out_name = parts[-1].strip('[]').strip()
                     # If name is empty or invalid after cleanup, use generic name
-                    if not out_name or len(out_name) < 2 or out_name in [')', '(', 'INSERT', 'SELECT']:
+                    if not out_name or out_name in [')', '(', 'INSERT', 'SELECT']:
                         out_name = "calc_expr"
             else:
                 # Attempt to derive a stable name from expression tail if no alias provided
                 out_name = _strip_expr_tail(str(proj))
                 # If _strip_expr_tail returns empty or invalid, use generic name
-                if not out_name or len(out_name) < 2:
+                if not out_name:
                     out_name = "calc_expr"
                 # Additional validation: check for SQL keywords or invalid characters
                 elif len(out_name) > 100 or any(keyword in out_name.upper() for keyword in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'FROM', 'WHERE', 'CASE', 'WHEN', 'THEN', 'ELSE', 'END', 'INT)', 'AS']):
@@ -1684,14 +1728,11 @@ def _process_ctes(self, select_stmt: exp.Expression) -> exp.Expression:
                 # Store both columns and the CTE definition (exp.Select) for later use
                 # We use a dict to store both pieces of information
                 if isinstance(cte.this, exp.Select):
-                    cte_node_name = _cte_node_name(self, cte_name)
-                    self.cte_registry[cte_name] = {
-                        'columns': cte_columns,
-                        'definition': cte.this,
-                        'node_name': cte_node_name,
-                    }
+                    self._cte_registry_store(
+                        cte_name,
+                        {"columns": cte_columns, "definition": cte.this},
+                    )
                     _register_cte_lineage_object(self, cte_name, cte.this, cte_columns)
                 else:
-                    # Fallback: if not a Select, just store columns
-                    self.cte_registry[cte_name] = cte_columns
+                    self._cte_registry_store(cte_name, {"columns": cte_columns})
     return select_stmt

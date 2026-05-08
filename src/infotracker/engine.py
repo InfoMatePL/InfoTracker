@@ -329,22 +329,27 @@ class Engine:
                     parser.temp_sources.clear()
                     parser.temp_lineage.clear()
                     parser._temp_version.clear()
+                    parser.cte_registry.clear()
+                    parser.cte_simple_alias.clear()
                     # DON'T reset context - we need it for canonical temp naming
                     # The context will be set by parse_sql_file if needed, but we preserve it from Phase 1
                     
                     # Parse the file - this will re-detect USE statement and set current_database
                     obj_info: ObjectInfo = parser.parse_sql_file(sql_text, object_hint=sql_path.stem)
+                    # Merge scoped CTE registry for column_graph expansion (like prefixed temp lineage)
+                    for _cte_sk, _cte_val in list(parser.cte_registry.items()):
+                        global_saved_cte_registry[_cte_sk] = _cte_val
                     if getattr(parser, "cte_lineage_objects", None):
-                        known_ctes = {getattr(o.schema, "name", "").lower() for o in global_cte_lineage_objects}
+                        # Deduplicate by full virtual object name (dbo.<proc>$<cte>), not bare CTE alias
+                        known_cte_nodes = {
+                            (getattr(o.schema, "name", None) or "").lower()
+                            for o in global_cte_lineage_objects
+                        }
                         for cte_obj in parser.cte_lineage_objects:
-                            cte_name = getattr(getattr(cte_obj, "schema", None), "name", "").lower()
-                            if cte_name and cte_name not in known_ctes:
+                            node_key = (getattr(getattr(cte_obj, "schema", None), "name", None) or "").lower()
+                            if node_key and node_key not in known_cte_nodes:
                                 global_cte_lineage_objects.append(cte_obj)
-                                known_ctes.add(cte_name)
-                    
-                    # NOTE: CTE registry saving attempted here but cte_registry is empty after parse
-                    # CTE are registered locally in SelectLineageExtractor and don't propagate back to parser
-                    # This is a known architectural limitation - CTE will appear in column_graph as-is
+                                known_cte_nodes.add(node_key)
                     
                     # Save temp_lineage, temp_sources, and temp_registry from procedures before they get cleared
                     if obj_info.object_type == "procedure" or "procedure" in str(sql_path).lower():
@@ -449,6 +454,7 @@ class Engine:
 
                     ol_payload = emit_ol_from_object(
                         obj_info,
+                        job_name=f"warehouse/sql/{sql_path.name}",
                         quality_metrics=True,
                         virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
                     )
@@ -566,16 +572,42 @@ class Engine:
                                     for ref in refs:
                                         # Check if ref points to a CTE (CTEs don't have namespace or have special format)
                                         # CTEs are typically not in temp_registry and don't have # prefix
-                                        if ref.table_name and not ref.table_name.startswith('#') and '.' not in ref.table_name:
-                                            # Might be a CTE, check if it's in cte_registry
-                                            if ref.table_name in parser.cte_registry or ref.table_name.lower() in [k.lower() for k in parser.cte_registry.keys()]:
-                                                has_cte_refs = True
-                                                break
+                                        if ref.table_name and parser._cte_registry_resolve_key(ref.table_name):
+                                            has_cte_refs = True
+                                            break
                                     if has_cte_refs:
                                         break
                             else:
                                 all_refs_empty = True
-                            
+
+                            # Some columns have lineage refs but others do not (e.g. spurious alias filter left one column).
+                            # Do not trigger the regex "first FROM only" fallback for this — enrich per-column below via deps.
+                            lineage_incomplete = False
+                            if col_map and schema.columns:
+                                cols_with_refs = 0
+                                for sch_col in schema.columns:
+                                    if not sch_col or not sch_col.name:
+                                        continue
+                                    cn = sch_col.name
+                                    refs_here = col_map.get(cn)
+                                    if refs_here is None:
+                                        for k, v in col_map.items():
+                                            if k and str(k).lower() == str(cn).lower():
+                                                refs_here = v
+                                                break
+                                    if refs_here:
+                                        cols_with_refs += 1
+                                lineage_incomplete = cols_with_refs < len(
+                                    [c for c in (schema.columns or []) if c and c.name]
+                                )
+
+                            prefixed_key_sources = f"{owner}::{tmp}"
+                            deps = set(
+                                global_saved_temp_sources.get(prefixed_key_sources, set())
+                                or global_saved_temp_sources.get(f"{prefixed_key_sources}@1", set())
+                                or set()
+                            )
+
                             if (not col_map or has_cte_refs or all_refs_empty) and schema.columns:
                                 # Fallback: try to extract basic lineage from SQL string for this temp table
                                 logger.debug(f"Phase 3: Starting fallback for {tmp}, col_map empty={not col_map}, has_cte_refs={has_cte_refs}, schema.columns={len(schema.columns)}")
@@ -649,31 +681,26 @@ class Engine:
                                                         if cte_any_match:
                                                             from_table = f"dbo.{cte_any_match.group(1)}"
                                                             logger.debug(f"Phase 3: Found CTE, actual source is {from_table} (from CTE, any table found)")
-                                                # Also check if from_table is in cte_registry and expand it
-                                                if from_table and from_table.lower() in [k.lower() for k in parser.cte_registry.keys()]:
-                                                    # This is a CTE - expand it to base sources
-                                                    cte_name_lower = from_table.lower()
-                                                    cte_name = next((k for k in parser.cte_registry.keys() if k.lower() == cte_name_lower), None)
-                                                    if cte_name:
-                                                        cte_info = parser.cte_registry[cte_name]
-                                                        from sqlglot import expressions as exp
-                                                        if isinstance(cte_info, dict) and 'definition' in cte_info:
-                                                            cte_def = cte_info['definition']
-                                                        elif isinstance(cte_info, exp.Select):
-                                                            cte_def = cte_info
-                                                        else:
-                                                            cte_def = None
-                                                        if cte_def and isinstance(cte_def, exp.Select):
-                                                            cte_deps = parser._extract_dependencies(cte_def)
-                                                            # Find first non-temp, non-CTE dependency
-                                                            for cte_dep in cte_deps:
-                                                                cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
-                                                                is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in parser.temp_registry)
-                                                                is_cte_dep_cte = cte_dep_simple and cte_dep_simple.lower() in [k.lower() for k in parser.cte_registry.keys()]
-                                                                if not is_cte_dep_temp and not is_cte_dep_cte:
-                                                                    from_table = cte_dep
-                                                                    logger.debug(f"Phase 3: Expanded CTE {cte_name} to base source {from_table}")
-                                                                    break
+                                                _cte_k = from_table and parser._cte_registry_resolve_key(from_table)
+                                                if _cte_k:
+                                                    cte_info = parser.cte_registry[_cte_k]
+                                                    from sqlglot import expressions as exp
+                                                    if isinstance(cte_info, dict) and 'definition' in cte_info:
+                                                        cte_def = cte_info['definition']
+                                                    elif isinstance(cte_info, exp.Select):
+                                                        cte_def = cte_info
+                                                    else:
+                                                        cte_def = None
+                                                    if cte_def and isinstance(cte_def, exp.Select):
+                                                        cte_deps = parser._extract_dependencies(cte_def)
+                                                        for cte_dep in cte_deps:
+                                                            cte_dep_simple = cte_dep.split('.')[-1] if '.' in cte_dep else cte_dep
+                                                            is_cte_dep_temp = cte_dep_simple.startswith('#') or (f"#{cte_dep_simple}" in parser.temp_registry)
+                                                            is_cte_dep_cte = bool(parser._cte_registry_resolve_key(cte_dep_simple))
+                                                            if not is_cte_dep_temp and not is_cte_dep_cte:
+                                                                from_table = cte_dep
+                                                                logger.debug(f"Phase 3: Expanded CTE {_cte_k} to base source {from_table}")
+                                                                break
                                             # Normalize table name
                                             if '.' not in from_table and not from_table.startswith('#'):
                                                 from_table = f"dbo.{from_table}"
@@ -810,11 +837,78 @@ class Engine:
                                 if normalized_refs:
                                     lin_list.append(ColumnLineage(output_column=col.name, input_fields=normalized_refs, transformation_type=TransformationType.IDENTITY, transformation_description="from temp source select"))
                                 else:
-                                    lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
-                            # Use global_saved_temp_sources with prefixed keys (owner::temp)
-                            prefixed_key_sources = f"{owner}::{tmp}"
-                            deps = set(global_saved_temp_sources.get(prefixed_key_sources, set()) or 
-                                     global_saved_temp_sources.get(f"{prefixed_key_sources}@1", set()) or set())
+                                    synthetic = []
+                                    if deps and lineage_incomplete:
+                                        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+                                        for dep in sorted(deps):
+                                            if not dep or dep.startswith('@') or '#' in dep:
+                                                continue
+                                            dep_simple = dep.split('.')[-1] if '.' in dep else dep
+                                            if dep_simple.lower() in JOIN_KEYWORDS:
+                                                continue
+                                            try:
+                                                ns_d, nm_d = parser._ns_and_name(dep, obj_type_hint="table")
+                                                synthetic.append(
+                                                    ColumnReference(
+                                                        namespace=ns_d,
+                                                        table_name=nm_d,
+                                                        column_name=col.name,
+                                                    )
+                                                )
+                                            except Exception:
+                                                tbl = dep if '.' in dep else f"dbo.{dep}"
+                                                synthetic.append(
+                                                    ColumnReference(
+                                                        namespace=schema.namespace,
+                                                        table_name=tbl,
+                                                        column_name=col.name,
+                                                    )
+                                                )
+                                    if synthetic:
+                                        lin_list.append(
+                                            ColumnLineage(
+                                                output_column=col.name,
+                                                input_fields=synthetic,
+                                                transformation_type=TransformationType.UNKNOWN,
+                                                transformation_description="synthetic from temp SELECT deps (sparse column lineage)",
+                                            )
+                                        )
+                                    else:
+                                        lin_list.append(ColumnLineage(output_column=col.name, input_fields=[], transformation_type=TransformationType.UNKNOWN, transformation_description="temp column"))
+
+                            # One lineage row per output column; prefer entries with more input_fields (fallback + col_map dedupe).
+                            # On equal counts, prefer parser-derived "from temp source select" over regex fallback "from <table>".
+                            if lin_list and schema.columns:
+                                best_by_col = {}
+                                for lin in lin_list:
+                                    c = lin.output_column
+                                    if c not in best_by_col:
+                                        best_by_col[c] = lin
+                                    else:
+                                        prev = best_by_col[c]
+                                        n_n = len(lin.input_fields or [])
+                                        p_n = len(prev.input_fields or [])
+                                        if n_n > p_n:
+                                            best_by_col[c] = lin
+                                        elif n_n == p_n and n_n > 0:
+                                            d_new = lin.transformation_description or ""
+                                            d_prev = prev.transformation_description or ""
+                                            if "from temp source select" in d_new and "from temp source select" not in d_prev:
+                                                best_by_col[c] = lin
+                                lin_list = []
+                                for sch_col in schema.columns or []:
+                                    if sch_col and sch_col.name in best_by_col:
+                                        lin_list.append(best_by_col[sch_col.name])
+                                    elif sch_col and sch_col.name:
+                                        lin_list.append(
+                                            ColumnLineage(
+                                                output_column=sch_col.name,
+                                                input_fields=[],
+                                                transformation_type=TransformationType.UNKNOWN,
+                                                transformation_description="temp column",
+                                            )
+                                        )
+
                             temp_obj = ObjectInfo(name=table_name, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
                             logger.debug(f"Phase 3: Created temp_obj for {owner}::{tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
                             # Include in graph
@@ -1059,6 +1153,7 @@ class Engine:
             # These are re-populated for each file, so we can clear them between objects
             # CTE registry was already saved above (lines 339-341) before parsing next file
             parser.cte_registry.clear()
+            parser.cte_simple_alias.clear()
             # Note: temp_registry, temp_sources, temp_lineage are already cleared before each file (line 303-306)
             # But we can also clear _proc_acc and _temp_version to be safe
             parser._proc_acc.clear()

@@ -531,10 +531,19 @@ class ColumnGraph:
                         # Try simple name (last part after dots)
                         cte_simple = in_tbl.split('.')[-1] if '.' in in_tbl else in_tbl
                         cte_info = None
-                        for cte_name, info in cte_data.items():
-                            if cte_name.lower() == cte_simple.lower():
-                                cte_info = info
-                                break
+                        if in_tbl in cte_data:
+                            cte_info = cte_data[in_tbl]
+                        else:
+                            in_lower = in_tbl.lower()
+                            for ck, info in cte_data.items():
+                                if str(ck).lower() == in_lower:
+                                    cte_info = info
+                                    break
+                            if cte_info is None:
+                                for _ck, info in cte_data.items():
+                                    if isinstance(info, dict) and str(info.get("simple_name") or "").lower() == cte_simple.lower():
+                                        cte_info = info
+                                        break
                         
                         if cte_info:
                             # CTE found - extract base sources from CTE definition
@@ -551,8 +560,20 @@ class ColumnGraph:
                                         tbl_name = str(table.name) if hasattr(table, 'name') else str(table)
                                         # Skip if this is another CTE
                                         is_another_cte = False
-                                        for other_cte_name in cte_data.keys():
-                                            if tbl_name.lower() == other_cte_name.lower():
+                                        tbl_lower = tbl_name.lower()
+                                        for other_key, other_info in cte_data.items():
+                                            ok_simple = (
+                                                other_key.split("$")[-1]
+                                                if "$" in str(other_key)
+                                                else str(other_key).split(".")[-1]
+                                            )
+                                            if tbl_lower == ok_simple.lower():
+                                                is_another_cte = True
+                                                break
+                                            if (
+                                                isinstance(other_info, dict)
+                                                and str(other_info.get("simple_name") or "").lower() == tbl_lower
+                                            ):
                                                 is_another_cte = True
                                                 break
                                         if not is_another_cte and not tbl_name.startswith('#'):
@@ -584,9 +605,11 @@ class ColumnGraph:
                                         continue
                     
                     # If input is a temp table and we have its ObjectInfo, expand to base sources
-                    if temp_obj and temp_obj.lineage:
-                        # Find lineage for this column in temp table
-                        temp_lineage = next((ln for ln in temp_obj.lineage if ln.output_column == input_field.column_name), None)
+                    if temp_obj:
+                        lineage_rows = temp_obj.lineage or []
+                        temp_lineage = next(
+                            (ln for ln in lineage_rows if ln.output_column == input_field.column_name), None
+                        )
                         if temp_lineage and temp_lineage.input_fields:
                             # Filter out self-references (temp table referencing itself)
                             # Only include base sources (not temp tables)
@@ -634,7 +657,32 @@ class ColumnGraph:
                                     
                                     self.add_edge(edge)
                                 # Also keep the direct temp->output edge for continuity
-                    
+                        elif (not temp_lineage or not temp_lineage.input_fields) and getattr(
+                            temp_obj, "dependencies", None
+                        ):
+                            # Sparse column lineage on temp — align column_graph upstream with OpenLineage inputs (coarse edges).
+                            JOIN_KEYWORDS = {"left", "right", "inner", "outer", "cross", "full", "join"}
+                            for dep in sorted(temp_obj.dependencies):
+                                if not dep or dep.startswith("@") or "#" in dep or dep == "unknown":
+                                    continue
+                                dep_tail = dep.split(".")[-1] if "." in dep else dep
+                                if str(dep_tail).lower() in JOIN_KEYWORDS:
+                                    continue
+                                base_tbl = dep if "." in dep else f"dbo.{dep}"
+                                base_column = ColumnNode(
+                                    namespace=in_ns,
+                                    table_name=base_tbl,
+                                    column_name=input_field.column_name,
+                                )
+                                self.add_edge(
+                                    ColumnEdge(
+                                        from_column=base_column,
+                                        to_column=output_column,
+                                        transformation_type=lineage.transformation_type,
+                                        transformation_description=lineage.transformation_description,
+                                    )
+                                )
+
                     # Normalize DB prefix AFTER temp_name_map lookup
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
                         in_tbl = in_tbl[len(in_db) + 1:]
