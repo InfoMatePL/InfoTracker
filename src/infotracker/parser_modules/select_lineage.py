@@ -7,6 +7,7 @@ import sqlglot
 from sqlglot import expressions as exp
 
 from ..models import ColumnReference, ColumnSchema, ColumnLineage, TransformationType, ObjectInfo, TableSchema
+from .names import _temp_registry_base_key
 import re
 
 logger = logging.getLogger(__name__)
@@ -75,7 +76,6 @@ def _build_alias_maps(self, select_exp: exp.Select):
                 # Check if it's a temp table (starts with # or is in temp_registry with #)
                 temp_seg = None
                 if str(simple).startswith('#'):
-                    # Already has #, check if it's in temp_registry
                     if simple in self.temp_registry:
                         temp_seg = simple
                     else:
@@ -221,6 +221,55 @@ def _scoped_temp_ref(self, temp_seg: str) -> Tuple[str, str]:
     return f"mssql://localhost/{str(ctx_db).upper()}", f"dbo.{proc_simple}#{temp_name}"
 
 
+def _normalize_column_ref_temp(self, ref: ColumnReference) -> None:
+    """Rewrite sqlglot ``*.dbo.temp`` and other registry-backed temp leaks to scoped ``dbo.<proc>#<name>``.
+
+    Column graph parity: ``models._graph_remap_dbo_temp_pseudo`` applies the same disambiguation when
+    building edges from lineage that still contains ``dbo.temp``.
+    """
+    if not isinstance(ref, ColumnReference):
+        return
+    tname = (ref.table_name or "").strip()
+    if not tname:
+        return
+    parts_clean = [re.sub(r"[\[\]]", "", p) for p in tname.split(".") if p]
+    simple = parts_clean[-1] if parts_clean else ""
+    simple_base = str(simple).split("@")[0]
+    temp_seg = _match_temp_segment(self, simple_base)
+    if not temp_seg and len(parts_clean) >= 2:
+        if parts_clean[-2].lower() == "dbo" and simple_base.lower() == "temp":
+            rk = _temp_registry_base_key(self, "temp")
+            if rk:
+                temp_seg = str(rk).split("@")[0]
+                if not temp_seg.startswith("#"):
+                    temp_seg = f"#{temp_seg.lstrip('#')}"
+    # General leak: ``dbo.<Name>`` where ``#Name`` exists in temp_registry (sqlglot dropped ``#``).
+    if not temp_seg and len(parts_clean) >= 2 and parts_clean[-2].lower() == "dbo":
+        rk2 = _temp_registry_base_key(self, simple_base)
+        if rk2:
+            temp_seg = str(rk2).split("@")[0]
+            if not temp_seg.startswith("#"):
+                temp_seg = f"#{temp_seg.lstrip('#')}"
+    if not temp_seg:
+        return
+    # Already scoped: last FQN segment contains '#' (e.g. dbo.<proc>#tmp)
+    if "#" in (tname.split(".")[-1] if tname else ""):
+        return
+    try:
+        ns_temp, nm_temp = _scoped_temp_ref(self, temp_seg)
+        ref.namespace = ns_temp
+        ref.table_name = nm_temp
+    except Exception:
+        pass
+
+
+def _normalize_lineage_input_temps(self, lineage: List[ColumnLineage]) -> None:
+    """Apply :func:`_normalize_column_ref_temp` to every input field (mutates in place)."""
+    for ln in lineage or []:
+        for ir in ln.input_fields or []:
+            _normalize_column_ref_temp(self, ir)
+
+
 def _register_cte_lineage_object(self, cte_name: str, cte_def: exp.Select, cte_columns: List[str]) -> None:
     """Create a virtual ObjectInfo for CTE so it appears as an intermediate graph node."""
     if not isinstance(cte_def, exp.Select):
@@ -234,21 +283,7 @@ def _register_cte_lineage_object(self, cte_name: str, cte_def: exp.Select, cte_c
     except Exception:
         cte_lineage, cte_output_columns = [], []
 
-    # Normalize temp references in CTE lineage to canonical procedure-scoped names.
-    for ln in cte_lineage:
-        for ref in (ln.input_fields or []):
-            tname = getattr(ref, "table_name", None)
-            if not tname:
-                continue
-            simple = str(tname).split(".")[-1]
-            temp_seg = _match_temp_segment(self, simple)
-            if temp_seg:
-                try:
-                    ns_temp, nm_temp = _scoped_temp_ref(self, temp_seg)
-                    ref.namespace = ns_temp
-                    ref.table_name = nm_temp
-                except Exception:
-                    pass
+    _normalize_lineage_input_temps(self, cte_lineage)
 
     if not cte_output_columns:
         cte_output_columns = [
@@ -558,12 +593,16 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                         if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
                                             _r = self.temp_lineage[ver][colname]
                                             if _r:
+                                                for _xr in _r:
+                                                    _normalize_column_ref_temp(self, _xr)
                                                 out_list.extend(_r)
                                                 logger.debug(f"_append_column_ref: Using temp_lineage from CTE: {len(_r)} refs")
                                                 return
                                         if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
                                             _r2 = self.temp_lineage[temp_seg][colname]
                                             if _r2:
+                                                for _xr in _r2:
+                                                    _normalize_column_ref_temp(self, _xr)
                                                 out_list.extend(_r2)
                                                 logger.debug(f"_append_column_ref: Using temp_lineage from CTE: {len(_r2)} refs")
                                                 return
@@ -606,6 +645,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                             # Use the input_fields from CTE's lineage as sources
                                             for input_ref in col_lineage.input_fields:
                                                 # input_ref might be another CTE - if so, it will be recursively expanded by deps.py
+                                                _normalize_column_ref_temp(self, input_ref)
                                                 out_list.append(input_ref)
                                                 logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} column lineage: {input_ref}")
                                             if out_list:
@@ -681,6 +721,8 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                             if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
                                 _r3 = self.temp_lineage[ver][colname]
                                 if _r3:
+                                    for _xr in _r3:
+                                        _normalize_column_ref_temp(self, _xr)
                                     out_list.extend(_r3)
                                     logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(_r3)} refs")
                                     temp_lineage_used = True
@@ -688,6 +730,8 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                             if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
                                 _r4 = self.temp_lineage[temp_seg][colname]
                                 if _r4:
+                                    for _xr in _r4:
+                                        _normalize_column_ref_temp(self, _xr)
                                     out_list.extend(_r4)
                                     logger.debug(f"_append_column_ref: Using temp_lineage from CTE registry: {len(_r4)} refs")
                                     temp_lineage_used = True
@@ -735,6 +779,7 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                     # Use the input_fields from CTE's lineage as sources
                                     for input_ref in col_lineage.input_fields:
                                         # input_ref might be another CTE - if so, it will be recursively expanded by deps.py
+                                        _normalize_column_ref_temp(self, input_ref)
                                         out_list.append(input_ref)
                                         logger.debug(f"_append_column_ref: Added ref from CTE {cte_name} (from registry) column lineage: {input_ref}")
                                     if out_list:
@@ -805,6 +850,8 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 if ver and ver in self.temp_lineage and colname in self.temp_lineage[ver]:
                     _tl_refs = self.temp_lineage[ver][colname]
                     if _tl_refs:
+                        for _xr in _tl_refs:
+                            _normalize_column_ref_temp(self, _xr)
                         out_list.extend(_tl_refs)
                         logger.debug(
                             f"_append_column_ref: Using temp_lineage[{ver}][{colname}]: {len(_tl_refs)} refs"
@@ -813,6 +860,8 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                 if temp_seg in self.temp_lineage and colname in self.temp_lineage[temp_seg]:
                     _tl_refs2 = self.temp_lineage[temp_seg][colname]
                     if _tl_refs2:
+                        for _xr in _tl_refs2:
+                            _normalize_column_ref_temp(self, _xr)
                         out_list.extend(_tl_refs2)
                         logger.debug(
                             f"_append_column_ref: Using temp_lineage[{temp_seg}][{colname}]: {len(_tl_refs2)} refs"
@@ -856,6 +905,20 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
     )
 
 
+def _enclosing_select_for_column(col: exp.Column) -> Optional[exp.Select]:
+    """SELECT that syntactically owns this column (via parent pointers).
+
+    sqlglot may reuse one ``Column`` node in multiple branches (e.g. projection and
+    ``MAX(col)`` in a predicate). ``find_all`` then yields several SELECTs containing the
+    same object; picking the smallest subtree wrongly resolves to a subquery. Walking
+    ``parent`` gives the correct scope for unqualified names in that projection/WHERE slot.
+    """
+    node = col.parent
+    while node is not None and not isinstance(node, exp.Select):
+        node = getattr(node, "parent", None)
+    return node if isinstance(node, exp.Select) else None
+
+
 def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derived_cols: dict):
     inputs = []
     outer_stmt = getattr(self, "_current_select_stmt", None)
@@ -874,7 +937,9 @@ def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derive
         return min(candidates, key=lambda s: sum(1 for _ in s.walk()))
 
     for col in expr.find_all(exp.Column):
-        enc = _smallest_select_containing(outer_stmt, col)
+        enc = _enclosing_select_for_column(col)
+        if enc is None:
+            enc = _smallest_select_containing(outer_stmt, col)
         eff_map = alias_map
         eff_derived = derived_cols
         if enc is not None and enc is not outer_stmt:
@@ -1087,6 +1152,175 @@ def _is_temp_source(table_name: str, temp_registry: dict) -> bool:
     return simple in temp_registry or f"#{simple}" in temp_registry
 
 
+def _find_subquery_select_for_from_alias(self, select_stmt: exp.Select, alias: str) -> Optional[exp.Select]:
+    """Resolve ``FROM (SELECT …) AS alias`` / ``FROM (SELECT …) alias`` to the inner :class:`exp.Select`.
+
+    sqlglot often uses ``From(this=Subquery(…, alias=TableAlias(alias)))`` rather than ``Alias(Subquery,…)``.
+    """
+    want = (alias or "").strip().lower()
+    if not want:
+        return None
+    frm = select_stmt.args.get("from_") or select_stmt.args.get("from")
+    if not frm or not getattr(frm, "this", None):
+        return None
+
+    def _subquery_alias_name(sq: exp.Subquery) -> Optional[str]:
+        a = sq.args.get("alias")
+        if a is None:
+            return None
+        if isinstance(a, exp.TableAlias):
+            ident = a.this if getattr(a, "this", None) is not None else a
+            return str(getattr(ident, "name", ident) or ident).lower()
+        return str(a).lower()
+
+    def walk(n: Optional[exp.Expression]) -> Optional[exp.Select]:
+        if n is None:
+            return None
+        if isinstance(n, exp.Paren):
+            return walk(n.this)
+        if isinstance(n, exp.Subquery):
+            if _subquery_alias_name(n) == want and isinstance(n.this, exp.Select):
+                return n.this
+            return None
+        if isinstance(n, exp.Alias):
+            if str(n.alias).lower() == want:
+                t = n.this
+                if isinstance(t, exp.Subquery) and isinstance(t.this, exp.Select):
+                    return t.this
+                if isinstance(t, exp.Select):
+                    return t.this
+            return None
+        if isinstance(n, exp.Join):
+            return walk(n.this) or walk(n.expression)
+        return None
+
+    return walk(frm.this)
+
+
+def _norm_sq_lineage_col_key(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    s = str(name).strip().strip("[]").strip()
+    return s.lower()
+
+
+def _build_sq_lineage_lookup(sq_lineage: List[ColumnLineage]) -> Dict[str, ColumnLineage]:
+    """Map normalized output column names to lineage rows (first wins)."""
+    lin_map: Dict[str, ColumnLineage] = {}
+    for l in sq_lineage or []:
+        if not l or not l.output_column:
+            continue
+        keys = {
+            str(l.output_column).lower(),
+            _norm_sq_lineage_col_key(str(l.output_column)),
+        }
+        for k in keys:
+            if k and k not in lin_map:
+                lin_map[k] = l
+    return lin_map
+
+
+def _resolve_lineage_for_subquery_column(
+    cname: str,
+    col_index: int,
+    lin_map: Dict[str, ColumnLineage],
+    sq_lineage: List[ColumnLineage],
+    sq_cols: List[ColumnSchema],
+) -> Optional[ColumnLineage]:
+    """Match inner column lineage by normalized name, then by ordinal alignment with inner extract."""
+    ck = _norm_sq_lineage_col_key(cname)
+    if ck:
+        ln = lin_map.get(ck) or lin_map.get(str(cname).lower())
+        if ln:
+            return ln
+        for k, v in lin_map.items():
+            if _norm_sq_lineage_col_key(k) == ck:
+                return v
+    if (
+        col_index is not None
+        and col_index >= 0
+        and col_index < len(sq_lineage)
+        and len(sq_lineage) == len(sq_cols)
+    ):
+        cand = sq_lineage[col_index]
+        if cand and cand.output_column:
+            if ck and _norm_sq_lineage_col_key(str(cand.output_column)) != ck:
+                logger.debug(
+                    "_try_expand_qualified_star_from_subquery: positional lineage at %s "
+                    "(inner out=%r vs outer col=%r)",
+                    col_index,
+                    cand.output_column,
+                    cname,
+                )
+            return cand
+    logger.debug(
+        "_try_expand_qualified_star_from_subquery: no lineage row for inner column %r (index %s)",
+        cname,
+        col_index,
+    )
+    return None
+
+
+def _try_expand_qualified_star_from_subquery(
+    self,
+    alias: str,
+    outer_select: exp.Select,
+    view_name: str,
+    seen_columns: Set[str],
+    ordinal: int,
+) -> Optional[Tuple[List[ColumnLineage], List[ColumnSchema], int]]:
+    """Expand ``alias.*`` using column-level lineage from a FROM subquery (not a physical table)."""
+    inner_sel = _find_subquery_select_for_from_alias(self, outer_select, alias)
+    if inner_sel is None:
+        return None
+    depth = getattr(self, "_subquery_star_depth", 0)
+    if depth > 8:
+        logger.debug("_try_expand_qualified_star_from_subquery: depth limit, skipping")
+        return None
+    self._subquery_star_depth = depth + 1
+    try:
+        vname = f"{view_name}$subq:{alias}"
+        sq_lineage, sq_cols = self._extract_column_lineage(inner_sel, vname)
+    except Exception as e:
+        logger.debug("_try_expand_qualified_star_from_subquery: inner extract failed: %s", e)
+        return None
+    finally:
+        self._subquery_star_depth = depth
+
+    if not sq_cols:
+        return None
+    lin_map = _build_sq_lineage_lookup(sq_lineage or [])
+    out_lineage: List[ColumnLineage] = []
+    out_cols: List[ColumnSchema] = []
+    o = ordinal
+    for col_index, col in enumerate(sq_cols):
+        cname = col.name if col and col.name else None
+        if not cname or str(cname) == "*" or str(cname).lower().startswith("unknown_"):
+            continue
+        if cname in seen_columns:
+            continue
+        seen_columns.add(cname)
+        out_cols.append(ColumnSchema(name=cname, data_type="unknown", nullable=True, ordinal=o))
+        o += 1
+        ln = _resolve_lineage_for_subquery_column(
+            str(cname), col_index, lin_map, list(sq_lineage or []), sq_cols
+        )
+        inputs = list(ln.input_fields) if ln and ln.input_fields else []
+        ttype = ln.transformation_type if ln else TransformationType.UNKNOWN
+        tdesc = (ln.transformation_description if ln else "") or f"{alias}.* via subquery"
+        out_lineage.append(
+            ColumnLineage(
+                output_column=cname,
+                input_fields=inputs,
+                transformation_type=ttype,
+                transformation_description=tdesc,
+            )
+        )
+    if not out_lineage:
+        return None
+    return out_lineage, out_cols, o
+
+
 def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
     lineage = []
     output_columns = []
@@ -1101,6 +1335,14 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             logger.debug(f"_handle_star_expansion: Found exp.Star, has table attr: {hasattr(select_expr, 'table')}, table value: {getattr(select_expr, 'table', None)}")
             if hasattr(select_expr, 'table') and select_expr.table:
                 alias = str(select_expr.table)
+                _sq_exp = _try_expand_qualified_star_from_subquery(
+                    self, alias, select_stmt, view_name, seen_columns, ordinal
+                )
+                if _sq_exp:
+                    _part_l, _part_c, ordinal = _sq_exp
+                    lineage.extend(_part_l)
+                    output_columns.extend(_part_c)
+                    continue
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
                 if table_name != "unknown" and not _is_join_keyword(table_name):
                     if _is_temp_source(table_name, self.temp_registry):
@@ -1179,7 +1421,6 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
                 logger.debug(f"_handle_star_expansion: Found {len(source_tables)} source tables: {source_tables}")
                 if temp_sources:
                     temp_table = temp_sources[0]
-                    temp_cols = []
                     try:
                         simple = str(temp_table).split('.')[-1]
                         temp_cols = self.temp_registry.get(simple) or self.temp_registry.get(f"#{simple}") or []
@@ -1261,6 +1502,14 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             logger.debug(f"_handle_star_expansion: Found column star: {select_expr}, table={select_expr.table}")
             if hasattr(select_expr, 'table') and select_expr.table:
                 alias = str(select_expr.table)
+                _sq_exp2 = _try_expand_qualified_star_from_subquery(
+                    self, alias, select_stmt, view_name, seen_columns, ordinal
+                )
+                if _sq_exp2:
+                    _part_l2, _part_c2, ordinal = _sq_exp2
+                    lineage.extend(_part_l2)
+                    output_columns.extend(_part_c2)
+                    continue
                 table_name = _resolve_table_from_alias(self, alias, select_stmt)
                 logger.debug(f"_handle_star_expansion: Resolved alias {alias} to {table_name}")
                 if table_name != "unknown" and not _is_join_keyword(table_name):
@@ -1325,6 +1574,7 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             # while preserving the lineage entry with proper transformation metadata.
             lineage.append(ColumnLineage(output_column=col_name, input_fields=input_refs, transformation_type=TransformationType.EXPRESSION, transformation_description=f"SELECT {str(select_expr)}"))
 
+    _normalize_lineage_input_temps(self, lineage)
     logger.debug(f"_handle_star_expansion: Returning {len(output_columns)} columns, {len(lineage)} lineage entries")
     return lineage, output_columns
 
@@ -1376,6 +1626,7 @@ def _handle_union_lineage(self, stmt: exp.Expression, view_name: str) -> tuple[L
                     all_input_fields.extend(other_lineage[i].input_fields)
         lineage.append(ColumnLineage(output_column=col_lineage.output_column, input_fields=all_input_fields, transformation_type=TransformationType.UNION, transformation_description="UNION operation"))
     output_columns = first_columns
+    _normalize_lineage_input_temps(self, lineage)
     return lineage, output_columns
 
 
@@ -1483,6 +1734,7 @@ def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple
         lineage.append(ColumnLineage(output_column=out_name, input_fields=inputs, transformation_type=ttype, transformation_description=_short_desc(self, inner)))
         output_columns.append(ColumnSchema(name=out_name, data_type=out_type, nullable=True, ordinal=ordinal))
         ordinal += 1
+    _normalize_lineage_input_temps(self, lineage)
     return lineage, output_columns
 
 

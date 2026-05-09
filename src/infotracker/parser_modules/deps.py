@@ -46,7 +46,7 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
             pass
         simple_name = table_name.split('.')[-1]
         # Check if this table is a CTE - expand it recursively
-        if simple_name in self.cte_registry:
+        if self._cte_registry_resolve_key(simple_name) or self._cte_registry_resolve_key(table_name):
             # Try to find CTE definition in WITH clause first (for CTEs in same statement)
             cte_found_in_with = False
             with_clause = select_stmt.args.get('with')
@@ -61,7 +61,8 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
             
             # If not found in WITH clause, use cte_registry (for CTEs defined elsewhere)
             if not cte_found_in_with:
-                cte_info = self.cte_registry.get(simple_name)
+                _ck = self._cte_registry_resolve_key(simple_name) or self._cte_registry_resolve_key(table_name)
+                cte_info = self.cte_registry.get(_ck) if _ck else None
                 if isinstance(cte_info, dict) and 'definition' in cte_info:
                     cte_def = cte_info['definition']
                     if isinstance(cte_def, exp.Select):
@@ -122,7 +123,7 @@ def _extract_dependencies(self, stmt: exp.Expression) -> Set[str]:
 def _expand_dependency_to_base_tables(self, dep_name: str, context_stmt: exp.Expression) -> Set[str]:
     expanded: Set[str] = set()
     simple_name = dep_name.split('.')[-1]
-    if simple_name in self.cte_registry:
+    if self._cte_registry_resolve_key(simple_name) or self._cte_registry_resolve_key(dep_name):
         if isinstance(context_stmt, exp.Select) and context_stmt.args.get('with'):
             with_clause = context_stmt.args.get('with')
             if hasattr(with_clause, 'expressions'):
@@ -155,7 +156,7 @@ def _expand_dependency_to_base_tables(self, dep_name: str, context_stmt: exp.Exp
 
 def _is_cte_reference(self, dep_name: str) -> bool:
     simple_name = dep_name.split('.')[-1]
-    return simple_name in self.cte_registry
+    return bool(self._cte_registry_resolve_key(simple_name) or self._cte_registry_resolve_key(dep_name))
 
 
 def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
@@ -200,6 +201,36 @@ def _extract_basic_dependencies(self, sql_content: str) -> Set[str]:
     matches = []
     for pat in (from_pattern, join_pattern, update_pattern, delete_from_pattern, merge_into_pattern):
         matches.extend(re.findall(pat, cleaned_sql, re.IGNORECASE))
+
+    # Parenthesized FROM / JOIN: e.g. FROM (schema.t1 a INNER JOIN schema.t2 b ON ...)
+    def _tables_in_paren_block(inner: str) -> list[str]:
+        found: list[str] = []
+        # Qualified names (at least db.schema.table or schema.table) before alias / JOIN / ON
+        for qm in re.finditer(
+            r"([\w\[\]]+(?:\.[\w\[\]]+){2,})\s+(?:[\[\]\w#@][\w\[\]#@]*)(?=\s|\)|,|\bINNER\b|\bLEFT\b|\bRIGHT\b|\bFULL\b|\bCROSS\b|\bJOIN\b|\bOUTER\b|\bON\b)",
+            inner,
+            re.I,
+        ):
+            tok = qm.group(1).strip()
+            if tok and tok.lower() not in sql_keywords:
+                found.append(tok)
+        return found
+
+    for pm in re.finditer(r"(?is)(?:\bFROM\b|\bJOIN\b)\s*\(", cleaned_sql):
+        start_paren = pm.end() - 1
+        depth = 0
+        j = start_paren
+        while j < len(cleaned_sql):
+            ch = cleaned_sql[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    inner = cleaned_sql[start_paren + 1 : j]
+                    matches.extend(_tables_in_paren_block(inner))
+                    break
+            j += 1
 
     insert_pattern = r'INSERT\s+INTO\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'
     create_pattern = r'CREATE\s+(?:OR\s+ALTER\s+)?(?:TABLE|VIEW|PROCEDURE|FUNCTION)\s+([^\s\(\),]+(?:\.[^\s\(\),]+)*)'

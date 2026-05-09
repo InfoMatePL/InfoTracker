@@ -97,6 +97,12 @@ def _parse_select_into_temp_statements_from_string(self, sql_content: str, objec
         chunk = s[sel_start:sel_end]
         if re.search(r"(?is)\bINTO\s+#\w+", chunk):
             try:
+                _m = re.search(r"(?is)\bINTO\s+#(\w+)", chunk)
+                if _m:
+                    self._ensure_temp_registry_placeholder(f"#{_m.group(1)}", sql_hint=chunk[:4000])
+            except Exception:
+                pass
+            try:
                 stmts = sqlglot.parse(chunk.strip(), read=self.dialect) or []
                 for stmt in stmts:
                     if isinstance(stmt, exp.Select) and self._is_select_into(stmt):

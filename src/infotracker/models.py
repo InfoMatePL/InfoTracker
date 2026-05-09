@@ -5,8 +5,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 from enum import Enum
+import re
 
 
 class TransformationType(Enum):
@@ -99,6 +100,8 @@ class ColumnLineage:
     input_fields: List[ColumnReference] = field(default_factory=list)
     transformation_type: TransformationType = TransformationType.IDENTITY
     transformation_description: str = ""
+    # Optional OpenLineage-style quality (e.g. heuristic wildcard expansion)
+    quality_facets: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -218,6 +221,550 @@ class ColumnEdge:
     to_column: ColumnNode
     transformation_type: TransformationType
     transformation_description: str
+    lineage_quality: Optional[Dict[str, Any]] = None
+
+
+def _is_persistent_physical_table_name(table_name: Optional[str]) -> bool:
+    """True for real persisted tables (not local temp / scoped proc#temp names)."""
+    if not table_name or table_name == "unknown":
+        return False
+    if table_name.startswith("@"):
+        return False
+    return "#" not in table_name
+
+
+_WILDCARD_EXPAND_QUALITY = {"isFallback": True, "reasonCode": "WILDCARD_EXPAND_NAME_INTERSECTION"}
+
+
+def _target_column_names_for_materialize(obj: ObjectInfo) -> Set[str]:
+    names: Set[str] = set()
+    for c in obj.schema.columns or []:
+        if not c or not c.name or c.name == "*":
+            continue
+        names.add(c.name)
+    return names
+
+
+def _norm_table_key(s: str) -> str:
+    return (s or "").lower().strip()
+
+
+def _schema_columns_from_registry(schema_registry: SchemaRegistry, namespace: str, table_name: str) -> Optional[Set[str]]:
+    if not schema_registry or not table_name:
+        return None
+    sch = schema_registry.get(namespace, table_name)
+    if not sch or not sch.columns:
+        return None
+    out = {c.name for c in sch.columns if c.name and c.name != "*"}
+    return out or None
+
+
+def _schema_columns_from_registry_fuzzy(
+    schema_registry: SchemaRegistry, ref: ColumnReference
+) -> Optional[Set[str]]:
+    """Match registry table by FQN tail when exact ``namespace``+``table_name`` key misses (no DDL in batch)."""
+    if not schema_registry or not ref or not ref.table_name:
+        return None
+    want_leaf = ref.table_name.split(".")[-1].lower()
+    if not want_leaf:
+        return None
+    best: Optional[Set[str]] = None
+    for sch in schema_registry.get_all():
+        if not sch or not sch.name:
+            continue
+        if sch.name.split(".")[-1].lower() != want_leaf:
+            continue
+        cols = {c.name for c in (sch.columns or []) if c.name and c.name != "*"}
+        if cols and (best is None or len(cols) > len(best)):
+            best = cols
+    return best
+
+
+def _schema_columns_from_peer_objects(table_name: str, objects: List[ObjectInfo]) -> Optional[Set[str]]:
+    """Match ``ObjectInfo.schema.name`` to ``table_name`` (suffix / last segment, case-insensitive)."""
+    if not table_name or not objects:
+        return None
+    want_t = _norm_table_key(table_name)
+    tail = want_t.split(".")[-1] if want_t else ""
+    for o in objects:
+        if getattr(o, "object_type", None) == "procedure":
+            continue
+        if not o.schema or not o.schema.name:
+            continue
+        sn = _norm_table_key(o.schema.name)
+        if not sn:
+            continue
+        if sn == want_t or sn.endswith("." + want_t) or sn.split(".")[-1] == tail:
+            cols = {c.name for c in (o.schema.columns or []) if c.name and c.name != "*"}
+            if cols:
+                return cols
+    return None
+
+
+def _resolve_source_column_names(
+    ref: ColumnReference, schema_registry: SchemaRegistry, objects: List[ObjectInfo]
+) -> Optional[Set[str]]:
+    creg = _schema_columns_from_registry(schema_registry, ref.namespace, ref.table_name)
+    if creg:
+        return creg
+    creg = _schema_columns_from_registry_fuzzy(schema_registry, ref)
+    if creg:
+        return creg
+    return _schema_columns_from_peer_objects(ref.table_name, objects)
+
+
+def _temp_suffix_from_table_name(table_name: Optional[str]) -> Optional[str]:
+    if not table_name or "#" not in table_name:
+        return None
+    return table_name.split("#")[-1].split("@")[0].lower()
+
+
+def augment_temp_table_schemas_from_downstream_lineage(objects: List[ObjectInfo]) -> int:
+    """Add concrete column names to ``temp_table`` schemas from any lineage ref that reads the temp (monotonic).
+
+    Needed for ``SELECT * INTO #t FROM stage`` when the temp schema is only ``*`` but later statements
+    reference ``#t.col`` — those names become materialization targets for stage ``column_name='*'``.
+    """
+    if not objects:
+        return 0
+    temps_by_suffix: Dict[str, ObjectInfo] = {}
+    for o in objects:
+        if getattr(o, "object_type", None) != "temp_table" or not o.schema:
+            continue
+        suff = _temp_suffix_from_table_name(o.schema.name) or _temp_suffix_from_table_name(o.name)
+        if suff:
+            temps_by_suffix[suff] = o
+    added = 0
+    for o in objects:
+        for ln in o.lineage or []:
+            for ref in ln.input_fields or []:
+                suff = _temp_suffix_from_table_name(ref.table_name)
+                if not suff or suff not in temps_by_suffix:
+                    continue
+                col = (ref.column_name or "").strip()
+                if not col or col == "*":
+                    continue
+                t_obj = temps_by_suffix[suff]
+                if not t_obj.schema:
+                    continue
+                cols = list(t_obj.schema.columns or [])
+                existing = {c.name.lower() for c in cols if c and c.name}
+                if col.lower() in existing:
+                    continue
+                max_ord = max((c.ordinal for c in cols if c), default=-1)
+                cols.append(ColumnSchema(name=col, data_type="unknown", nullable=True, ordinal=max_ord + 1))
+                t_obj.schema.columns = cols
+                existing.add(col.lower())
+                added += 1
+    return added
+
+
+def _is_physical_table_star_ref(ref: Optional[ColumnReference]) -> bool:
+    if not ref or not ref.table_name:
+        return False
+    if (ref.column_name or "").strip() != "*":
+        return False
+    if "#" in ref.table_name:
+        return False
+    if ref.table_name.startswith("@"):
+        return False
+    return True
+
+
+def _star_physical_table_keys(star_refs: List[ColumnReference]) -> Set[Tuple[str, str]]:
+    return {(r.namespace.lower(), r.table_name.lower()) for r in star_refs}
+
+
+def _materialize_single_lineage_row(
+    lin: ColumnLineage,
+    target_names: Set[str],
+    schema_registry: SchemaRegistry,
+    objects: List[ObjectInfo],
+) -> List[ColumnLineage]:
+    """Return one or more lineage rows; replacement list may be longer when exploding output ``*``."""
+    out_col = (lin.output_column or "").strip()
+    inputs = list(lin.input_fields or [])
+    star_phys = [r for r in inputs if _is_physical_table_star_ref(r)]
+    non_star = [r for r in inputs if not _is_physical_table_star_ref(r)]
+
+    if len(_star_physical_table_keys(star_phys)) > 1:
+        return [lin]
+
+    if out_col and out_col != "*":
+        if len(star_phys) != 1 or non_star:
+            return [lin]
+        ref = star_phys[0]
+        src_cols = _resolve_source_column_names(ref, schema_registry, objects)
+        if not src_cols or out_col not in src_cols:
+            return [lin]
+        new_ref = ColumnReference(ref.namespace, ref.table_name, out_col)
+        return [
+            ColumnLineage(
+                output_column=out_col,
+                input_fields=[new_ref],
+                transformation_type=lin.transformation_type,
+                transformation_description=lin.transformation_description,
+                quality_facets=dict(_WILDCARD_EXPAND_QUALITY),
+            )
+        ]
+
+    if out_col != "*":
+        return [lin]
+    if non_star:
+        return [lin]
+    if len(star_phys) != 1:
+        return [lin]
+    ref = star_phys[0]
+    src_cols = _resolve_source_column_names(ref, schema_registry, objects)
+    used_downstream_only = False
+    if not src_cols and target_names:
+        src_cols = set(target_names)
+        used_downstream_only = True
+    if not src_cols:
+        return [lin]
+    if target_names:
+        common = sorted(target_names & src_cols, key=lambda x: (x or "").lower())
+    else:
+        common = sorted(src_cols, key=lambda x: (x or "").lower())
+    if not common:
+        return [lin]
+    qf = dict(_WILDCARD_EXPAND_QUALITY)
+    if used_downstream_only:
+        qf = {**qf, "reasonCode": "WILDCARD_EXPAND_DOWNSTREAM_COLUMN_NAMES"}
+    return [
+        ColumnLineage(
+            output_column=c,
+            input_fields=[ColumnReference(ref.namespace, ref.table_name, c)],
+            transformation_type=lin.transformation_type,
+            transformation_description=lin.transformation_description,
+            quality_facets=qf,
+        )
+        for c in common
+    ]
+
+
+def _materialize_object_lineage(
+    obj: ObjectInfo, schema_registry: SchemaRegistry, objects: List[ObjectInfo]
+) -> Tuple[List[ColumnLineage], bool]:
+    if not obj.lineage:
+        return obj.lineage, False
+    targets = _target_column_names_for_materialize(obj)
+    new_rows: List[ColumnLineage] = []
+    changed = False
+    for lin in obj.lineage:
+        expanded = _materialize_single_lineage_row(lin, targets, schema_registry, objects)
+        if expanded != [lin]:
+            changed = True
+        new_rows.extend(expanded)
+    if not changed:
+        return obj.lineage, False
+    return new_rows, True
+
+
+def _prune_placeholder_star_schema_column_after_lineage(obj: ObjectInfo) -> None:
+    """Remove synthetic ``*`` schema column when lineage no longer projects output ``*``."""
+    if not obj.schema or not obj.schema.columns:
+        return
+    has_star_out = any((ln.output_column or "").strip() == "*" for ln in (obj.lineage or []))
+    if has_star_out:
+        return
+    cols = [c for c in obj.schema.columns if c and (c.name or "").strip() != "*"]
+    if len(cols) == len(obj.schema.columns):
+        return
+    for i, c in enumerate(cols):
+        c.ordinal = i
+    obj.schema.columns = cols
+
+
+def materialize_wildcard_lineage_objects(
+    objects: List[ObjectInfo],
+    schema_registry: SchemaRegistry,
+    *,
+    max_passes: int = 4,
+) -> None:
+    """Expand **persistent** ``column_name == "*"`` refs into concrete ``schema.table.column`` pairs where safe.
+
+    Refs whose ``table_name`` contains ``#`` (lineage pointing **at** a temp) are left unchanged here:
+    that is column-level ``*``/projection on a **#temp** source, not “skip whole ``temp_table`` objects”.
+    Prefer :func:`wildcard_lineage_fixpoint` in the engine so schema/deps can grow between passes.
+
+    Does **not** expand when multiple persisted tables each contribute a ``*`` in the same lineage row
+    (heuristic for multi-table JOIN).
+    """
+    if not objects:
+        return
+    for _ in range(max(1, max_passes)):
+        any_change = False
+        for obj in objects:
+            new_lin, ch = _materialize_object_lineage(obj, schema_registry, objects)
+            if ch:
+                obj.lineage = new_lin
+                _prune_placeholder_star_schema_column_after_lineage(obj)
+                any_change = True
+        if not any_change:
+            break
+
+
+def dependency_string_from_column_ref(ref: ColumnReference) -> Optional[str]:
+    """Build a dependency string (``DB.schema.table``) from a column ref for object-level merges.
+
+    Returns ``None`` for temps, unknowns, and join-keyword pseudo tables. Does **not** remove or filter
+    real persistent tables — callers only **add** these to ``ObjectInfo.dependencies``.
+    """
+    if not ref or not ref.table_name or ref.table_name == "unknown":
+        return None
+    if "#" in ref.table_name:
+        return None
+    JOIN_KEYWORDS = {"left", "right", "inner", "outer", "cross", "full", "join"}
+    leaf = ref.table_name.split(".")[-1].lower() if ref.table_name else ""
+    if leaf in JOIN_KEYWORDS:
+        return None
+    tn = ref.table_name.strip()
+    try:
+        db = ref.namespace.rsplit("/", 1)[-1].upper() if ref.namespace and "://" in ref.namespace else None
+    except Exception:
+        db = None
+    if not db:
+        return tn if "." in tn else f"dbo.{tn}"
+    parts = tn.split(".")
+    if len(parts) >= 2:
+        return f"{db}.{tn}"
+    return f"{db}.dbo.{tn}"
+
+
+def augment_object_schemas_from_lineage(objects: List[ObjectInfo]) -> int:
+    """Append output column names from lineage missing on ``obj.schema`` (monotonic). Returns count added."""
+    added = 0
+    for o in objects or []:
+        if not o.schema:
+            continue
+        cols = list(o.schema.columns or [])
+        existing = {c.name.lower() for c in cols if c and c.name}
+        max_ord = max((c.ordinal for c in cols if c), default=-1)
+        for ln in o.lineage or []:
+            cname = (ln.output_column or "").strip()
+            if not cname or cname == "*":
+                continue
+            if cname.lower() in existing:
+                continue
+            max_ord += 1
+            cols.append(ColumnSchema(name=cname, data_type="unknown", nullable=True, ordinal=max_ord))
+            existing.add(cname.lower())
+            added += 1
+        o.schema.columns = cols
+    return added
+
+
+def augment_temp_dependencies_from_lineage_refs(objects: List[ObjectInfo]) -> int:
+    """Union object-level dependencies inferred from column lineage refs onto ``temp_table`` objects.
+
+    Only **adds** dependency strings; never removes existing ``ObjectInfo.dependencies``.
+    """
+    n = 0
+    for o in objects or []:
+        if getattr(o, "object_type", None) != "temp_table":
+            continue
+        if o.dependencies is None:
+            o.dependencies = set()
+        for ln in o.lineage or []:
+            for f in ln.input_fields or []:
+                ds = dependency_string_from_column_ref(f)
+                if ds and ds not in o.dependencies:
+                    o.dependencies.add(ds)
+                    n += 1
+    return n
+
+
+def _wildcard_fixpoint_signature(objects: List[ObjectInfo]) -> Tuple[int, int, int]:
+    sch = 0
+    refs = 0
+    deps = 0
+    for o in objects or []:
+        sch += len([c for c in (o.schema.columns or []) if c and c.name])
+        deps += len(o.dependencies or [])
+        for ln in o.lineage or []:
+            for f in ln.input_fields or []:
+                if (f.column_name or "").strip() not in ("", "*"):
+                    refs += 1
+    return sch, refs, deps
+
+
+def wildcard_lineage_fixpoint(
+    objects: List[ObjectInfo],
+    schema_registry: SchemaRegistry,
+    *,
+    max_iterations: int = 32,
+) -> None:
+    """Iterate schema augmentation, wildcard materialization, and dependency merges until stable.
+
+    Column-level ``*`` expansion can require several rounds when ``#temp`` columns appear across
+    multiple procedural steps: each iteration may add new output column names from lineage to the
+    temp schema, then re-run materialization for intersections with stage/CTE schemas.
+
+    Object-level ``dependencies`` on temp tables are **only ever extended** (from persistent refs
+    in lineage), never replaced by column logic.
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+    if not objects:
+        return
+    prev_sig: Optional[Tuple[int, int, int]] = None
+    for i in range(max(1, max_iterations)):
+        augment_temp_table_schemas_from_downstream_lineage(objects)
+        augment_object_schemas_from_lineage(objects)
+        materialize_wildcard_lineage_objects(objects, schema_registry, max_passes=4)
+        augment_temp_dependencies_from_lineage_refs(objects)
+        sig = _wildcard_fixpoint_signature(objects)
+        log.debug(
+            "wildcard_lineage_fixpoint: iter=%s signature=(schema_cols=%s, concrete_refs=%s, dep_count=%s)",
+            i,
+            sig[0],
+            sig[1],
+            sig[2],
+        )
+        if prev_sig is not None and sig == prev_sig:
+            break
+        prev_sig = sig
+    else:
+        log.warning(
+            "wildcard_lineage_fixpoint: stopped after max_iterations=%s (signature may still be changing)",
+            max_iterations,
+        )
+
+
+def _infer_scoped_hash_temp_from_cte_output(output_table: Optional[str]) -> Optional[str]:
+    """Infer ``dbo.<procedure>#temp`` from ``dbo.<procedure>$<cte>`` when sqlglot leaked ``dbo.temp``."""
+    if not output_table or "$" not in output_table:
+        return None
+    proc = output_table.split("$", 1)[0].strip()
+    if not proc:
+        return None
+    pl = proc.lower()
+    if pl == "dbo.temp" or pl.endswith(".dbo.temp"):
+        return None
+    return f"{proc}#temp"
+
+
+def _pick_temp_table_for_sqlglot_dbo_temp_leak(objects: List[ObjectInfo]) -> Optional[ObjectInfo]:
+    """Pick ``temp_table`` for sqlglot ``dbo.temp`` when logical table is ``#temp`` / ``#temp@N``.
+
+    Multiple versioned registry keys map to the same leak; require a **single** owning procedure
+    (same FQN prefix before the last ``#``), then prefer ``#temp`` over ``#temp@1``.
+    """
+    hits: List[Tuple[str, str, ObjectInfo]] = []  # (owner_before_last_hash, version_suffix_or_empty, obj)
+    for o in objects or []:
+        if getattr(o, "object_type", None) != "temp_table" or not o.schema or not (o.schema.name or ""):
+            continue
+        nm = o.schema.name
+        if "#" not in nm:
+            continue
+        try:
+            ns_db_o = o.schema.namespace.rsplit("/", 1)[1] if o.schema.namespace else None
+            if ns_db_o and nm.startswith(f"{ns_db_o}."):
+                nm = nm[len(ns_db_o) + 1 :]
+        except Exception:
+            pass
+        owner_part, _, tail = nm.rpartition("#")
+        base, _, ver = tail.partition("@")
+        if base.lower() != "temp":
+            continue
+        hits.append((owner_part, ver, o))
+    if not hits:
+        return None
+    owners = {h[0] for h in hits}
+    if len(owners) != 1:
+        return None
+
+    def _sortkey(h: Tuple[str, str, ObjectInfo]):
+        ver = h[1]
+        if ver == "":
+            return (0, 0)
+        try:
+            return (1, int(ver))
+        except ValueError:
+            return (1, 9999)
+
+    hits.sort(key=_sortkey)
+    return hits[0][2]
+
+
+def _graph_remap_dbo_temp_pseudo(
+    in_tbl: str,
+    in_db: Optional[str],
+    temp_name_map: Dict[str, str],
+    temp_owners_registry: Dict[str, Set[str]],
+    temp_obj_map: Dict[str, ObjectInfo],
+    all_objects: Optional[List[ObjectInfo]] = None,
+    output_table: Optional[str] = None,
+) -> Tuple[str, Optional[ObjectInfo]]:
+    """Map sqlglot leaks (``*.dbo.temp``, ``*.dbo.<name>`` when ``#name`` is a local temp) to canonical names.
+
+    Mirrors the intent of ``select_lineage._normalize_column_ref_temp``. Uses *temp_owners_registry* /
+    *temp_name_map* when temp nodes were registered; otherwise falls back to a **unique** ``temp_table``
+    object in *all_objects* whose fragment after ``#`` is ``temp`` (covers missing *temp_name_map*).
+    """
+    if not in_tbl:
+        return in_tbl, None
+    if temp_name_map:
+        for cand in (in_tbl, in_tbl.lower() if in_tbl else None):
+            if cand and cand in temp_name_map:
+                canonical = temp_name_map[cand]
+                temp_obj: Optional[ObjectInfo] = temp_obj_map.get(canonical)
+                if temp_obj is None and in_db:
+                    temp_obj = temp_obj_map.get(f"{in_db}.{canonical}")
+                return canonical, temp_obj
+    last_seg = in_tbl.split(".")[-1]
+    if "#" in last_seg:
+        return in_tbl, None
+    parts = [re.sub(r"[\[\]]", "", p) for p in in_tbl.split(".") if p]
+    if len(parts) < 2 or parts[-2].lower() != "dbo":
+        return in_tbl, None
+    if parts[-1].split("@")[0].lower() != "temp":
+        return in_tbl, None
+
+    candidates: List[str] = []
+    for raw in temp_owners_registry:
+        base = str(raw).split("@")[0]
+        if base.lstrip("#").lower() == "temp":
+            candidates.append(raw)
+    uniq_owner_keys = [k for k in candidates if len(temp_owners_registry.get(k, set())) == 1]
+    canonical: Optional[str] = None
+    if uniq_owner_keys:
+        canonicals = {temp_name_map.get(k) for k in uniq_owner_keys if temp_name_map.get(k)}
+        if len(canonicals) == 1:
+            canonical = next(iter(canonicals))
+
+    temp_obj: Optional[ObjectInfo] = None
+    if canonical:
+        for variant in (canonical, f"{in_db}.{canonical}" if in_db else None):
+            if variant and variant in temp_obj_map:
+                temp_obj = temp_obj_map[variant]
+                break
+        if temp_obj is None and "#" in canonical:
+            temp_part = canonical.split("#")[-1]
+            for key, obj in temp_obj_map.items():
+                if key.endswith(f"#{temp_part}") or key == f"#{temp_part}":
+                    temp_obj = obj
+                    break
+        return canonical, temp_obj
+
+    ut = _pick_temp_table_for_sqlglot_dbo_temp_leak(all_objects or [])
+    if ut and ut.schema and ut.schema.name:
+        canon = ut.schema.name
+        try:
+            ns_u = ut.schema.namespace.rsplit("/", 1)[1] if ut.schema.namespace else None
+            if ns_u and canon.startswith(f"{ns_u}."):
+                canon = canon[len(ns_u) + 1 :]
+        except Exception:
+            pass
+        return canon, ut
+
+    inferred = _infer_scoped_hash_temp_from_cte_output(output_table)
+    if inferred:
+        return inferred, None
+
+    return in_tbl, None
 
 
 class ColumnGraph:
@@ -341,12 +888,22 @@ class ColumnGraph:
             "downstream_tables": len(set(str(edge.to_column).rsplit('.', 1)[0] for edge in downstream_edges))
         }
     
-    def build_from_object_lineage(self, objects: List[ObjectInfo], cte_data: Dict[str, Any] = None) -> None:
+    def build_from_object_lineage(
+        self,
+        objects: List[ObjectInfo],
+        cte_data: Dict[str, Any] = None,
+        *,
+        expand_temp_lineage_to_persistent: bool = False,
+    ) -> None:
         """Build column graph from object lineage information.
         
         Args:
             objects: List of ObjectInfo with lineage
             cte_data: Optional CTE registry for expanding CTE to base sources (NOT WORKING due to architectural limitation)
+            expand_temp_lineage_to_persistent: When True, expand temp column lineage into extra
+                edges from base tables directly to **persistent** targets (legacy / “expanded” graph).
+                Default False: for ``INSERT INTO persist SELECT … FROM #temp`` only keep
+                ``#temp → persist`` per column (avoid duplicate parents: base → persist and #temp → persist).
         """
         if cte_data is None:
             cte_data = {}
@@ -398,6 +955,16 @@ class ColumnGraph:
                     if ns_db:
                         temp_name_map[f"{ns_db}.dbo.#{temp_part}"] = normalized_name
                         temp_name_map[f"{ns_db}.#{temp_part}"] = normalized_name
+                    # sqlglot: ``#Foo`` → ``EDW_CORE.dbo.Foo`` (unique owner only — avoids real dbo.Foo clashes).
+                    owners_for = temp_owners_registry.get(temp_raw) or set()
+                    if len(owners_for) == 1:
+                        leak_plain = f"dbo.{temp_part}"
+                        temp_name_map[leak_plain] = normalized_name
+                        temp_name_map[leak_plain.lower()] = normalized_name
+                        if ns_db:
+                            fq_leak = f"{ns_db}.{leak_plain}"
+                            temp_name_map[fq_leak] = normalized_name
+                            temp_name_map[fq_leak.lower()] = normalized_name
                     
                     # Map in temp_obj_map for lineage expansion
                     temp_obj_map[normalized_name] = obj
@@ -448,6 +1015,10 @@ class ColumnGraph:
                         continue
                     # Skip "unknown" table names (e.g., unresolved JOIN keywords)
                     if input_field.table_name == "unknown":
+                        continue
+                    # Wildcard source columns are projection placeholders, not OpenLineage field-level identities.
+                    # Omit edges from ``*``; ``materialize_wildcard_lineage_objects`` should expand to concrete names.
+                    if (input_field.column_name or "").strip() == "*":
                         continue
                     
                     in_ns = input_field.namespace
@@ -521,6 +1092,22 @@ class ColumnGraph:
                                     if key.endswith(f"#{temp_part}") or key == f"#{temp_part}":
                                         temp_obj = obj
                                         break
+
+                    # sqlglot: #temp → dbo.temp (no '#'); remap using temp_owners_registry like _normalize_column_ref_temp
+                    if temp_obj is None:
+                        new_tbl, dbo_temp_obj = _graph_remap_dbo_temp_pseudo(
+                            in_tbl,
+                            in_db,
+                            temp_name_map,
+                            temp_owners_registry,
+                            temp_obj_map,
+                            objects,
+                            output_table=output_table,
+                        )
+                        if new_tbl != in_tbl:
+                            in_tbl = new_tbl
+                        if dbo_temp_obj is not None:
+                            temp_obj = dbo_temp_obj
                     
                     # CHECK FOR CTE EXPANSION (before temp table expansion)
                     # If input is a CTE, expand it to base sources (similar to temp tables)
@@ -585,10 +1172,24 @@ class ColumnGraph:
                                             # Skip "unknown" table names
                                             if base_tbl_name == "unknown":
                                                 continue
+                                            eff_tbl = (
+                                                f"dbo.{base_tbl_name}"
+                                                if "." not in base_tbl_name
+                                                else base_tbl_name
+                                            )
+                                            eff_tbl, _ = _graph_remap_dbo_temp_pseudo(
+                                                eff_tbl,
+                                                in_db,
+                                                temp_name_map,
+                                                temp_owners_registry,
+                                                temp_obj_map,
+                                                objects,
+                                                output_table=output_table,
+                                            )
                                             # Use same namespace as CTE
                                             base_column = ColumnNode(
                                                 namespace=in_ns,
-                                                table_name=f"dbo.{base_tbl_name}" if '.' not in base_tbl_name else base_tbl_name,
+                                                table_name=eff_tbl,
                                                 column_name=input_field.column_name
                                             )
                                             
@@ -596,7 +1197,8 @@ class ColumnGraph:
                                                 from_column=base_column,
                                                 to_column=output_column,
                                                 transformation_type=lineage.transformation_type,
-                                                transformation_description=lineage.transformation_description
+                                                transformation_description=lineage.transformation_description,
+                                                lineage_quality=getattr(lineage, "quality_facets", None),
                                             )
                                             
                                             self.add_edge(edge)
@@ -626,42 +1228,69 @@ class ColumnGraph:
                                 # This is a base source, include it
                                 base_inputs.append(base_input)
                             
-                            # Expand temp table to base sources - create edges from base sources to output
+                            # Expand temp table to base sources - edges base → output (optional)
                             if base_inputs:
-                                for base_input in base_inputs:
-                                    base_ns = base_input.namespace
-                                    base_tbl = base_input.table_name
-                                    # Skip "unknown" table names
-                                    if base_tbl == "unknown":
-                                        continue
-                                    # Normalize base table name
-                                    try:
-                                        base_db = base_ns.rsplit('/', 1)[1] if base_ns else None
-                                    except Exception:
-                                        base_db = None
-                                    if base_db and base_tbl and base_tbl.startswith(f"{base_db}."):
-                                        base_tbl = base_tbl[len(base_db) + 1:]
-                                    
-                                    base_column = ColumnNode(
-                                        namespace=base_ns,
-                                        table_name=base_tbl,
-                                        column_name=base_input.column_name
-                                    )
-                                    
-                                    edge = ColumnEdge(
-                                        from_column=base_column,
-                                        to_column=output_column,
-                                        transformation_type=lineage.transformation_type,
-                                        transformation_description=lineage.transformation_description
-                                    )
-                                    
-                                    self.add_edge(edge)
-                                # Also keep the direct temp->output edge for continuity
+                                if expand_temp_lineage_to_persistent or not _is_persistent_physical_table_name(
+                                    output_table
+                                ):
+                                    for base_input in base_inputs:
+                                        base_ns = base_input.namespace
+                                        base_tbl = base_input.table_name
+                                        # Skip "unknown" table names
+                                        if base_tbl == "unknown":
+                                            continue
+                                        # Normalize base table name
+                                        try:
+                                            base_db = base_ns.rsplit('/', 1)[1] if base_ns else None
+                                        except Exception:
+                                            base_db = None
+                                        if base_db and base_tbl and base_tbl.startswith(f"{base_db}."):
+                                            base_tbl = base_tbl[len(base_db) + 1:]
+                                        base_tbl, _ = _graph_remap_dbo_temp_pseudo(
+                                            base_tbl,
+                                            base_db,
+                                            temp_name_map,
+                                            temp_owners_registry,
+                                            temp_obj_map,
+                                            objects,
+                                            output_table=output_table,
+                                        )
+                                        base_column = ColumnNode(
+                                            namespace=base_ns,
+                                            table_name=base_tbl,
+                                            column_name=base_input.column_name
+                                        )
+                                        
+                                        edge = ColumnEdge(
+                                            from_column=base_column,
+                                            to_column=output_column,
+                                            transformation_type=lineage.transformation_type,
+                                            transformation_description=lineage.transformation_description,
+                                            lineage_quality=getattr(lineage, "quality_facets", None),
+                                        )
+                                        
+                                        self.add_edge(edge)
+                                # Direct temp→output edge is always added below
                         # No fallback when temp column lineage is missing: do not multiply deps × downstream columns.
 
                     # Normalize DB prefix AFTER temp_name_map lookup
                     if in_db and in_tbl and in_tbl.startswith(f"{in_db}."):
                         in_tbl = in_tbl[len(in_db) + 1:]
+
+                    # Final pass: sqlglot dbo.temp leak may survive rare paths above
+                    new_tbl2, dbo_obj2 = _graph_remap_dbo_temp_pseudo(
+                        in_tbl,
+                        in_db,
+                        temp_name_map,
+                        temp_owners_registry,
+                        temp_obj_map,
+                        objects,
+                        output_table=output_table,
+                    )
+                    if new_tbl2 != in_tbl:
+                        in_tbl = new_tbl2
+                    if dbo_obj2 is not None:
+                        temp_obj = dbo_obj2
 
                     input_column = ColumnNode(
                         namespace=in_ns,
@@ -673,7 +1302,8 @@ class ColumnGraph:
                         from_column=input_column,
                         to_column=output_column,
                         transformation_type=lineage.transformation_type,
-                        transformation_description=lineage.transformation_description
+                        transformation_description=lineage.transformation_description,
+                        lineage_quality=getattr(lineage, "quality_facets", None),
                     )
                     
                     self.add_edge(edge)

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .models import ObjectInfo, ColumnLineage, TransformationType
 
@@ -103,6 +103,7 @@ class OpenLineageGenerator:
         # Determine run ID based on object hint (filename) for consistency with examples
         run_id = self._generate_run_id(object_hint or obj_info.name)
         
+        inputs, proc_deps_facet = openlineage_direct_inputs_and_procedure_deps_facet(obj_info)
         # Build the OpenLineage event
         event = {
             "eventType": "COMPLETE",
@@ -112,8 +113,8 @@ class OpenLineageGenerator:
                 "namespace": job_namespace,
                 "name": job_name or f"warehouse/sql/{obj_info.name}.sql"
             },
-            "inputs": self._build_inputs(obj_info),
-            "outputs": self._build_outputs(obj_info)
+            "inputs": inputs,
+            "outputs": self._build_outputs(obj_info, procedure_dependencies_facet=proc_deps_facet)
         }
         
         return json.dumps(event, indent=2, ensure_ascii=False)
@@ -129,41 +130,11 @@ class OpenLineageGenerator:
             return f"00000000-0000-0000-0000-{num:012d}"
         return "00000000-0000-0000-0000-000000000000"
     
-    def _build_inputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
-        """Build inputs array from object dependencies."""
-        JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
-        inputs = []
-        for dep_name in sorted(obj_info.dependencies):
-            if _is_noise_dep(dep_name):
-                continue
-            # Skip JOIN keywords early
-            dep_simple = dep_name.split('.')[-1].lower() if dep_name else ""
-            if dep_simple in JOIN_KEYWORDS:
-                continue
-            d = _dequote(dep_name)
-            # tempdb legacy pattern
-            if d.startswith('tempdb..#'):
-                namespace = "mssql://localhost/tempdb"
-                name = d
-            else:
-                parts = d.split('.')
-                db = parts[0] if len(parts) >= 3 else None
-                # Scoped temp without explicit DB (dbo.proc#temp) should keep object/default namespace
-                if '#' in d and len(parts) == 2 and not d.startswith('#'):
-                    namespace = self.namespace
-                else:
-                    namespace = f"mssql://localhost/{db}" if db else self.namespace
-                # Preserve DB for temp canonical names (contain '#')
-                if '#' in d:
-                    name = d
-                else:
-                    name = ".".join(parts[-2:]) if len(parts) >= 2 else d
-            inputs.append({"namespace": namespace, "name": name})
-
-        
-        return inputs
-    
-    def _build_outputs(self, obj_info: ObjectInfo) -> List[Dict[str, Any]]:
+    def _build_outputs(
+        self,
+        obj_info: ObjectInfo,
+        procedure_dependencies_facet: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
         """Build outputs array with schema and lineage facets."""
         # Use consistent temp table namespace
         if obj_info.schema.name.startswith('tempdb..#'):
@@ -185,6 +156,8 @@ class OpenLineageGenerator:
             "name": obj_info.schema.name,
             "facets": {}
         }
+        if procedure_dependencies_facet:
+            output["facets"]["procedureDependencies"] = procedure_dependencies_facet
         
         # Add schema facet for tables and procedures (even if columns list is empty)
         # Views should only have columnLineage, not schema
@@ -264,8 +237,194 @@ class OpenLineageGenerator:
         }
 
 
+def _is_noise_dataset_name(n: str) -> bool:
+    if not n:
+        return True
+    if n.startswith('@'):
+        return True
+    if '+' in n:
+        return True
+    if n.startswith('[') and n.endswith(']') and '.' not in n:
+        return True
+    JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+    name_simple = n.split('.')[-1].lower() if n else ""
+    if name_simple in JOIN_KEYWORDS:
+        return True
+    return False
+
+
+def _infer_lineage_field_dataset_pair(
+    f: Any, default_ns: str
+) -> Optional[Tuple[str, str]]:
+    """When ``namespace`` is empty but ``table_name`` is qualified, align with dep-style (ns, schema.table)."""
+    tn_raw = getattr(f, "table_name", None) or ""
+    tn = _dequote(tn_raw)
+    if not tn or tn == "unknown":
+        return None
+    parts = [p for p in tn.split(".") if p]
+    if not parts:
+        return None
+    if len(parts) >= 3:
+        dep = ".".join(parts[:3])
+        return (_ns_for_dep(dep, default_ns), _strip_db_prefix(dep))
+    if len(parts) == 2:
+        db = None
+        if default_ns and "://" in default_ns:
+            db = default_ns.rsplit("/", 1)[-1]
+        if not db:
+            return None
+        dep = f"{db}.{parts[0]}.{parts[1]}"
+        return (_ns_for_dep(dep, default_ns), _strip_db_prefix(dep))
+    return None
+
+
+def _lineage_direct_dataset_pairs(obj: ObjectInfo) -> set[tuple[str, str]]:
+    """Dataset (namespace, table) pairs referenced by column lineage inputFields (direct read)."""
+    pairs: set[tuple[str, str]] = set()
+    JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
+    default_ns = obj.schema.namespace if obj.schema else "mssql://localhost/InfoTrackerDW"
+    for ln in obj.lineage or []:
+        for f in ln.input_fields or []:
+            tn = getattr(f, "table_name", None)
+            if not tn:
+                continue
+            if tn == "unknown":
+                continue
+            table_simple = (tn or "").split(".")[-1] if tn else ""
+            if table_simple.lower() in JOIN_KEYWORDS:
+                continue
+            if _is_noise_dataset_name(tn):
+                continue
+            ns = getattr(f, "namespace", None)
+            if ns and str(ns).strip():
+                pairs.add((str(ns), tn))
+                continue
+            inferred = _infer_lineage_field_dataset_pair(f, default_ns)
+            if inferred:
+                pairs.add(inferred)
+    return pairs
+
+
+def _procedure_deps_drop_pseudo_dbo_temp(
+    obj: ObjectInfo, proc_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Drop ``dbo.<suffix>`` from procedure dependency lists when lineage uses ``…#<suffix>`` (sqlglot leak)."""
+    if not proc_rows:
+        return proc_rows
+    temp_suffixes: set[str] = set()
+    for ln in obj.lineage or []:
+        for f in ln.input_fields or []:
+            tn = f.table_name or ""
+            if "#" in tn:
+                suff = tn.split("#")[-1].split("@")[0].lower()
+                if suff:
+                    temp_suffixes.add(suff)
+    if not temp_suffixes:
+        return proc_rows
+    out: List[Dict[str, Any]] = []
+    for row in proc_rows:
+        nm = row.get("name") or ""
+        parts = nm.split(".")
+        if (
+            len(parts) == 2
+            and parts[0].lower() == "dbo"
+            and parts[1].lower() in temp_suffixes
+        ):
+            continue
+        out.append(row)
+    return out
+
+
+def _lineage_direct_datasets_are_all_temp_staging(pairs: set[tuple[str, str]]) -> bool:
+    """True when every lineage dataset is a temp / staging table (scoped #temp or tempdb).
+
+    In that case we omit ``procedureDependencies`` on the persistent output: the same
+    information would duplicate ``inputs`` semantics (one staging hop) and obscure UX;
+    full physical deps remain on the temp table's own event / expanded graph mode.
+    """
+    if not pairs:
+        return False
+    for _ns, name in pairs:
+        n = name or ""
+        if "#" in n:
+            continue
+        if n.lower().startswith("tempdb"):
+            continue
+        return False
+    return True
+
+
+def openlineage_direct_inputs_and_procedure_deps_facet(
+    obj: ObjectInfo,
+) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Event-level ``inputs`` (direct datasets) and optional ``procedureDependencies`` facet dict.
+
+    See :func:`emit_ol_from_object` docstring for semantics.
+    """
+    ns = obj.schema.namespace if obj.schema else "mssql://localhost/InfoTrackerDW"
+    input_pairs_from_lineage = _lineage_direct_dataset_pairs(obj)
+    input_pairs_from_deps = {
+        (_ns_for_dep(dep, ns), _strip_db_prefix(dep))
+        for dep in sorted(obj.dependencies or []) if not _is_noise_dep(dep)
+    }
+    # Object-level inputs for temp tables: **union** lineage-derived datasets with SQL ``dependencies``.
+    # Column lineage may lag (``*`` not expanded yet, or only a later step’s refs visible); deps from
+    # ``_extract_dependencies`` / ``temp_sources`` must not disappear from the event when lineage exists.
+    merged_pairs: Optional[set[tuple[str, str]]] = None
+    if getattr(obj, "object_type", None) == "temp_table":
+        merged_pairs = set(input_pairs_from_lineage) | set(input_pairs_from_deps)
+
+    if merged_pairs is not None and merged_pairs:
+        filtered = [(ns2, nm2) for (ns2, nm2) in merged_pairs if not _is_noise_dataset_name(nm2)]
+        inputs: List[Dict[str, Any]] = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
+    elif input_pairs_from_lineage:
+        filtered = [(ns2, nm2) for (ns2, nm2) in input_pairs_from_lineage if not _is_noise_dataset_name(nm2)]
+        inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
+    elif input_pairs_from_deps:
+        filtered = [(ns2, nm2) for (ns2, nm2) in input_pairs_from_deps if not _is_noise_dataset_name(nm2)]
+        inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
+    else:
+        inputs = []
+    proc_facet: Optional[Dict[str, Any]] = None
+    if (
+        getattr(obj, "object_type", None) != "temp_table"
+        and input_pairs_from_lineage
+        and input_pairs_from_deps
+        and input_pairs_from_lineage != input_pairs_from_deps
+        and not _lineage_direct_datasets_are_all_temp_staging(input_pairs_from_lineage)
+    ):
+        proc_rows = [
+            {"namespace": ns2, "name": nm2}
+            for (ns2, nm2) in sorted(input_pairs_from_deps)
+            if not _is_noise_dataset_name(nm2)
+        ]
+        proc_rows = _procedure_deps_drop_pseudo_dbo_temp(obj, proc_rows)
+        proc_facet = {
+            "_producer": "https://github.com/InfoTracker/InfoTracker",
+            "_schemaURL": "https://infotracker.dev/spec/facets/procedure-dependencies/1-0-0.json",
+            "datasets": proc_rows,
+        }
+    return inputs, proc_facet
+
+
 def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_metrics: bool = False, virtual_proc_outputs: bool = False) -> dict:
-    """Emit OpenLineage JSON directly from ObjectInfo without re-parsing."""
+    """Emit OpenLineage JSON directly from ObjectInfo without re-parsing.
+
+    Semantics:
+    - Top-level ``inputs`` lists **direct** datasets for this load step: derived from
+      column lineage ``inputFields`` when lineage is present (e.g. INSERT … SELECT … FROM #temp
+      → only the scoped temp). This matches OpenLineage's notion of immediate upstream datasets.
+    - For ``temp_table`` outputs, ``inputs`` is the **union** of lineage-derived datasets and
+      ``ObjectInfo.dependencies`` so persistent stage tables stay visible even when column ``*``
+      has not yet been materialized in lineage.
+    - When lineage-based direct inputs are a strict subset of ``ObjectInfo.dependencies``
+      **and** those direct inputs are not exclusively temp staging tables, the full
+      procedure/read list is attached under ``outputs[].facets.procedureDependencies``.
+      For ``INSERT INTO … SELECT … FROM #staging``-style loads (only ``#temp`` in lineage),
+      that facet is omitted so UI does not repeat the whole procedure next to the single
+      staging input.
+    - If there is no usable lineage dataset set, ``inputs`` falls back to ``dependencies`` (legacy).
+    """
     ns = obj.schema.namespace if obj.schema else "mssql://localhost/InfoTrackerDW"
     name = obj.schema.name if obj.schema else obj.name
     
@@ -273,50 +432,12 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
     if obj.object_type == "procedure" and virtual_proc_outputs and obj.schema and obj.schema.columns:
         name = f"procedures.{obj.name}"
     
-    # Build inputs from dependencies with per-dependency namespaces
-    # First, collect from lineage (more detailed)
-    input_pairs_from_lineage = set()
-    if obj.lineage:
-        input_pairs_from_lineage = {
-            (f.namespace, f.table_name)
-            for ln in obj.lineage
-            for f in ln.input_fields
-            if getattr(f, "namespace", None) and getattr(f, "table_name", None)
-        }
-    
-    # Also collect from dependencies (may include temp tables and other sources not in lineage)
-    input_pairs_from_deps = {
-        (_ns_for_dep(dep, ns), _strip_db_prefix(dep))
-        for dep in sorted(obj.dependencies) if not _is_noise_dep(dep)
-    }
-    
-    # Combine both sources
-    all_input_pairs = input_pairs_from_lineage | input_pairs_from_deps
-    
-    if all_input_pairs:
-        def _is_noise_name(n: str) -> bool:
-            if not n:
-                return True
-            # keep temp tables visible
-            if n.startswith('@'):
-                return True
-            if '+' in n:
-                return True
-            if n.startswith('[') and n.endswith(']') and '.' not in n:
-                return True
-            # Filter out SQL keywords (JOIN keywords)
-            JOIN_KEYWORDS = {'left', 'right', 'inner', 'outer', 'cross', 'full', 'join'}
-            name_simple = n.split('.')[-1].lower() if n else ""
-            if name_simple in JOIN_KEYWORDS:
-                return True
-            return False
-        filtered = [ (ns2, nm2) for (ns2, nm2) in all_input_pairs if not _is_noise_name(nm2) ]
-        inputs = [{"namespace": ns2, "name": nm2} for (ns2, nm2) in sorted(filtered)]
-    else:
-        inputs = []
+    inputs, proc_deps_facet = openlineage_direct_inputs_and_procedure_deps_facet(obj)
 
     # Build output facets
     facets = {}
+    if proc_deps_facet:
+        facets["procedureDependencies"] = proc_deps_facet
     
     # Add schema facet if we have columns and it's not a fallback object
     # Relaxed condition: allow schema facet even if columns list is empty
@@ -344,13 +465,19 @@ def emit_ol_from_object(obj: ObjectInfo, job_name: str | None = None, quality_me
                     continue
                 if f.table_name == "unknown":
                     continue
+                if (f.column_name or "").strip() == "*":
+                    continue
                 filtered_inputs.append({"namespace": f.namespace, "name": f.table_name, "field": f.column_name})
             
-            lineage_fields[ln.output_column] = {
+            field_entry: dict = {
                 "inputFields": filtered_inputs,
                 "transformationType": ln.transformation_type.value,
                 "transformationDescription": ln.transformation_description,
             }
+            qf = getattr(ln, "quality_facets", None)
+            if qf:
+                field_entry["quality"] = qf
+            lineage_fields[ln.output_column] = field_entry
         facets["columnLineage"] = {
             "_producer": "https://github.com/OpenLineage/OpenLineage",
             "_schemaURL": "https://openlineage.io/spec/facets/1-0-0/ColumnLineageDatasetFacet.json",

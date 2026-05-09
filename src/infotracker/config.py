@@ -28,6 +28,9 @@ class RuntimeConfig:
     log_level: str = "info"
     output_format: str = "text"
     openlineage: OpenLineageCfg = field(default_factory=OpenLineageCfg)
+    # When True, column_graph.json adds base-table edges through temp lineage onto persistent targets.
+    # Default False: only #temp → persistent for INSERT…SELECT…FROM #temp style loads.
+    column_graph_expand_temp_to_persistent: bool = False
 
 
 def load_config(path: Optional[Path]) -> RuntimeConfig:

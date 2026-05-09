@@ -6,8 +6,8 @@ import logging
 import sqlglot
 from sqlglot import exp  # type: ignore
 
-from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage
-from .select_lineage import _register_cte_lineage_object
+from ..models import ObjectInfo, TableSchema, ColumnSchema, ColumnLineage, TransformationType
+from .select_lineage import _register_cte_lineage_object, _normalize_lineage_input_temps
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,117 @@ def _procedure_output_looks_like_table_variable(obj: ObjectInfo) -> bool:
     name = getattr(obj.schema, "name", None) or obj.name or ""
     name = re.sub(r"\[([^\]]+)\]", r"\1", str(name))
     return "@" in name
+
+
+def _temp_lineage_has_column_level_refs(parser, tkey: str) -> bool:
+    """True when parser already recorded per-column refs (not deps×* coarse ``column_name='*'``)."""
+    base = str(tkey).split("@")[0].lower()
+    reg = getattr(parser, "temp_lineage", None) or {}
+    for lk, cmap in reg.items():
+        if str(lk).split("@")[0].lower() != base:
+            continue
+        for _c, refs in (cmap or {}).items():
+            for r in refs or []:
+                cn = getattr(r, "column_name", None)
+                if cn not in (None, "", "*"):
+                    return True
+    return False
+
+
+def _column_lineage_list_from_parser_temp_lineage(parser, tkey: str) -> List[ColumnLineage]:
+    """Build ``ColumnLineage`` rows from ``parser.temp_lineage`` for all version keys sharing the same base temp."""
+    base = str(tkey).split("@")[0].lower()
+    merged: dict = {}
+    reg = getattr(parser, "temp_lineage", None) or {}
+    for lk, cmap in reg.items():
+        if str(lk).split("@")[0].lower() != base:
+            continue
+        for col, refs in (cmap or {}).items():
+            if not col:
+                continue
+            prev = merged.get(col)
+            if not prev or len(refs or []) > len(prev):
+                merged[col] = list(refs or [])
+    return [
+        ColumnLineage(
+            output_column=c,
+            input_fields=list(refs),
+            transformation_type=TransformationType.IDENTITY,
+            transformation_description="from temp source select",
+        )
+        for c, refs in sorted(merged.items(), key=lambda x: x[0])
+    ]
+
+
+def _normalize_schema_table_key(name: Optional[str]) -> str:
+    """Lowercase ``schema.table`` (last two identifiers) for comparing UPDATE target vs temp dependencies."""
+    if not name:
+        return ""
+    s = re.sub(r"\[([^\]]+)\]", r"\1", str(name).strip())
+    parts = [p for p in s.split(".") if p]
+    if len(parts) >= 2:
+        return f"{parts[-2]}.{parts[-1]}".lower()
+    return parts[-1].lower() if parts else ""
+
+
+def _find_output_into_staging_temp_for_update(
+    all_outputs: List[ObjectInfo],
+    update_obj: Optional[ObjectInfo],
+    result_table_name: str,
+) -> Optional[ObjectInfo]:
+    """Temp table from ``UPDATE … OUTPUT … INTO #t`` that stages rows for the same persistent target as ``update_obj``.
+
+    Links structurally: ``_extract_output_into_lineage_string`` puts the updated table (``dml_target``) into the
+    OUTPUT INTO temp's ``dependencies``. No hardcoded temp name substrings.
+    """
+    if not update_obj:
+        return None
+    tkey = _normalize_schema_table_key(result_table_name)
+    if not tkey:
+        return None
+
+    def _is_scoped_temp(o: ObjectInfo) -> bool:
+        if not (o and o.object_type == "temp_table" and o.schema and o.schema.name):
+            return False
+        return "#" in o.schema.name
+
+    candidates: List[ObjectInfo] = []
+    for obj in all_outputs:
+        if not _is_scoped_temp(obj):
+            continue
+        for dep in obj.dependencies or ():
+            if _normalize_schema_table_key(str(dep)) == tkey:
+                candidates.append(obj)
+                break
+
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        try:
+            uidx = all_outputs.index(update_obj)
+        except ValueError:
+            return candidates[0]
+        best: Optional[ObjectInfo] = None
+        best_dist = 10**9
+        for c in candidates:
+            try:
+                cidx = all_outputs.index(c)
+            except ValueError:
+                continue
+            if cidx < uidx and (uidx - cidx) < best_dist:
+                best_dist = uidx - cidx
+                best = c
+        return best or candidates[0]
+
+    try:
+        uidx = all_outputs.index(update_obj)
+    except ValueError:
+        return None
+    for j in range(uidx - 1, -1, -1):
+        o = all_outputs[j]
+        if _is_scoped_temp(o):
+            return o
+    return None
 
 
 def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] = None) -> ObjectInfo:
@@ -288,6 +399,11 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                 into_pos = m_into.start()
                 into_end = m_into.end()
                 tmp = m_into.group(1)
+                # Before parsing the segment, register #tmp so sqlglot ``catalog.dbo.<tmp>`` maps to temp (parse order).
+                try:
+                    self._ensure_temp_registry_placeholder(f"#{tmp}", sql_hint=None)
+                except Exception:
+                    pass
                 
                 # Find the SELECT that belongs to this INTO
                 # Strategy: search backwards through statement boundaries (double-newlines)
@@ -323,7 +439,13 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                 
                 # Find end of INTO statement
                 after_into = src_text[into_end:]
-                end_match = _re.search(r'\n\s*(?:GO|;|SELECT\s+@)', after_into, _re.IGNORECASE | _re.MULTILINE)
+                # T-SQL next statement is often ``SELECT @var = …``; do not use ``SELECT\s+@`` alone — it false-matches
+                # ``SELECT`` + newline + ``@SnapshotDate`` (column list) inside a nested subquery.
+                end_match = _re.search(
+                    r'\n\s*(?:GO|;|SELECT\s+@\w+\s*=)',
+                    after_into,
+                    _re.IGNORECASE | _re.MULTILINE,
+                )
                 if end_match:
                     end_pos = into_end + end_match.start()
                 else:
@@ -359,6 +481,7 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                     try:
                         if tmp:
                             tkey = f"#{tmp}"
+                            self._ensure_temp_registry_placeholder(tkey, sql_hint=None)
                             bases = self._extract_basic_dependencies(raw_seg) or set()
                             # Filter out self and temps
                             bases = {b for b in bases if '#' not in b and 'tempdb' not in str(b).lower()}
@@ -367,50 +490,50 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                                 existing = self.temp_sources.get(tkey, set())
                                 existing.update(bases)
                                 self.temp_sources[tkey] = existing
-                                # Also register temp in temp_registry if not already there (for columns)
-                                if tkey not in self.temp_registry:
-                                    # Try to extract column names from SELECT
-                                    import re as _re2
-                                    # Use negative lookahead to avoid matching across multiple INTO statements
-                                    select_match = _re2.search(r'(?is)SELECT\s+((?:(?!INTO).)+)\s+INTO', raw_seg)
-                                    if select_match:
-                                        select_list = select_match.group(1)
-                                        # Robust column extraction - handle aliases and qualified names
-                                        cols = []
-                                        seen = set()
+                            # Column list even when deps are empty (large / fragile segments)
+                            if tkey not in self.temp_registry or not self.temp_registry.get(tkey):
+                                # Try to extract column names from SELECT
+                                import re as _re2
+                                # Use negative lookahead to avoid matching across multiple INTO statements
+                                select_match = _re2.search(r'(?is)SELECT\s+((?:(?!INTO).)+)\s+INTO', raw_seg)
+                                if select_match:
+                                    select_list = select_match.group(1)
+                                    # Robust column extraction - handle aliases and qualified names
+                                    cols = []
+                                    seen = set()
 
-                                        def _extract_simple_col(expr: str) -> Optional[str]:
-                                            expr = _re2.sub(r'--.*$', '', expr, flags=_re2.MULTILINE).strip()
-                                            expr = _re2.sub(r'/\*.*?\*/', '', expr, flags=_re2.DOTALL).strip()
-                                            if not expr:
-                                                return None
-                                            if expr == "*" or expr.endswith(".*"):
-                                                return "*"
-                                            upper = expr.upper()
-                                            if " AS " in upper:
-                                                expr = expr.rsplit(" AS ", 1)[-1].strip()
-                                            else:
-                                                parts = expr.split()
-                                                if len(parts) > 1:
-                                                    expr = parts[-1].strip()
-                                            expr = expr.strip('[]').strip()
-                                            if _re2.match(r'^[\w\[\]]+\.[\w\[\]]+$', expr):
-                                                expr = expr.split('.')[-1].strip('[]').strip()
-                                            if not _re2.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
-                                                return None
-                                            return expr
+                                    def _extract_simple_col(expr: str) -> Optional[str]:
+                                        expr = _re2.sub(r'--.*$', '', expr, flags=_re2.MULTILINE).strip()
+                                        expr = _re2.sub(r'/\*.*?\*/', '', expr, flags=_re2.DOTALL).strip()
+                                        if not expr:
+                                            return None
+                                        if expr == "*" or expr.endswith(".*"):
+                                            return "*"
+                                        upper = expr.upper()
+                                        if " AS " in upper:
+                                            expr = expr.rsplit(" AS ", 1)[-1].strip()
+                                        else:
+                                            parts = expr.split()
+                                            if len(parts) > 1:
+                                                expr = parts[-1].strip()
+                                        expr = expr.strip('[]').strip()
+                                        if _re2.match(r'^[\w\[\]]+\.[\w\[\]]+$', expr):
+                                            expr = expr.split('.')[-1].strip('[]').strip()
+                                        if not _re2.match(r'^[A-Za-z_][A-Za-z0-9_]*$', expr):
+                                            return None
+                                        return expr
 
-                                        for col_expr in _re2.split(r',\s*(?![^()]*\))', select_list):
-                                            col_name = _extract_simple_col(col_expr)
-                                            if not col_name:
-                                                continue
-                                            key = col_name.lower()
-                                            if key in seen:
-                                                continue
-                                            seen.add(key)
-                                            cols.append(col_name)
-                                        if cols:
-                                            self.temp_registry[tkey] = cols
+                                    for col_expr in _re2.split(r',\s*(?![^()]*\))', select_list):
+                                        col_name = _extract_simple_col(col_expr)
+                                        if not col_name:
+                                            continue
+                                        key = col_name.lower()
+                                        if key in seen:
+                                            continue
+                                        seen.add(key)
+                                        cols.append(col_name)
+                                    if cols:
+                                        self.temp_registry[tkey] = cols
                     except Exception as e:
                         import traceback
                         logger.debug(f"Error in regex fallback for {tmp}: {e}")
@@ -418,6 +541,10 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                         pass
             # INSERT INTO #temp SELECT ... segments
             for m in _re.finditer(r"(?is)\bINSERT\s+INTO\s+#(?P<tmp>[A-Za-z0-9_]+)\b.*?\bSELECT\b.*?(?=;|\bINSERT\b|\bCREATE\b|\bALTER\b|\bUPDATE\b|\bDELETE\b|\bEND\b|\bGO\b|$)", src_text):
+                try:
+                    self._ensure_temp_registry_placeholder(f"#{m.group('tmp')}", sql_hint=None)
+                except Exception:
+                    pass
                 raw_seg = m.group(0)
                 seg = self._preprocess_sql(self._normalize_tsql(raw_seg))
                 try:
@@ -484,6 +611,10 @@ def _parse_procedure_string(self, sql_content: str, object_hint: Optional[str] =
                     except Exception as e:
                         logger.debug(f"Error in INSERT fallback for {tmp}: {e}")
                         pass
+            try:
+                _normalize_lineage_input_temps(self, materialized_output.lineage or [])
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1010,7 +1141,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
     preprocessed_body = self._preprocess_sql(body_sql)
     logger.debug(f"_parse_procedure_body_statements: preprocessed_body length={len(preprocessed_body)}")
     # Check if SELECT INTO is in preprocessed_body
-    if 'INTO #' in preprocessed_body or 'INTO #asefl_temp' in preprocessed_body:
+    if 'INTO #' in preprocessed_body:
         logger.debug(f"_parse_procedure_body_statements: Found 'INTO #' in preprocessed_body")
     if 'WITH' in preprocessed_body.upper():
         logger.debug(f"_parse_procedure_body_statements: Found 'WITH' in preprocessed_body")
@@ -1409,7 +1540,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                         logger.debug(f"_parse_procedure_body_statements: Failed to parse standalone WITH statement before INTO {temp_table}: {e}")
                 
                 # Find the end of this statement - look for semicolon or next SELECT after INTO #table
-                # For #asefl_temp, the statement ends after the FROM clause (no semicolon, next statement is SELECT)
+                # (e.g. SELECT … INTO #temp with no semicolon before the next statement)
                 # Strategy: Find the end of the FROM clause by looking for the next SELECT on a new line
                 # that appears after all JOINs are done
                 search_end_pos = min(len(preprocessed_body), into_end + 20000)
@@ -1418,7 +1549,6 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 logger.debug(f"_parse_procedure_body_statements: Looking for end of statement for {temp_table}, after_text length={len(after_text)}")
                 logger.debug(f"_parse_procedure_body_statements: First 300 chars after INTO {temp_table}: {after_text[:300]}")
                 
-                # For #asefl_temp, the statement ends after the FROM clause (no semicolon, next statement is SELECT)
                 # Strategy: Always look for next SELECT or EXEC on a new line first, as it's more reliable than semicolon
                 # The semicolon might be inside the statement (e.g., after JOINs but before the actual end)
                 # Ignore SELECT @var assignments using negative lookahead
@@ -1992,7 +2122,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
             if not stmt_sql or stmt_sql.upper() in ('GO', 'END'):
                 continue
             # Check if this chunk contains SELECT INTO or UPDATE ... OUTPUT ... INTO
-            if 'INTO #' in stmt_sql or 'INTO #asefl_temp' in stmt_sql:
+            if 'INTO #' in stmt_sql:
                 logger.debug(f"_parse_procedure_body_statements: Chunk {chunk_idx+1} contains 'INTO #' (length={len(stmt_sql)})")
             # Check if this chunk contains UPDATE ... OUTPUT ... INTO
             if 'UPDATE' in stmt_sql.upper() and 'OUTPUT' in stmt_sql.upper() and 'INTO #' in stmt_sql:
@@ -2800,7 +2930,7 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 all_inputs.update(obj.dependencies or [])
     
     # Create ObjectInfo for temp tables from temp_registry that are not in all_outputs
-    # This ensures temp tables like #insert_update_temp_asefl, #MaxLoadDate, #MinAccountingPeriod are available
+    # (e.g. OUTPUT INTO #…, SELECT INTO #…, helper temps)
     # Skip table variables (starting with @) - they should not be materialized
     for tkey in self.temp_registry.keys():
         if tkey.startswith('#') and not tkey.startswith('@'):
@@ -2899,45 +3029,51 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                             self.temp_sources[tkey] = deps_for_temp
                     if deps_for_temp:
                         out_obj.dependencies = deps_for_temp
-                        
-                        # Generate lineage for graph visualization
-                        if out_cols:
-                            from infotracker.models import ColumnLineage, ColumnReference, TransformationType
-                            lineage = []
-                            for col in out_cols:
-                                input_refs = []
-                                for dep in deps_for_temp:
-                                    try:
-                                        dep_ns, dep_name = self._ns_and_name(dep)
-                                        input_refs.append(ColumnReference(
+
+                    # Prefer AST column lineage from SELECT INTO / INSERT…SELECT; do not replace with deps×* (WHERE tables
+                    # would be linked to every projected column via column_name='*').
+                    if _temp_lineage_has_column_level_refs(self, tkey):
+                        out_obj.lineage = _column_lineage_list_from_parser_temp_lineage(self, tkey)
+                    elif deps_for_temp and out_cols:
+                        # Generate coarse lineage only when parser did not produce per-column refs
+                        from infotracker.models import ColumnReference
+
+                        lineage = []
+                        for col in out_cols:
+                            input_refs = []
+                            for dep in deps_for_temp:
+                                try:
+                                    dep_ns, dep_name = self._ns_and_name(dep)
+                                    input_refs.append(
+                                        ColumnReference(
                                             namespace=dep_ns,
                                             table_name=dep_name,
-                                            column_name="*"
-                                        ))
-                                    except Exception:
-                                        pass
-                                if input_refs:
-                                    lineage.append(ColumnLineage(
+                                            column_name="*",
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                            if input_refs:
+                                lineage.append(
+                                    ColumnLineage(
                                         output_column=col.name,
                                         input_fields=input_refs,
                                         transformation_type=TransformationType.UNKNOWN,
-                                        transformation_description="from temp source"
-                                    ))
-                            out_obj.lineage = lineage
-                            
-                            # Register in temp_lineage so downstream usage can resolve it
-                            # This is crucial for graph connectivity when this temp table is used as a source
-                            col_map = {}
-                            for lin in lineage:
-                                col_map[lin.output_column] = lin.input_fields
-                            
-                            self.temp_lineage[tkey] = col_map
-                            # Also register canonical name
-                            try:
-                                canonical = self._canonical_temp_name(tkey)
-                                self.temp_lineage[canonical] = col_map
-                            except Exception:
-                                pass
+                                        transformation_description="from temp source",
+                                    )
+                                )
+                        out_obj.lineage = lineage
+
+                        col_map = {}
+                        for lin in lineage:
+                            col_map[lin.output_column] = lin.input_fields
+
+                        self.temp_lineage[tkey] = col_map
+                        try:
+                            canonical = self._canonical_temp_name(tkey)
+                            self.temp_lineage[canonical] = col_map
+                        except Exception:
+                            pass
                     all_outputs.append(out_obj)
                     logger.debug(f"_parse_procedure_body_statements: Created ObjectInfo for {tkey} from temp_registry: {out_obj.name}, columns={len(out_cols)}, dependencies={len(out_obj.dependencies)}")
                 except Exception as obj_error:
@@ -2996,37 +3132,45 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
         result_table_name = result_output.schema.name if result_output.schema else result_output.name
         update_obj = None
         insert_update_temp_obj = None
-        logger.debug(f"_parse_procedure_body_statements: Looking for UPDATE and #insert_update_temp_asefl for {result_table_name}, all_outputs count: {len(all_outputs)}")
+        logger.debug(
+            f"_parse_procedure_body_statements: Looking for UPDATE + OUTPUT INTO temp merge for "
+            f"{result_table_name}, all_outputs count: {len(all_outputs)}"
+        )
         for obj in all_outputs:
             if obj and obj.schema:
                 logger.debug(f"_parse_procedure_body_statements: Checking obj: {obj.object_type}, name={obj.schema.name}")
-            if (obj and obj.object_type == "table" and obj.schema and 
-                obj.schema.name == result_table_name and obj != result_output):
-                # This is an UPDATE targeting the same table
+            if (
+                obj
+                and obj.object_type == "table"
+                and obj.schema
+                and obj.schema.name == result_table_name
+                and obj != result_output
+            ):
                 update_obj = obj
-                logger.debug(f"_parse_procedure_body_statements: Found update_obj: {update_obj.name}, lineage={len(update_obj.lineage)} columns")
-            elif (obj and obj.object_type == "temp_table" and obj.schema and
-                  'insert_update_temp_asefl' in obj.schema.name.lower()):
-                # Found #insert_update_temp_asefl
-                insert_update_temp_obj = obj
-                logger.debug(f"_parse_procedure_body_statements: Found insert_update_temp_obj: {insert_update_temp_obj.name}, dependencies={insert_update_temp_obj.dependencies}")
-        
-        # If UPDATE exists and #insert_update_temp_asefl exists, merge lineage
-        # UPDATE modifies TrialBalance_asefl_BV and OUTPUT INTO #insert_update_temp_asefl
-        # So columns updated by UPDATE should have lineage through #insert_update_temp_asefl
+                logger.debug(
+                    f"_parse_procedure_body_statements: Found update_obj: {update_obj.name}, "
+                    f"lineage={len(update_obj.lineage)} columns"
+                )
+
+        if update_obj:
+            insert_update_temp_obj = _find_output_into_staging_temp_for_update(
+                all_outputs, update_obj, result_table_name
+            )
+            if insert_update_temp_obj:
+                logger.debug(
+                    f"_parse_procedure_body_statements: Found OUTPUT INTO staging temp for merge: "
+                    f"{insert_update_temp_obj.name}, dependencies={insert_update_temp_obj.dependencies}"
+                )
+
+        # If UPDATE exists and its OUTPUT INTO staging temp exists, merge lineage into the primary persistent output
         if update_obj and insert_update_temp_obj and update_obj.lineage:
             if not result_output.lineage:
                 result_output.lineage = []
-            # For columns updated by UPDATE, lineage should go through #insert_update_temp_asefl
             for lin in update_obj.lineage:
-                # Replace input_fields to point to #insert_update_temp_asefl instead of direct sources
                 from ..models import ColumnLineage, ColumnReference, TransformationType
                 updated_input_fields = []
-                # If lineage has input_fields pointing to #asefl_temp or other sources,
-                # replace them with #insert_update_temp_asefl
                 if lin.input_fields:
                     for input_field in lin.input_fields:
-                        # Replace with #insert_update_temp_asefl reference
                         updated_input_fields.append(ColumnReference(
                             namespace=insert_update_temp_obj.schema.namespace,
                             table_name=insert_update_temp_obj.schema.name,
@@ -3043,7 +3187,6 @@ def _parse_procedure_body_statements(self, body_sql: str, object_hint: Optional[
                 # Check if this column already exists in result_output.lineage
                 existing = next((l for l in result_output.lineage if l.output_column == lin.output_column), None)
                 if existing:
-                    # Merge input_fields - add #insert_update_temp_asefl as source
                     if not existing.input_fields:
                         existing.input_fields = []
                     existing.input_fields.extend(updated_input_fields)

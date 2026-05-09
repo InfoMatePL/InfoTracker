@@ -14,10 +14,10 @@ import yaml
 from .adapters import get_adapter
 from .object_db_registry import ObjectDbRegistry
 from .io_utils import read_text_safely
-from .lineage import emit_ol_from_object
+from .lineage import emit_ol_from_object, _lineage_direct_dataset_pairs
 from .models import (
-    ObjectInfo, 
-    ColumnNode, 
+    ObjectInfo,
+    ColumnNode,
     ColumnSchema,
     TableSchema,
     ColumnGraph,
@@ -25,9 +25,114 @@ from .models import (
     ColumnLineage,
     ColumnReference,
     TransformationType,
+    wildcard_lineage_fixpoint,
 )
 
 logger = logging.getLogger(__name__)
+
+_DIAG_TEMP_FRAG = "tmp_stage_asefl_partycustomer_contract_lnk"
+
+
+def _dependency_string_from_select_into_from_clause(from_table_raw: str, parser: Any) -> Optional[str]:
+    """Normalize regex-captured FROM clause to ``DB.schema.object`` for ``ObjectInfo.dependencies``."""
+    if not from_table_raw:
+        return None
+    ft = from_table_raw.strip().replace("[", "").replace("]", "")
+    if not ft or ft.startswith("#"):
+        return None
+    JOIN_KEYWORDS = {"left", "right", "inner", "outer", "cross", "full", "join"}
+    parts = [p for p in ft.split(".") if p]
+    if not parts or parts[-1].lower() in JOIN_KEYWORDS:
+        return None
+    if len(parts) >= 3:
+        return ".".join(parts[:3])
+    db = getattr(parser, "current_database", None) or getattr(parser, "default_database", None) or "EDW_CORE"
+    if isinstance(db, str) and "://" in db:
+        db = db.rsplit("/", 1)[-1]
+    db_u = str(db).upper()
+    if len(parts) == 2:
+        return f"{db_u}.{parts[0]}.{parts[1]}"
+    return f"{db_u}.dbo.{parts[0]}"
+
+
+def _debug_log_temp_lineage_diag(label: str, owner: str, tmp: str, temp_obj: ObjectInfo) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    if _DIAG_TEMP_FRAG not in (tmp or "").lower():
+        return
+    try:
+        pairs = sorted(_lineage_direct_dataset_pairs(temp_obj))
+        sample = []
+        for ln in (temp_obj.lineage or [])[:12]:
+            for f in ln.input_fields or []:
+                sample.append(
+                    f"out={ln.output_column!r} ns={getattr(f, 'namespace', None)!r} tbl={getattr(f, 'table_name', None)!r} col={getattr(f, 'column_name', None)!r}"
+                )
+        logger.debug(
+            "%s owner=%s tmp=%s deps=%s lineage_direct_pairs=%s sample_input_fields=%s",
+            label,
+            owner,
+            tmp,
+            sorted(temp_obj.dependencies or []),
+            pairs,
+            sample[:20],
+        )
+    except Exception:
+        logger.debug("%s diagnostic logging failed for %s::%s", label, owner, tmp, exc_info=True)
+
+
+def _collect_local_temp_suffixes_lower(file_temp_registries: Dict[Any, Any], group_paths: List[Path]) -> Set[str]:
+    """Lowercase base names (no ``#``) of temps declared in procedure files in this merge group."""
+    s: Set[str] = set()
+    for p in group_paths:
+        fd = file_temp_registries.get(p)
+        if not fd:
+            continue
+        for k in fd.get("registry") or {}:
+            s.add(str(k).lstrip("#").split("@")[0].lower())
+    return s
+
+
+def _filter_phantom_dbo_temp_deps(deps: Set[str], suffixes: Set[str]) -> Set[str]:
+    """Drop ``*.dbo.<X>`` dependencies when ``#X`` is a known local temp (sqlglot leak), not a persistent table."""
+    if not suffixes or not deps:
+        return set(deps)
+    out: Set[str] = set()
+    for d in deps:
+        parts = [x for x in str(d).split(".") if x]
+        if len(parts) >= 2 and parts[-2].lower() == "dbo":
+            leaf = parts[-1].split("@")[0].lower()
+            if leaf in suffixes:
+                continue
+        out.add(d)
+    return out
+
+
+def _filter_phantom_lineage_refs(lineages: List[ColumnLineage], suffixes: Set[str]) -> List[ColumnLineage]:
+    """Remove column refs that look like persistent ``dbo.<temp>`` but match a local ``#temp`` suffix."""
+    if not suffixes or not lineages:
+        return lineages
+    out: List[ColumnLineage] = []
+    for ln in lineages:
+        new_refs: List[ColumnReference] = []
+        for ref in ln.input_fields or []:
+            tn = ref.table_name or ""
+            parts = [x for x in tn.split(".") if x]
+            if len(parts) >= 2 and parts[-2].lower() == "dbo":
+                leaf = parts[-1].split("@")[0].lower()
+                if leaf in suffixes:
+                    continue
+            new_refs.append(ref)
+        out.append(
+            ColumnLineage(
+                output_column=ln.output_column,
+                input_fields=new_refs,
+                transformation_type=ln.transformation_type,
+                transformation_description=ln.transformation_description,
+                quality_facets=getattr(ln, "quality_facets", None),
+            )
+        )
+    return out
 
 
 # ======== Requests (sygnatury zgodne z CLI) ========
@@ -403,15 +508,21 @@ class Engine:
                     logger.warning("failed to parse %s: %s", sql_path, e)
 
             # Compute union lineage/deps across contributions to the same object (e.g., SP materializing the table)
+            temp_suffixes = _collect_local_temp_suffixes_lower(file_temp_registries, group_paths)
             union_lineage: List[ColumnLineage] = []
             union_deps: Set[str] = set()
             try:
-                # prefer contributions that already have lineage (procedures)
                 for gi in group_infos:
                     if gi.lineage:
-                        union_lineage.extend(gi.lineage)
+                        li = gi.lineage
+                        if getattr(gi, "object_type", None) == "procedure" and temp_suffixes:
+                            li = _filter_phantom_lineage_refs(li, temp_suffixes)
+                        union_lineage.extend(li)
                     if gi.dependencies:
-                        union_deps.update(gi.dependencies)
+                        d = gi.dependencies
+                        if getattr(gi, "object_type", None) == "procedure" and temp_suffixes:
+                            d = _filter_phantom_dbo_temp_deps(d, temp_suffixes)
+                        union_deps.update(d)
             except Exception:
                 pass
 
@@ -601,6 +712,7 @@ class Engine:
                                             sql_text = read_text_safely(sql_path)
                                             sql_text_cache[sql_path] = sql_text
                                         match = None
+                                        match_update = None
                                         from_table = None
                                         # Try UPDATE ... OUTPUT ... INTO #tmp pattern first (for temp tables created by UPDATE)
                                         # UPDATE may have FROM before OUTPUT or after INTO
@@ -689,9 +801,18 @@ class Engine:
                                             if from_table_simple.lower() in JOIN_KEYWORDS:
                                                 logger.debug(f"Phase 3: Skipping JOIN keyword '{from_table}' in fallback lineage for {tmp}")
                                                 break
-                                            # Do not synthesize per-column or table-* lineage (misleading cartesian).
+                                            # Do not synthesize per-column lineage (cartesian); still record object-level dep.
+                                            dep_s = _dependency_string_from_select_into_from_clause(from_table, parser)
+                                            if dep_s:
+                                                deps.add(dep_s)
+                                                logger.debug(
+                                                    "Phase 3: SELECT INTO fallback persist FROM %s → dependency %s for %s",
+                                                    from_table,
+                                                    dep_s,
+                                                    tmp,
+                                                )
                                             logger.debug(
-                                                f"Phase 3: Regex matched FROM {from_table} for {tmp} but skipping synthetic lineage"
+                                                f"Phase 3: Regex matched FROM {from_table} for {tmp} but skipping synthetic per-column lineage"
                                             )
                                             break
                                 except Exception as e:
@@ -845,6 +966,9 @@ class Engine:
                                         )
 
                             temp_obj = ObjectInfo(name=table_name, object_type="temp_table", schema=schema, lineage=lin_list, dependencies=deps)
+                            setattr(temp_obj, "_infotracker_temp_diag_owner", owner)
+                            setattr(temp_obj, "_infotracker_temp_diag_tmp", tmp)
+                            _debug_log_temp_lineage_diag("Phase3_pre_fixpoint", owner, tmp, temp_obj)
                             logger.debug(f"Phase 3: Created temp_obj for {owner}::{tmp}: obj.name={temp_obj.name}, obj.schema.name={temp_obj.schema.name}")
                             # Include in graph
                             resolved_objects.append(temp_obj)
@@ -861,11 +985,28 @@ class Engine:
                                 safe_name = canonical
                             safe = safe_name.replace('/', '_').replace('\\', '_').replace(':', '_').replace('#', 'hash')
                             tpath = out_dir / f"{sql_path.stem}__temp__{safe}.json"
-                            tpayload = emit_ol_from_object(temp_obj, quality_metrics=True, virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True))
+                            # Re-emitted after wildcard_lineage_fixpoint so on-disk OL matches ColumnGraph inputs.
+                            setattr(temp_obj, "_infotracker_temp_ol_path", tpath)
+                            setattr(
+                                temp_obj,
+                                "_infotracker_temp_ol_job_name",
+                                f"warehouse/sql/{sql_path.name}",
+                            )
+                            tpayload = emit_ol_from_object(
+                                temp_obj,
+                                job_name=getattr(temp_obj, "_infotracker_temp_ol_job_name"),
+                                quality_metrics=True,
+                                virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
+                            )
                             tpath.write_text(json.dumps(tpayload, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
                             outputs.append([sql_path.stem, str(tpath)])
                         except Exception:
-                            pass
+                            logger.exception(
+                                "Phase 3: failed temp_table OpenLineage emit owner=%s tmp=%s sql_path=%s",
+                                owner,
+                                tmp,
+                                sql_path,
+                            )
 
                     # Optionally emit minimal source dataset events for inputs that do not have their own outputs
                     if self._emit_external_sources:
@@ -1110,9 +1251,42 @@ class Engine:
         # 4) Build column graph from resolved objects (second pass)
         if resolved_objects:
             try:
+                wildcard_lineage_fixpoint(resolved_objects, parser.schema_registry, max_iterations=32)
+                # Refresh temp_table OpenLineage JSON on disk to match post-fixpoint lineage/deps (ColumnGraph input).
+                for _tobj in resolved_objects:
+                    if getattr(_tobj, "object_type", None) != "temp_table":
+                        continue
+                    _d_owner = getattr(_tobj, "_infotracker_temp_diag_owner", None)
+                    _d_tmp = getattr(_tobj, "_infotracker_temp_diag_tmp", None)
+                    if _d_owner and _d_tmp:
+                        _debug_log_temp_lineage_diag("Post_fixpoint", _d_owner, _d_tmp, _tobj)
+                    _tpath = getattr(_tobj, "_infotracker_temp_ol_path", None)
+                    _job = getattr(_tobj, "_infotracker_temp_ol_job_name", None)
+                    if not _tpath or not _job:
+                        continue
+                    try:
+                        _tpayload = emit_ol_from_object(
+                            _tobj,
+                            job_name=_job,
+                            quality_metrics=True,
+                            virtual_proc_outputs=getattr(self.config, "virtual_proc_outputs", True),
+                        )
+                        _tpath.write_text(
+                            json.dumps(_tpayload, indent=2, ensure_ascii=False, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                    except Exception as _e:
+                        logger.warning("post-fixpoint temp OL re-emit failed for %s: %s", _tpath, _e)
+
                 graph = ColumnGraph()
                 # Pass CTE registry to enable CTE expansion (like temp tables)
-                graph.build_from_object_lineage(resolved_objects, cte_data=global_saved_cte_registry)
+                graph.build_from_object_lineage(
+                    resolved_objects,
+                    cte_data=global_saved_cte_registry,
+                    expand_temp_lineage_to_persistent=bool(
+                        getattr(self.config, "column_graph_expand_temp_to_persistent", False)
+                    ),
+                )
                 self._column_graph = graph
 
                 # Save graph to disk for impact analysis
@@ -1127,12 +1301,15 @@ class Engine:
                         if key in seen:
                             continue
                         seen.add(key)
-                        edges_dump.append({
+                        ed: Dict[str, Any] = {
                             "from": str(e.from_column),
                             "to": str(e.to_column),
                             "transformation": key[2],
                             "description": key[3],
-                        })
+                        }
+                        if getattr(e, "lineage_quality", None):
+                            ed["quality"] = e.lineage_quality
+                        edges_dump.append(ed)
                 # Also include nodes (columns) even if they don't have edges
                 nodes_dump = []
                 for node in graph._nodes.values():

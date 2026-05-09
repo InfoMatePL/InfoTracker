@@ -34,6 +34,28 @@ def _normalize_table_ident(self, s: str) -> str:
         return (s or "").strip()
 
 
+def _temp_registry_base_key(self, simple: Optional[str]) -> Optional[str]:
+    """Match ``temp_registry`` by simple name or ``#name@ver`` key (no ``#`` stripping in the middle).
+
+    sqlglot drops ``#`` from ``#temp`` → name ``temp``; ``\"#temp\" in registry`` fails when only
+    ``#temp@1`` exists. Do **not** split on ``#`` here — that would map unrelated identifiers
+    (e.g. ``…#PIT`` tails) to the wrong temp.
+    """
+    if not simple:
+        return None
+    t = str(simple).split("@")[0].lstrip("#").lower()
+    if not t:
+        return None
+    reg = getattr(self, "temp_registry", None) or {}
+    if f"#{t}" in reg:
+        return f"#{t}"
+    for k in reg.keys():
+        base = str(k).split("@")[0]
+        if base.lstrip("#").lower() == t:
+            return base if base.startswith("#") else f"#{base}"
+    return None
+
+
 def _split_fqn(self, fqn: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Split fully qualified name into (db, schema, table) using cached core and context default."""
     db, sch, tbl = _cached_split_fqn_core(fqn)
@@ -55,15 +77,11 @@ def _ns_and_name(self, table_name: str, obj_type_hint: str = "table") -> tuple[s
     # Check if this is a CTE reference - CTEs don't need database qualification
     # They exist only in the query context, not in the database
     simple_name = parts_check[-1] if parts_check else table_name
-    if simple_name and simple_name in self.cte_registry:
-        # CTEs are query-scoped, but give them a namespace for visualization
-        # Use current database namespace to group them properly
+    _cte_sk = self._cte_registry_resolve_key(simple_name) or self._cte_registry_resolve_key(table_name)
+    if simple_name and _cte_sk:
         db = self.current_database or self.default_database or "InfoTrackerDW"
         ns = f"mssql://localhost/{db}"
-        # Prefix CTE name with schema for proper grouping in visualization
-        schema = getattr(self, '_ctx_schema', None) or self.default_schema or "dbo"
-        name = f"{schema}.{simple_name}"
-        return ns, name
+        return ns, _cte_sk
     
     if table_name and (table_name.startswith('#') or '.#' in table_name or 'tempdb..#' in table_name or 'tempdb' in table_name.lower() or ('[' in table_name and '#' in table_name)):
         # If table_name is already canonical (contains '.#'), use it directly
@@ -220,15 +238,20 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
                     # Use canonical temp name instead of tempdb..#
                     return self._canonical_temp_name(f"#{simple}")
             # If we have materialized this temp earlier in the procedure, map it to canonical form
-            if simple and (f"#{simple}" in self.temp_registry):
-                return self._canonical_temp_name(f"#{simple}")
+            _tb = _temp_registry_base_key(self, simple)
+            if _tb:
+                return self._canonical_temp_name(_tb)
         except Exception:
             pass
         catalog = str(table_expr.catalog) if table_expr.catalog else None
         if catalog and catalog.lower() in {"view", "function", "procedure"}:
             catalog = None
         if catalog and table_expr.db:
-            # Explicit DB qualifier in SQL – trust it and do not override via registry.
+            # sqlglot drops ``#`` → catalog.schema.name looks like a real table; if ``#name`` is in
+            # ``temp_registry`` for this procedure, always emit canonical temp (never a persistent FQN).
+            _tb_cat = _temp_registry_base_key(self, str(table_expr.name))
+            if _tb_cat:
+                return self._canonical_temp_name(_tb_cat)
             full_name = f"{catalog}.{table_expr.db}.{table_expr.name}"
             explicit_db = True
         elif table_expr.db:
@@ -236,20 +259,21 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
             full_name = qualify_identifier(table_name, database_to_use)
         else:
             table_name = str(table_expr.name)
-            # Check if this is a CTE reference - CTEs should not be qualified with database
-            if table_name in self.cte_registry:
-                # Return CTE name as-is without qualification
-                return table_name
+            _cte_sk = self._cte_registry_resolve_key(table_name)
+            if _cte_sk:
+                return _cte_sk
             full_name = qualify_identifier(table_name, database_to_use)
     elif isinstance(table_expr, exp.Identifier):
         # Identifiers may also point at temps without leading '#'. If present in temp_registry, use canonical name.
         try:
             ident = str(table_expr.this)
-            if ident and (f"#{ident}" in self.temp_registry):
-                return self._canonical_temp_name(f"#{ident}")
+            _ik = _temp_registry_base_key(self, ident)
+            if _ik:
+                return self._canonical_temp_name(_ik)
             # Check if this is a CTE reference
-            if ident in self.cte_registry:
-                return ident
+            _cte_sk2 = self._cte_registry_resolve_key(ident)
+            if _cte_sk2:
+                return _cte_sk2
         except Exception:
             pass
         table_name = str(table_expr.this)
@@ -281,6 +305,31 @@ def _get_table_name(self, table_expr: exp.Expression, hint: Optional[str] = None
         # On any registry or resolution error, fall back to original full_name
         pass
 
+    # sqlglot: #temp → EDW_CORE.dbo.temp (pseudo-table). Rewrite only that pattern, not arbitrary last segments.
+    try:
+        _parts = [re.sub(r"[\[\]]", "", p) for p in (full_name or "").split(".") if p]
+        if (
+            len(_parts) >= 2
+            and _parts[-2].lower() == "dbo"
+            and _parts[-1].split("@")[0].lower() == "temp"
+        ):
+            _rk = _temp_registry_base_key(self, "temp")
+            if _rk:
+                return self._canonical_temp_name(_rk)
+    except Exception:
+        pass
+
+    # Any qualified name whose leaf matches a registered local temp (``#leaf``) → canonical temp.
+    try:
+        _parts2 = [re.sub(r"[\[\]]", "", p) for p in (full_name or "").split(".") if p]
+        if _parts2:
+            _leaf = _parts2[-1].split("@")[0]
+            _rk2 = _temp_registry_base_key(self, _leaf)
+            if _rk2:
+                return self._canonical_temp_name(_rk2)
+    except Exception:
+        pass
+
     return sanitize_name(full_name)
 
 
@@ -302,9 +351,9 @@ def _get_full_table_name(self, table_name: str) -> str:
     
     # Check if this is a CTE reference - CTEs should not be qualified
     simple_name = parts_check[-1] if parts_check else table_name
-    if simple_name and simple_name in self.cte_registry:
-        # Return CTE name as-is without qualification
-        return simple_name
+    _cte_sk3 = self._cte_registry_resolve_key(simple_name) or self._cte_registry_resolve_key(table_name)
+    if simple_name and _cte_sk3:
+        return _cte_sk3
     
     db_to_use = self.current_database or self.default_database or "InfoTrackerDW"
     parts = (table_name or "").split('.')

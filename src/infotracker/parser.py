@@ -85,6 +85,35 @@ class SqlParser:
     def _extract_temp_name(self, raw_name: str) -> str:
         from .parser_modules import temp_utils as _tu
         return _tu._extract_temp_name(self, raw_name)
+
+    def _ensure_temp_registry_placeholder(
+        self, raw_target: Optional[str] = None, *, sql_hint: Optional[str] = None
+    ) -> None:
+        """Register ``#name`` in ``temp_registry`` (empty column list) before lineage/deps walks.
+
+        sqlglot drops ``#`` so inner ``FROM``/aliases may resolve to ``catalog.dbo.<name>``; early
+        registration lets :func:`_get_table_name` and ``_temp_registry_base_key`` map leaks back to temps.
+        """
+        import re as _re
+
+        base: Optional[str] = None
+        if raw_target:
+            rt = str(raw_target).strip()
+            if rt.startswith("#") or "tempdb" in rt.lower():
+                seg = rt.split(".")[-1]
+                if not seg.startswith("#") and "tempdb" not in rt.lower():
+                    seg = f"#{seg.lstrip('#')}"
+                base = seg.split("@")[0]
+        if not base and sql_hint:
+            m = _re.search(r"\bINTO\s+#([A-Za-z0-9_]+)\b", sql_hint, _re.IGNORECASE)
+            if m:
+                base = f"#{m.group(1)}"
+        if not base:
+            return
+        if not base.startswith("#"):
+            base = f"#{base.lstrip('#')}"
+        if base not in self.temp_registry:
+            self.temp_registry[base] = []
     
     def _clean_proc_name(self, s: str) -> str:
         """Clean procedure name by removing semicolons and parameters."""
