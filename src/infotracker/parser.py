@@ -223,9 +223,9 @@ class SqlParser:
         from .parser_modules import select_lineage as _sl
         return _sl._build_alias_maps(self, select_exp)
     
-    def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
+    def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict, scope_select=None):
         from .parser_modules import select_lineage as _sl
-        return _sl._append_column_ref(self, out_list, col_exp, alias_map)
+        return _sl._append_column_ref(self, out_list, col_exp, alias_map, scope_select)
     
     def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derived_cols: dict):
         from .parser_modules import select_lineage as _sl
@@ -925,9 +925,15 @@ class SqlParser:
         from .parser_modules import select_lineage as _sl
         return _sl._has_union(self, stmt)
     
-    def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
+    def _handle_star_expansion(
+        self,
+        select_stmt: exp.Select,
+        view_name: str,
+        alias_map=None,
+        derived_cols=None,
+    ) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
         from .parser_modules import select_lineage as _sl
-        return _sl._handle_star_expansion(self, select_stmt, view_name)
+        return _sl._handle_star_expansion(self, select_stmt, view_name, alias_map, derived_cols)
 
     
     def _handle_union_lineage(self, stmt: exp.Expression, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:

@@ -767,6 +767,39 @@ def _graph_remap_dbo_temp_pseudo(
     return in_tbl, None
 
 
+def _cte_from_table_should_skip_expand_to_persistent(
+    table: Any,
+    temp_owners_registry: Optional[Dict[str, Set[str]]] = None,
+) -> bool:
+    """True when a CTE body ``FROM`` target is a **local temp** that must not be treated as a durable base table.
+
+    sqlglot maps ``FROM #temp`` to ``Table(name=temp, db=dbo, …)``. The ColumnGraph CTE-expansion block used to add
+    ``temp`` to ``base_tables``, emit ``prep → #temp`` and **skip** the intermediate ``$source_data`` edge — wrong for
+    chains like ``prep ← source_data(SELECT * FROM #temp)``.
+    """
+    try:
+        from sqlglot import expressions as exp
+    except ImportError:
+        return False
+    if not isinstance(table, exp.Table):
+        return False
+    name = str(getattr(table, "name", "") or "").strip().strip("[]")
+    nl = name.lower()
+    if nl.startswith("#"):
+        return True
+    db = table.args.get("db") if getattr(table, "args", None) else None
+    dbn = str(db).lower() if db else ""
+    # Typical sqlglot leak: Identifier ``temp`` under ``dbo`` with no real persistent ``dbo.temp``.
+    if nl == "temp" and (not dbn or dbn == "dbo"):
+        return True
+    reg = temp_owners_registry or {}
+    if nl == "temp" and any(
+        str(k).split("@")[0].lstrip("#").lower() == "temp" for k in reg.keys()
+    ):
+        return True
+    return False
+
+
 class ColumnGraph:
     """Bidirectional graph of column-level lineage relationships."""
     
@@ -899,7 +932,9 @@ class ColumnGraph:
         
         Args:
             objects: List of ObjectInfo with lineage
-            cte_data: Optional CTE registry for expanding CTE to base sources (NOT WORKING due to architectural limitation)
+            cte_data: Merged ``parser.cte_registry`` (scoped keys). Used to expand CTE inputs to **durable** base
+                tables only; ``#temp`` / sqlglot ``dbo.temp`` in a CTE body are not treated as expandable bases
+                (preserves intermediate ``dbo.<proc>$<cte>`` hops).
             expand_temp_lineage_to_persistent: When True, expand temp column lineage into extra
                 edges from base tables directly to **persistent** targets (legacy / “expanded” graph).
                 Default False: for ``INSERT INTO persist SELECT … FROM #temp`` only keep
@@ -907,10 +942,6 @@ class ColumnGraph:
         """
         if cte_data is None:
             cte_data = {}
-        
-        # NOTE: CTE expansion was attempted but cte_data is always empty
-        # CTE are registered locally in SelectLineageExtractor and don't propagate to engine/models
-        # Known limitation: CTE will appear in column_graph as intermediate nodes
         
         # Build a map of old temp table names to new ones (e.g., "dbo.#asefl_temp" -> "dbo.update_asefl_TrialBalance_BV#asefl_temp")
         # Also build a map of temp table names to their ObjectInfo for lineage expansion
@@ -1163,8 +1194,13 @@ class ColumnGraph:
                                             ):
                                                 is_another_cte = True
                                                 break
-                                        if not is_another_cte and not tbl_name.startswith('#'):
-                                            base_tables.add(tbl_name)
+                                        if is_another_cte:
+                                            continue
+                                        if _cte_from_table_should_skip_expand_to_persistent(
+                                            table, temp_owners_registry
+                                        ):
+                                            continue
+                                        base_tables.add(tbl_name)
                                     
                                     # Create edges from CTE base sources to output (expand CTE)
                                     if base_tables:

@@ -422,6 +422,8 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
 
             existing_lower = {str(c.name).lower() for c in (output_columns or []) if c and c.name}
             lineage_by_name = {str(ln.output_column).lower(): ln for ln in (lineage or []) if ln and ln.output_column}
+            alias_map, derived_cols = _sl._build_alias_maps(self, select_stmt)
+            self._current_select_stmt = select_stmt
             for alias_name, alias_expr in alias_exprs:
                 if not alias_name:
                     continue
@@ -431,7 +433,7 @@ def _parse_select_into(self, statement: exp.Select, object_hint: Optional[str] =
                     existing_lower.add(alias_lower)
                 if alias_lower not in lineage_by_name:
                     inner = alias_expr.this
-                    input_refs = _sl._extract_column_references(self, inner, select_stmt)
+                    input_refs = _sl._collect_inputs_for_expr(self, inner, alias_map, derived_cols)
                     if isinstance(inner, exp.Case):
                         ttype = TransformationType.CASE
                     else:

@@ -89,6 +89,19 @@ def _build_alias_maps(self, select_exp: exp.Select):
                     fqn = canonical_name
         except Exception:
             pass
+        # CTE references parsed as Table must use the same scoped virtual FQN as cte_registry
+        # (alias ``efs`` would otherwise map to dbo.<cte> while simple name maps to dbo.<proc>$<cte>,
+        # breaking unqualified-column disambiguation).
+        try:
+            cte_key_tbl = self._cte_registry_resolve_key(getattr(t, "name", None))
+            if cte_key_tbl:
+                cte_info = self.cte_registry.get(cte_key_tbl)
+                if isinstance(cte_info, dict) and cte_info.get("node_name"):
+                    fqn = str(cte_info["node_name"])
+                else:
+                    fqn = cte_key_tbl
+        except Exception:
+            pass
         if alias:
             alias_map[alias] = fqn
         # Don't overwrite CTEs in alias_map - they were already added with simple CTE names
@@ -149,6 +162,35 @@ def _build_alias_maps(self, select_exp: exp.Select):
                     from_table_lower = from_table_name.lower()
                     if from_table_lower in alias_map:
                         from_source = alias_map[from_table_lower]
+            elif isinstance(from_this, exp.Join):
+                # sqlglot: FROM a JOIN b → root is Join; leftmost leaf is the primary FROM source
+                leaf = from_this
+                while isinstance(leaf, exp.Join):
+                    leaf = leaf.this
+                if isinstance(leaf, exp.Table):
+                    from_alias = getattr(leaf, "alias", None) or leaf.args.get("alias")
+                    if from_alias:
+                        from_alias_str = (
+                            from_alias.name.lower()
+                            if hasattr(from_alias, "name")
+                            else str(from_alias).lower()
+                        )
+                        if from_alias_str in alias_map:
+                            from_source = alias_map[from_alias_str]
+                    if not from_source and getattr(leaf, "name", None):
+                        from_table_lower = str(leaf.name).lower()
+                        if from_table_lower in alias_map:
+                            from_source = alias_map[from_table_lower]
+                elif isinstance(leaf, exp.Alias) and isinstance(leaf.this, exp.Table):
+                    inner_t = leaf.this
+                    if leaf.alias:
+                        from_alias_str = str(leaf.alias).lower()
+                        if from_alias_str in alias_map:
+                            from_source = alias_map[from_alias_str]
+                    if not from_source and getattr(inner_t, "name", None):
+                        from_table_lower = str(inner_t.name).lower()
+                        if from_table_lower in alias_map:
+                            from_source = alias_map[from_table_lower]
             elif isinstance(from_this, exp.Values):
                 # T-SQL: FROM (VALUES (a.col), ...) AS V(LoadDate) — Values + TableAlias, not exp.Table
                 talias = from_this.args.get("alias") or getattr(from_this, "alias", None)
@@ -189,6 +231,183 @@ def _build_alias_maps(self, select_exp: exp.Select):
         pass
 
     return alias_map, derived_cols
+
+
+def _fqn_column_presence_known(self, fqn: str, col_lower: str) -> Optional[bool]:
+    """Whether ``fqn`` has column ``col_lower`` when schema/temp/CTE metadata is available.
+
+    Returns:
+        True / False when we have a non-placeholder column list or TableSchema.
+        None when we cannot tell (no metadata, placeholder ``*``, unknown inference).
+    """
+    if not fqn or not col_lower:
+        return None
+    fqn_s = str(fqn).strip()
+    if fqn_s.startswith("__values__."):
+        return None
+
+    cte_key = self._cte_registry_resolve_key(fqn_s)
+    if cte_key:
+        info = self.cte_registry.get(cte_key)
+        if isinstance(info, dict):
+            cols = info.get("columns") or []
+            if not cols or _is_placeholder_cols(list(cols)):
+                return None
+            names = {str(c).lower() for c in cols if c}
+            return col_lower in names
+        return None
+
+    temp_seg = None
+    if "#" in fqn_s:
+        for seg in fqn_s.split("."):
+            if str(seg).startswith("#"):
+                temp_seg = seg
+                break
+    if not temp_seg:
+        leaf = fqn_s.split(".")[-1] if "." in fqn_s else fqn_s
+        temp_seg = _match_temp_segment(self, leaf)
+    if temp_seg:
+        try:
+            simple = str(temp_seg).split("@")[0].lstrip("#")
+            tcols = (
+                self.temp_registry.get(temp_seg)
+                or self.temp_registry.get(f"#{simple}")
+                or self.temp_registry.get(simple)
+                or []
+            )
+        except Exception:
+            tcols = []
+        if not tcols or _is_placeholder_cols(list(tcols)):
+            return None
+        names = {str(c).lower() for c in tcols if c}
+        return col_lower in names
+
+    try:
+        db, sch, tbl = self._split_fqn(fqn_s)
+    except Exception:
+        return None
+    schema = _get_schema(self, db, sch, tbl)
+    if schema and schema.columns:
+        return schema.get_column(col_lower) is not None
+
+    cols_inf = self._infer_table_columns_unified(fqn_s)
+    if _is_placeholder_cols(cols_inf):
+        return None
+    names = {str(c).lower() for c in cols_inf if c}
+    return col_lower in names
+
+
+def _from_clause_alias_keys(select_stmt: Optional[exp.Select]) -> Optional[Set[str]]:
+    """Table / subquery aliases introduced only in this SELECT's top-level FROM/JOIN chain.
+
+    Excludes tables inside nested ``SELECT`` bodies (e.g. ``NOT EXISTS (SELECT … FROM efs)``) so
+    unqualified column binding does not treat correlate subquery sources as peer join inputs.
+    """
+    if not isinstance(select_stmt, exp.Select):
+        return None
+    out: Set[str] = set()
+    from_expr = select_stmt.args.get("from_") or select_stmt.args.get("from")
+    if not from_expr or not getattr(from_expr, "this", None):
+        return out
+
+    def add_table_identifier(t: exp.Table) -> None:
+        if getattr(t, "name", None):
+            out.add(str(t.name).lower().strip())
+        a = getattr(t, "alias", None) or t.args.get("alias")
+        if a:
+            if hasattr(a, "name"):
+                out.add(str(a.name).lower().strip())
+            else:
+                out.add(str(a).lower().strip())
+
+    def walk(n: Optional[exp.Expression]) -> None:
+        if n is None:
+            return
+        if isinstance(n, exp.Select):
+            return
+        if isinstance(n, exp.Table):
+            add_table_identifier(n)
+            return
+        if isinstance(n, exp.Join):
+            walk(n.this)
+            walk(n.expression)
+            return
+        if isinstance(n, exp.Alias):
+            inner = n.this
+            if isinstance(inner, exp.Table):
+                add_table_identifier(inner)
+            elif isinstance(inner, (exp.Subquery, exp.Unnest)):
+                al = n.args.get("alias") or getattr(n, "alias", None)
+                if isinstance(al, exp.TableAlias):
+                    tt = al.this if getattr(al, "this", None) is not None else al
+                    out.add(str(getattr(tt, "name", tt)).lower())
+            return
+        if isinstance(n, exp.Subquery):
+            al = n.args.get("alias") or getattr(n, "alias", None)
+            if isinstance(al, exp.TableAlias):
+                tt = al.this if getattr(al, "this", None) is not None else al
+                out.add(str(getattr(tt, "name", tt)).lower())
+            return
+        if isinstance(n, exp.Paren):
+            walk(n.this)
+            return
+        if isinstance(n, exp.From):
+            walk(n.this)
+            return
+        logger.debug("_from_clause_alias_keys: skipping unexpected FROM subtree node %s", type(n).__name__)
+
+    walk(from_expr.this)
+    for j in select_stmt.args.get("joins") or []:
+        if isinstance(j, exp.Join):
+            walk(j.this)
+    return out
+
+
+def _disambiguate_unqualified_column_fqn(
+    self,
+    col_name: str,
+    alias_map: dict,
+    fallback_fqn: str,
+    scope_aliases: Optional[Set[str]],
+) -> Optional[str]:
+    """Pick a single source FQN for an unqualified column when schemas distinguish sources.
+
+    If multiple distinct sources *provably* contain the column, returns None (conservative).
+    If no source provably contains it, returns ``fallback_fqn`` (typically ``__main_from__``).
+    """
+    ckey = (col_name or "").strip().lower()
+    if not ckey:
+        return fallback_fqn
+    matches: List[str] = []
+    seen: Set[str] = set()
+    for k, v in (alias_map or {}).items():
+        if not isinstance(k, str):
+            continue
+        lk = k.lower()
+        if lk in ("__main_from__", "") or lk.startswith("__"):
+            continue
+        if scope_aliases is not None and lk not in scope_aliases:
+            continue
+        if not isinstance(v, str) or not v:
+            continue
+        if v in seen:
+            continue
+        if str(v).startswith("__values__."):
+            continue
+        seen.add(v)
+        pres = _fqn_column_presence_known(self, v, ckey)
+        if pres is True:
+            matches.append(v)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        logger.debug(
+            "Ambiguous unqualified column %r among sources with known schema: %s",
+            col_name,
+            matches,
+        )
+        return None
+    return fallback_fqn
 
 
 def _cte_node_name(self, cte_name: str) -> str:
@@ -333,7 +552,13 @@ def _register_cte_lineage_object(self, cte_name: str, cte_def: exp.Select, cte_c
         self.cte_lineage_objects.append(cte_obj)
 
 
-def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
+def _append_column_ref(
+    self,
+    out_list,
+    col_exp: exp.Column,
+    alias_map: dict,
+    scope_select: Optional[exp.Select] = None,
+):
     import logging
     logger = logging.getLogger(__name__)
     
@@ -450,6 +675,16 @@ def _append_column_ref(self, out_list, col_exp: exp.Column, alias_map: dict):
                                 return
             else:
                 return
+
+    if not qual and table_fqn:
+        scope = scope_select or getattr(self, "_current_select_stmt", None)
+        scope_aliases = _from_clause_alias_keys(scope) if isinstance(scope, exp.Select) else None
+        dis = _disambiguate_unqualified_column_fqn(
+            self, col_exp.name, alias_map, table_fqn, scope_aliases
+        )
+        if dis is None:
+            return
+        table_fqn = dis
     
     # Check if this is a CTE reference
     # CTEs don't have direct table sources - their sources are in the CTE definition
@@ -954,9 +1189,10 @@ def _collect_inputs_for_expr(self, expr: exp.Expression, alias_map: dict, derive
         if base_cols:
             # VALUES row cells reference outer SELECT aliases (e.g. Document_hub.col); resolve with outer alias_map.
             for b in base_cols:
-                _append_column_ref(self, inputs, b, alias_map)
+                _append_column_ref(self, inputs, b, alias_map, outer_stmt)
             continue
-        _append_column_ref(self, inputs, col, eff_map)
+        scope_sel = enc if enc is not None else outer_stmt
+        _append_column_ref(self, inputs, col, eff_map, scope_sel)
     return inputs
 
 
@@ -1072,41 +1308,10 @@ def _extract_column_alias(self, select_expr: exp.Expression) -> Optional[str]:
 
 
 def _extract_column_references(self, select_expr: exp.Expression, select_stmt: exp.Select) -> List[ColumnReference]:
-    """Extract table-qualified column references used by a SELECT expression."""
-    refs: List[ColumnReference] = []
-    for column_expr in select_expr.find_all(exp.Column):
-        table_name = "unknown"
-        column_name = str(column_expr.this)
-        if hasattr(column_expr, 'table') and column_expr.table:
-            table_alias = str(column_expr.table)
-            table_name = self._resolve_table_from_alias(table_alias, select_stmt)
-        else:
-            # Get all tables, but exclude INTO target table (which is not a source)
-            all_tables = list(select_stmt.find_all(exp.Table))
-            into_node = select_stmt.args.get('into') if hasattr(select_stmt, 'args') else None
-            into_table = into_node.this if into_node else None
-            # Filter out INTO table from source tables
-            source_tables = [t for t in all_tables if not (into_table and t == into_table)]
-            tables = [self._get_table_name(t) for t in source_tables]
-            if len(tables) == 1:
-                table_name = tables[0]
-        if table_name and (table_name.startswith('@') or ('+' in table_name) or (table_name.startswith('[') and table_name.endswith(']') and '.' not in table_name)):
-            continue
-        # Skip SQL keywords (JOIN keywords like LEFT/RIGHT/etc)
-        if _is_join_keyword(table_name):
-            continue  # Skip this ref entirely - it's not a real table
-        if table_name != "unknown":
-            ns, nm = self._ns_and_name(table_name)
-            if nm == "unknown":
-                import sys, traceback
-                print(f"\n=== DEBUG: Created 'unknown' ref ===", file=sys.stderr)
-                print(f"table_name={table_name}, ns={ns}, nm={nm}, column={column_name}", file=sys.stderr)
-                print("Traceback:", file=sys.stderr)
-                for line in traceback.format_stack()[-6:-1]:
-                    print(line.strip(), file=sys.stderr)
-                print("===\n", file=sys.stderr)
-            refs.append(ColumnReference(namespace=ns, table_name=nm, column_name=column_name))
-    return refs
+    """Resolve column refs inside a projection expression using FROM/JOIN scope (incl. multi-table)."""
+    alias_map, derived_cols = _build_alias_maps(self, select_stmt)
+    self._current_select_stmt = select_stmt
+    return _collect_inputs_for_expr(self, select_expr, alias_map, derived_cols)
 
 
 def _is_string_function(self, expr: exp.Expression) -> bool:
@@ -1321,11 +1526,21 @@ def _try_expand_qualified_star_from_subquery(
     return out_lineage, out_cols, o
 
 
-def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
+def _handle_star_expansion(
+    self,
+    select_stmt: exp.Select,
+    view_name: str,
+    alias_map: Optional[dict] = None,
+    derived_cols: Optional[dict] = None,
+) -> tuple[List[ColumnLineage], List[ColumnSchema]]:
     lineage = []
     output_columns = []
     ordinal = 0
     seen_columns = set()
+
+    if alias_map is None or derived_cols is None:
+        alias_map, derived_cols = _build_alias_maps(self, select_stmt)
+    self._current_select_stmt = select_stmt
     
     logger.debug(f"_handle_star_expansion: Called for {view_name}, select_stmt has {len(select_stmt.expressions)} expressions")
 
@@ -1566,13 +1781,31 @@ def _handle_star_expansion(self, select_stmt: exp.Select, view_name: str) -> tup
             logger.debug(f"_handle_star_expansion: Non-star expression, extracting alias")
             col_name = self._extract_column_alias(select_expr) or f"col_{ordinal}"
             logger.debug(f"_handle_star_expansion: Extracted alias: {col_name}")
-            output_columns.append(ColumnSchema(name=col_name, data_type="unknown", nullable=True, ordinal=ordinal))
+            inner = select_expr.this if isinstance(select_expr, exp.Alias) else select_expr
+            input_refs = _collect_inputs_for_expr(self, inner, alias_map, derived_cols)
+            out_type = _infer_type(self, inner, alias_map)
+            if isinstance(inner, (exp.Cast, exp.Convert)):
+                ttype = TransformationType.CAST
+            elif isinstance(inner, exp.Case):
+                ttype = TransformationType.CASE
+            elif isinstance(inner, exp.Column):
+                ttype = TransformationType.IDENTITY
+            else:
+                s = str(inner).upper()
+                if s.startswith("CASE ") or s.startswith("CASEWHEN ") or s.startswith("IIF("):
+                    ttype = TransformationType.CASE
+                else:
+                    ttype = TransformationType.EXPRESSION
+            output_columns.append(ColumnSchema(name=col_name, data_type=out_type, nullable=True, ordinal=ordinal))
             ordinal += 1
-            input_refs = self._extract_column_references(select_expr, select_stmt)
-            # For computed expressions without trackable column dependencies, use empty input_refs
-            # instead of creating fake LITERAL objects. This prevents spurious nodes in column_graph
-            # while preserving the lineage entry with proper transformation metadata.
-            lineage.append(ColumnLineage(output_column=col_name, input_fields=input_refs, transformation_type=TransformationType.EXPRESSION, transformation_description=f"SELECT {str(select_expr)}"))
+            lineage.append(
+                ColumnLineage(
+                    output_column=col_name,
+                    input_fields=input_refs,
+                    transformation_type=ttype,
+                    transformation_description=_short_desc(self, inner),
+                )
+            )
 
     _normalize_lineage_input_temps(self, lineage)
     logger.debug(f"_handle_star_expansion: Returning {len(output_columns)} columns, {len(lineage)} lineage entries")
@@ -1653,7 +1886,7 @@ def _extract_column_lineage(self, stmt: exp.Expression, view_name: str) -> tuple
     logger.debug(f"_extract_column_lineage: _has_star_expansion returned {has_star}")
     if has_star:
         logger.debug(f"_extract_column_lineage: Calling _handle_star_expansion")
-        return _handle_star_expansion(self, select_stmt, view_name)
+        return _handle_star_expansion(self, select_stmt, view_name, alias_map, derived_cols)
     if _has_union(self, select_stmt):
         logger.debug(f"_extract_column_lineage: Has union, calling _handle_union_lineage")
         return _handle_union_lineage(self, select_stmt, view_name)
